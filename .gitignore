@@ -1,0 +1,28 @@
+# Environment variables
+.env
+
+# Virtual environments
+.venv/
+env/
+venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Tool and Editor states
+.claude/
+.langgraph_api/
+.idea/
+.vscode/
+
+# macOS metadata
+.DS_Store
+
+# Agent runtime memory, sessions, and temporary directories
+sessions/
+memory/
+asm_dir/
+memdump_dir/
+text_dir/

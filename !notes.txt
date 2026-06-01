@@ -1,0 +1,9 @@
+start langgraph/langsmith runtime locally:
+uv run langgraph dev
+
+start streamlit Web GUI:
+source .venv/bin/activate
+streamlit run app.py
+
+
+https://www.barrywalker.io/blog/vice-mcp-ai-meets-commodore-64/

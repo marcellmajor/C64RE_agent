@@ -1,0 +1,64 @@
+"""Shared LangGraph state for the C64-RE Agent.
+
+Mirrors `CLAUDE_graph.md` §2. Reducers are declared via `Annotated` so that
+LangGraph merges parallel/looped updates without clobbering history.
+"""
+
+from __future__ import annotations
+
+from operator import add
+from typing import Annotated, Any, TypedDict
+
+from langgraph.graph.message import add_messages
+
+
+class C64State(TypedDict, total=False):
+    # --- inputs (set once at load_inputs) ---
+    game: str
+    question: str
+    dump_path: str
+    partial_asm_path: str | None
+    text_dir: str | None
+    # Directory of partial-asm files fed to the layered code-comprehension
+    # sub-agent (`code_kb`). Independent from `partial_asm_path` so a run
+    # can mix one curated partial asm with a directory of community
+    # disassemblies, and from `text_dir` because the asm pipeline owns
+    # its own parser/store.
+    asm_dir: str | None
+    # Explicit per-game asm-file selection. When set, this overrides the
+    # auto-scoping done by `code_kb.scoping.select_asm_files`. Each entry
+    # may be absolute or relative to `asm_dir`. Used when `asm_dir` holds
+    # files belonging to several games and the game's slug-token heuristic
+    # would otherwise pick up the wrong subset.
+    asm_files: list[str] | None
+
+    # --- working memory ---
+    kb_handle: str
+    # Handle to the *separate* CodeKnowledgeStore that owns Layer-0
+    # ground truth and Layer-1+ LLM annotations of the disassembly. Set
+    # by `load_inputs` when an asm dir / partial asm is supplied.
+    code_kb_handle: str | None
+    plan: list[dict[str, Any]]
+    current_step_id: str | None
+    tool_results: Annotated[list[dict[str, Any]], add]
+
+    # --- analysis ---
+    candidate_answer: dict[str, Any] | None
+    verdict: dict[str, Any] | None
+    history: Annotated[list[dict[str, Any]], add]
+
+    # Question-relevant KB digest, refreshed by the synthesizer / curator
+    # so the analyst and critic see the same evidence sheet.
+    kb_digest: str
+
+    # Snapshot of `events_total` at the last critic verdict; used by the
+    # dead-end detector to notice "two replans in a row, KB didn't grow".
+    last_kb_event_count: int
+
+    # --- control ---
+    iteration: int
+    replan_count: int
+    budget_used: float
+
+    # --- transcript (LangChain message log; viewable in Studio/LangSmith) ---
+    messages: Annotated[list, add_messages]

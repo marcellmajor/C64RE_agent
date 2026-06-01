@@ -1,0 +1,75 @@
+{
+  "providers": {
+    "ollama": {
+      "base_url": "http://localhost:11434/v1",
+      "api_key": "ollama"
+    },
+    "grok": {
+      "base_url": "https://api.x.ai/v1",
+      "api_key": "${XAI_API_KEY}"
+    },
+    "gemini": {
+      "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+      "api_key": "${GEMINI_API_KEY}"
+    },
+    "openai": {
+      "base_url": "https://api.openai.com/v1",
+      "api_key": "${OPENAI_API_KEY}"
+    },
+    "anthropic": {
+      "base_url": "https://api.anthropic.com/v1",
+      "api_key": "${ANTHROPIC_API_KEY}"
+    }
+  },
+  "agents": {
+    "coordinator": {
+      "provider": "grok",
+      "model": "grok-4.3",
+      "temperature": 0.1,
+      "reasoning_effort": "low"
+    },
+    "planner": {
+      "provider": "anthropic",
+      "model": "claude-opus-4-7",
+      "temperature": 0.2
+    },
+    "executor": {
+      "provider": "openai",
+      "model": "gpt-5.3-codex",
+      "temperature": 0.0
+    },
+    "synthesizer": {
+      "provider": "grok",
+      "model": "grok-4.3",
+      "temperature": 0.3,
+      "reasoning_effort": "low"
+    },
+    "analyst": {
+      "provider": "gemini",
+      "model": "gemini-pro-latest",
+      "temperature": 0.2
+    },
+    "critic": {
+      "provider": "gemini",
+      "model": "gemini-pro-latest",
+      "temperature": 0.1
+    },
+    "curator": {
+      "provider": "grok",
+      "model": "grok-4.3",
+      "temperature": 0.2,
+      "reasoning_effort": "none"
+    },
+    "researcher": {
+      "provider": "grok",
+      "model": "grok-4.3",
+      "temperature": 0.3,
+      "reasoning_effort": "medium"
+    }
+  },
+  "defaults": {
+    "max_tokens": 4096,
+    "timeout_s": 120,
+    "retries": 3
+  }
+}

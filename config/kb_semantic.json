@@ -1,0 +1,26 @@
+{
+  "enabled": false,
+  "comment": "Set enabled=true once OPENAI_API_KEY (or embedding_api_key_provider) resolves. index_event_kinds controls which KB event kinds produce embedding rows; omit tool_result unless you accept extra noise/cost.",
+
+  "use_llm_provider": "executor",
+  "embedding_model": "text-embedding-3-small",
+  "embedding_dimensions": null,
+
+  "chunk_chars": 700,
+  "chunk_overlap": 120,
+
+  "embed_batch_size": 48,
+  "embed_timeout_s": 120,
+
+  "digest_semantic_limit": 8,
+  "semantic_search_limit_default": 12,
+
+  "index_event_kinds": [
+    "ingest_text",
+    "label",
+    "routine",
+    "data_structure",
+    "hypothesis",
+    "consolidated_observation"
+  ]
+}
