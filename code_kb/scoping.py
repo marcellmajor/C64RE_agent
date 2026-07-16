@@ -48,8 +48,17 @@ class Scoping:
 
 
 def _slug(name: str) -> str:
-    """Same slugifier the rest of the agent uses."""
-    return (name or "unknown").strip().lower().replace(" ", "_")
+    """Same slugifier the rest of the agent uses (graph.plan_utils).
+
+    Imported lazily: `code_kb` must not import the `graph` package at
+    module level — `graph/__init__.py` compiles the full LangGraph,
+    whose nodes import `code_kb`, so a top-level import here would be
+    circular. At call time the graph is either fully imported already
+    (agent runtime) or gets imported once (standalone use).
+    """
+    from graph.plan_utils import slugify
+
+    return slugify(name)
 
 
 def game_tokens(game: str) -> list[str]:

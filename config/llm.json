@@ -24,23 +24,23 @@
   "agents": {
     "coordinator": {
       "provider": "grok",
-      "model": "grok-4.3",
+      "model": "grok-4.5",
       "temperature": 0.1,
       "reasoning_effort": "low"
     },
     "planner": {
       "provider": "anthropic",
-      "model": "claude-opus-4-7",
+      "model": "claude-opus-4-8",
       "temperature": 0.2
     },
     "executor": {
       "provider": "openai",
-      "model": "gpt-5.3-codex",
+      "model": "gpt-5.5",
       "temperature": 0.0
     },
     "synthesizer": {
       "provider": "grok",
-      "model": "grok-4.3",
+      "model": "grok-4.5",
       "temperature": 0.3,
       "reasoning_effort": "low"
     },
@@ -56,13 +56,13 @@
     },
     "curator": {
       "provider": "grok",
-      "model": "grok-4.3",
+      "model": "grok-4.5",
       "temperature": 0.2,
       "reasoning_effort": "none"
     },
     "researcher": {
       "provider": "grok",
-      "model": "grok-4.3",
+      "model": "grok-4.5",
       "temperature": 0.3,
       "reasoning_effort": "medium"
     }

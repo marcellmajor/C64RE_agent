@@ -54,7 +54,11 @@ from tools.agent_runner import (  # noqa: E402
 
 
 def _slugify_game_name(game: str) -> str:
-    return (game or "").strip().lower().replace(" ", "_")
+    # Delegates to the canonical slugifier (tracker 0.7); the UI keeps
+    # "" for an empty game field so picker/prefs comparisons stay inert.
+    from graph.plan_utils import slugify
+
+    return slugify(game) if (game or "").strip() else ""
 
 
 def _known_game_slugs() -> list[str]:
@@ -220,9 +224,7 @@ with st.sidebar:
             on_change=_on_game_picker_change,
         )
 
-    game_slug = (
-        (st.session_state.game or "").strip().lower().replace(" ", "_")
-    )
+    game_slug = _slugify_game_name(st.session_state.game)
     game_just_changed = game_slug != st.session_state.last_scoped_slug
 
     if game_just_changed:
@@ -1010,8 +1012,11 @@ with tab_kb:
             st.info("No code KB on disk yet.")
         else:
             st.json(summary, expanded=False)
-        slug = st.session_state.game.strip().lower().replace(" ", "_")
-        report_path = Path("sessions") / slug / "report.md"
+        from graph.plan_utils import resolve_session_slug
+
+        sessions = Path("sessions")
+        slug = resolve_session_slug(st.session_state.game, sessions)
+        report_path = sessions / slug / "report.md"
         if report_path.exists():
             st.markdown(f"**Last full report:** `{report_path}`")
             with st.expander("Show last report.md"):

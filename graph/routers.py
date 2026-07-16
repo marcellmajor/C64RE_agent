@@ -13,20 +13,28 @@ from __future__ import annotations
 
 from typing import Literal
 
+from graph.plan_utils import MAX_ITERS, pending_steps
 from graph.state import C64State
 from memory import get_store
 
 # Token budget over which the curator should compact tool_result events.
 KB_TOKEN_THRESHOLD = 80_000
 
-# Hard caps for the outer critic loop.
-MAX_ITERS = 12
+# Hard caps for the outer critic loop. MAX_ITERS lives in
+# graph.plan_utils (RECURSION_LIMIT is derived from it) and is
+# re-exported here for existing importers.
 BUDGET_CAP = 5.0  # USD or tokens (depending on what `budget_used` tracks)
 
 
 def _pending_steps(state: C64State) -> list[dict]:
-    done = {r.get("step_id") for r in state.get("tool_results", [])}
-    return [s for s in state.get("plan", []) if s.get("id") not in done]
+    """Steps still needing a (re)run.
+
+    Delegates to `plan_utils.pending_steps`: a step only counts as done
+    when it succeeded or its retries are exhausted — previously any
+    attempted step (even `ok=False` from a missing API key) was
+    permanently burned (tracker 0.3).
+    """
+    return pending_steps(state)
 
 
 def _kb_size_tokens(state: C64State) -> int:
@@ -40,34 +48,46 @@ def _kb_size_tokens(state: C64State) -> int:
     return 1_000 * len(state.get("tool_results", []))
 
 
-def _kb_event_count(state: C64State) -> int:
-    handle = state.get("kb_handle")
-    if not handle:
-        return 0
-    try:
-        return int(get_store(handle).stats().get("events_total", 0))
-    except Exception:  # noqa: BLE001
-        return 0
-
-
 def _dead_end_detected(state: C64State) -> bool:
-    """Two consecutive `replan` verdicts AND no new KB facts.
+    """Two consecutive `replan` verdicts AND no new substantive KB facts.
 
-    The original implementation only checked for two replans in a row,
-    which would terminate even if the second replan produced new
-    Capstone evidence. We also require the KB to have stopped growing.
+    The growth signal (`kb_grew_since_last_verdict`) is computed inside
+    `critic_node`, which compares the substantive-event count against the
+    snapshot taken at the *previous* verdict before overwriting it. The
+    old implementation compared against a snapshot written in the same
+    state update the router then read — always equal, so every second
+    consecutive replan terminated the run regardless of progress
+    (tracker 0.2).
     """
     history = state.get("history", []) or []
-    last_two = [h for h in history[-2:] if h.get("decision") == "replan"]
-    if len(last_two) < 2:
+    if len(history) < 2:
         return False
-    return _kb_event_count(state) <= int(state.get("last_kb_event_count", 0))
+    last, prev = history[-1], history[-2]
+    if last.get("decision") != "replan" or prev.get("decision") != "replan":
+        return False
+    # Default True: when the flag is missing (old histories, no KB
+    # handle) we must not terminate a possibly-productive replan.
+    return not last.get("kb_grew_since_last_verdict", True)
 
 
 def route_tool(
     state: C64State,
-) -> Literal["vice", "capstone", "tavily", "kb", "code_kb"]:
+) -> Literal[
+    "vice", "capstone", "tavily", "kb", "code_kb", "synthesizer", "planner",
+]:
     step_id = state.get("current_step_id")
+    if not step_id:
+        # Nothing dispatchable. Two cases (tracker 0.6):
+        # * blocked plan (executor set `plan_blocked` after recording a
+        #   structured failure per blocked step) → deterministically
+        #   replan, bounded by MAX_ITERS since the planner increments
+        #   `iteration` on every pass;
+        # * plan complete (or iteration budget spent) → synthesizer,
+        #   which persists any recorded failures and lets post_synth
+        #   route on to the analyst/critic end path.
+        if state.get("plan_blocked") and state.get("iteration", 0) < MAX_ITERS:
+            return "planner"
+        return "synthesizer"
     for s in state.get("plan", []):
         if s.get("id") == step_id:
             tool = str(s.get("tool", "kb"))

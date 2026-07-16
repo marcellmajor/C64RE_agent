@@ -23,6 +23,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "langgraph-cli[inmem]>=0.1.55",
+    "pytest>=8",
 ]
 ui = [
     "streamlit>=1.36",

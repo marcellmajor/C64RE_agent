@@ -51,13 +51,31 @@ class C64State(TypedDict, total=False):
     # so the analyst and critic see the same evidence sheet.
     kb_digest: str
 
-    # Snapshot of `events_total` at the last critic verdict; used by the
-    # dead-end detector to notice "two replans in a row, KB didn't grow".
+    # Snapshot of the *distinct substantive fact* count (bookkeeping
+    # kinds excluded; failed tool attempts excluded; identity is stable
+    # across replanned step IDs) at the last critic verdict.
+    # `critic_node` compares the fresh count against this snapshot BEFORE
+    # overwriting it and ships the result on the verdict as
+    # `kb_grew_since_last_verdict`, which the dead-end router reads.
     last_kb_event_count: int
+
+    # Set by the executor when every pending step has an unsatisfiable
+    # dependency (failed prerequisite, missing id, or cycle); routes
+    # deterministically to a replan. Cleared by the planner.
+    plan_blocked: bool
+
+    # Stamped post-hoc by the runners when a run ends without a critic
+    # accept (e.g. "recursion_exhausted") — see
+    # `plan_utils.normalize_truncated_state`.
+    termination_reason: str | None
 
     # --- control ---
     iteration: int
     replan_count: int
+    # Consecutive `revise` verdicts; reset on accept/replan. The critic
+    # forces `accept` once this reaches MAX_CONSECUTIVE_REVISES so the
+    # analyst↔critic ping-pong terminates (tracker 0.4).
+    revise_count: int
     budget_used: float
 
     # --- transcript (LangChain message log; viewable in Studio/LangSmith) ---

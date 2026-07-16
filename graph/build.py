@@ -61,6 +61,10 @@ def build_graph() -> StateGraph:
     builder.add_edge("planner", "executor")
 
     # ---- tool dispatch fan-out ----
+    # Two no-step paths (tracker 0.6): a blocked plan (unsatisfiable
+    # dependencies — the executor records a structured failure per
+    # blocked step) routes deterministically to "planner" for a replan,
+    # bounded by MAX_ITERS; a completed plan routes to "synthesizer".
     builder.add_conditional_edges(
         "executor",
         route_tool,
@@ -70,6 +74,8 @@ def build_graph() -> StateGraph:
             "tavily": "tavily",
             "kb": "kb",
             "code_kb": "code_kb",
+            "synthesizer": "synthesizer",
+            "planner": "planner",
         },
     )
     for tool in ("vice", "capstone", "tavily", "kb", "code_kb"):

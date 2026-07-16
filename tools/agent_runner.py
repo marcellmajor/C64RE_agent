@@ -23,8 +23,14 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.errors import GraphRecursionError
 
 from graph.build import build_graph
+from graph.plan_utils import (
+    RECURSION_LIMIT,
+    normalize_truncated_state,
+    resolve_session_slug,
+)
 
 log = logging.getLogger(__name__)
 
@@ -141,11 +147,17 @@ def run_question(
     }
 
     tid = thread_id or f"webui-{uuid.uuid4().hex[:8]}"
-    config = {"configurable": {"thread_id": tid}}
+    # LangGraph defaults to 25 super-steps — one 7-step plan iteration.
+    # RECURSION_LIMIT budgets the full MAX_ITERS loop (tracker 0.1).
+    config = {
+        "recursion_limit": RECURSION_LIMIT,
+        "configurable": {"thread_id": tid},
+    }
 
     yield ("status", f"thread_id={tid}")
     seen_msgs = 0
     last_state: dict[str, Any] = {}
+    truncated: dict[str, Any] | None = None
     try:
         for event in graph.stream(initial_state, config, stream_mode="values"):
             last_state = event
@@ -157,13 +169,44 @@ def run_question(
                     "messages": [getattr(m, "content", str(m)) for m in new_msgs],
                     "iteration": event.get("iteration", 0),
                 })
+    except GraphRecursionError:
+        # Degrade to an honest best-effort answer instead of an error
+        # bubble (tracker 0.1): normalize the last completed state —
+        # explicit termination reason, capped confidence, truncation
+        # note in open_questions — and use THAT for both the report
+        # (the write_report node never ran) and the TurnResult below.
+        yield ("status", (
+            f"recursion limit ({RECURSION_LIMIT} super-steps) exhausted — "
+            "returning best-effort truncated state"
+        ))
+        try:
+            raw = graph.get_state(config).values or last_state
+        except Exception:  # noqa: BLE001
+            raw = last_state
+        truncated = normalize_truncated_state(
+            raw,
+            reason="recursion_exhausted",
+            detail=(
+                f"the {RECURSION_LIMIT}-super-step recursion limit was "
+                "reached before the critic accepted an answer; findings "
+                "reflect the last completed iteration only."
+            ),
+        )
+        try:
+            from graph.nodes import write_report
+            write_report(truncated)
+        except Exception:  # noqa: BLE001
+            log.warning("best-effort write_report failed", exc_info=True)
     except Exception as e:  # noqa: BLE001
         tb = traceback.format_exc()
         log.error("run_question failed:\n%s", tb)
         yield ("error", f"{type(e).__name__}: {e}\n\n```\n{tb}\n```")
         return
 
-    final = graph.get_state(config).values or last_state
+    if truncated is not None:
+        final = truncated
+    else:
+        final = graph.get_state(config).values or last_state
     candidate = final.get("candidate_answer") or {}
     verdict_obj = final.get("verdict") or {}
     answer = str(candidate.get("answer") or "(no answer produced)")
@@ -202,8 +245,8 @@ def _resolve_code_store(game: str):
     """Locate the persistent CodeKnowledgeStore for a game, if it exists."""
     from code_kb import get_code_store
 
-    slug = (game or "unknown").strip().lower().replace(" ", "_")
-    root = Path("sessions") / slug / "code_kb"
+    sessions = Path("sessions")
+    root = sessions / resolve_session_slug(game, sessions) / "code_kb"
     if not root.exists():
         return None
     return get_code_store(root)
@@ -332,8 +375,8 @@ def reset_code_kb(game: str) -> bool:
     user wants a clean slate. Returns True iff something was removed.
     """
     import shutil as _sh
-    slug = (game or "unknown").strip().lower().replace(" ", "_")
-    target = Path("sessions") / slug / "code_kb"
+    sessions = Path("sessions")
+    target = sessions / resolve_session_slug(game, sessions) / "code_kb"
     if not target.exists():
         return False
     _sh.rmtree(target)

@@ -344,21 +344,30 @@ Check, in order:
 Emit JSON ONLY:
 
   {
-    "decision":         "accept" | "revise" | "replan",
-    "critique":         "<markdown — specific, addresses cited>",
-    "suggested_steps":  [{"id": "c<n>", "goal": "...",
-                          "tool": "kb"|"capstone"|"vice"|"tavily",
-                          "args": {...}, "depends_on": [],
-                          "hypothesis": null}]
+    "decision":            "accept" | "revise" | "replan",
+    "critique":            "<markdown — specific, addresses cited>",
+    "suggested_steps":     [{"id": "c<n>", "goal": "...",
+                             "tool": "kb"|"capstone"|"vice"|"tavily",
+                             "args": {...}, "depends_on": [],
+                             "hypothesis": null}],
+    "optional_followups":  [{"goal": "..."}]
   }
 
 Decision rules:
 - `accept`  : confidence well-supported; no critical gaps.
+              `suggested_steps` MUST be empty — they are BLOCKING tool
+              work, and an `accept` carrying them is auto-escalated to
+              `replan`. If further investigation would be *nice to have*
+              but is NOT needed to trust the answer, put it in
+              `optional_followups` — it is appended to the report's open
+              questions and does not block acceptance.
 - `revise`  : analyst can fix in place using the EXISTING KB digest;
-              no new tool calls needed. (Use this when the answer is
-              right but poorly worded or under-cited.)
-- `replan`  : missing evidence — `suggested_steps` MUST be non-empty
-              and concrete (real tool args, real addresses).
+              no new tool calls needed, so `suggested_steps` MUST be
+              empty. (Use this when the answer is right but poorly
+              worded or under-cited. A `revise` carrying
+              `suggested_steps` is auto-escalated to `replan`.)
+- `replan`  : missing BLOCKING evidence — `suggested_steps` MUST be
+              non-empty and concrete (real tool args, real addresses).
 
 If the analyst's confidence ≥ 0.9 and you find any unsupported claim
 or unverified dynamic behaviour, you MUST `revise` or `replan`.

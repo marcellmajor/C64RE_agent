@@ -32,7 +32,24 @@ LANGGRAPH_API_DIR = ROOT_DIR / ".langgraph_api"
 
 
 def _slug(game: str) -> str:
-    return game.strip().lower().replace(" ", "_")
+    """Canonical slugifier, honouring legacy-slug session dirs.
+
+    Delegates to `graph.plan_utils` (tracker 0.7) with a lazy import —
+    importing `graph` compiles the LangGraph, which this standalone
+    script only needs when it actually resolves a game. Falls back to
+    the historical local rule if the package is unimportable, so a
+    broken venv can still purge. Note the canonical rule also maps an
+    empty name to "unknown" instead of "" (which would have targeted
+    sessions/ itself).
+    """
+    import sys
+    if str(ROOT_DIR) not in sys.path:
+        sys.path.insert(0, str(ROOT_DIR))
+    try:
+        from graph.plan_utils import resolve_session_slug
+        return resolve_session_slug(game, SESSIONS_DIR)
+    except Exception:  # noqa: BLE001
+        return (game or "").strip().lower().replace(" ", "_") or "unknown"
 
 
 def _collect_targets(

@@ -22,7 +22,6 @@ __pycache__/
 
 # Agent runtime memory, sessions, and temporary directories
 sessions/
-memory/
 asm_dir/
 memdump_dir/
 text_dir/

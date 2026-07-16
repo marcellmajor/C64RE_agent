@@ -23,8 +23,17 @@ import argparse
 from pathlib import Path
 
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.errors import GraphRecursionError
 
 from graph.build import build_graph
+from graph.plan_utils import (
+    RECURSION_LIMIT,
+    normalize_truncated_state,
+    resolve_session_slug,
+    slugify,
+)
+
+SESSIONS_DIR = Path(__file__).resolve().parent / "sessions"
 
 
 def _truthy_env(name: str) -> bool:
@@ -176,8 +185,8 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.reset_code_kb:
-        slug = args.game.strip().lower().replace(" ", "_")
-        ck = Path("sessions") / slug / "code_kb"
+        slug = resolve_session_slug(args.game, SESSIONS_DIR)
+        ck = SESSIONS_DIR / slug / "code_kb"
         if ck.exists():
             import shutil as _sh
             _sh.rmtree(ck)
@@ -202,18 +211,55 @@ def main() -> None:
         "messages": [],
     }
 
-    thread_id = args.thread_id or args.game.lower().replace(" ", "-")
-    config = {"configurable": {"thread_id": thread_id}}
+    thread_id = args.thread_id or slugify(args.game)
+    # LangGraph defaults to 25 super-steps — one 7-step plan iteration.
+    # RECURSION_LIMIT budgets the full MAX_ITERS loop (tracker 0.1).
+    config = {
+        "recursion_limit": RECURSION_LIMIT,
+        "configurable": {"thread_id": thread_id},
+    }
 
     print(f"=== Running C64-RE on {args.game!r} (thread_id={thread_id}) ===\n")
     seen = 0
-    for event in graph.stream(initial_state, config, stream_mode="values"):
-        msgs = event.get("messages") or []
-        for m in msgs[seen:]:
-            print(f"  · {m.content}", flush=True)
-        seen = len(msgs)
+    recursion_exhausted = False
+    try:
+        for event in graph.stream(initial_state, config, stream_mode="values"):
+            msgs = event.get("messages") or []
+            for m in msgs[seen:]:
+                print(f"  · {m.content}", flush=True)
+            seen = len(msgs)
+    except GraphRecursionError:
+        # Degrade into a best-effort low-confidence report instead of a
+        # stack trace: write_report is only reachable via the critic
+        # router, so on recursion exhaustion it never ran.
+        recursion_exhausted = True
+        print(
+            f"\n!! Recursion limit ({RECURSION_LIMIT} super-steps) exhausted "
+            "— emitting best-effort report from the last completed state."
+        )
 
-    final = graph.get_state(config).values
+    final = graph.get_state(config).values or {}
+
+    if recursion_exhausted:
+        # Normalize BEFORE reporting/printing: stamp the termination
+        # reason, cap the (never critic-accepted) confidence, and append
+        # an open question explaining the truncation, so neither the
+        # report nor the CLI output presents the checkpoint state as a
+        # validated answer.
+        final = normalize_truncated_state(
+            final,
+            reason="recursion_exhausted",
+            detail=(
+                f"the {RECURSION_LIMIT}-super-step recursion limit was "
+                "reached before the critic accepted an answer; findings "
+                "reflect the last completed iteration only."
+            ),
+        )
+        try:
+            from graph.nodes import write_report
+            write_report(final)
+        except Exception as e:  # noqa: BLE001
+            print(f"Could not write best-effort report: {type(e).__name__}: {e}")
     verdict = (final.get("verdict") or {}).get("decision", "n/a")
     candidate = final.get("candidate_answer") or {}
 
@@ -229,8 +275,9 @@ def main() -> None:
         print("\n--- Evidence ---")
         try:
             from memory.store import get_store
-            game_slug = (args.game or "unknown").strip().lower().replace(" ", "_")
-            ev_store = get_store(Path("sessions") / game_slug / "kb")
+            sessions = SESSIONS_DIR
+            game_slug = resolve_session_slug(args.game, sessions)
+            ev_store = get_store(sessions / game_slug / "kb")
             for e in evidence:
                 print(f"  · {_resolve_evidence(str(e), ev_store)}")
         except Exception:
@@ -248,8 +295,10 @@ def main() -> None:
         print("\n--- Critic notes ---")
         print(critique)
 
-    game_slug = (args.game or "unknown").strip().lower().replace(" ", "_")
-    report_path = Path("sessions") / game_slug / "report.md"
+    sessions = SESSIONS_DIR
+    report_path = (
+        sessions / resolve_session_slug(args.game, sessions) / "report.md"
+    )
     if report_path.exists():
         print(f"\nFull report: {report_path}")
 

@@ -11,6 +11,7 @@ touch sqlite/JSON directly.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -22,6 +23,15 @@ from typing import Any
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from graph.llm import get_llm
+from graph.plan_utils import (
+    MAX_CONSECUTIVE_REVISES,
+    MAX_PLAN_STEPS,
+    failed_step_notes,
+    resolve_session_slug,
+    runnable_steps,
+    slugify,
+    step_status,
+)
 from graph.prompts import MASTER_PREAMBLE, system_message
 from graph.state import C64State
 from memory import KnowledgeStore, get_store
@@ -442,7 +452,127 @@ def _step_for(state: C64State, step_id: str | None) -> dict[str, Any]:
 
 
 def _slug(game: str) -> str:
-    return game.strip().lower().replace(" ", "_") or "unknown"
+    # Canonical slug lives in graph.plan_utils so main.py / app.py /
+    # agent_runner.py share it (tracker 0.7).
+    return slugify(game)
+
+
+def _session_dir(game: str) -> Path:
+    """Per-game session directory, honouring existing legacy-slug dirs.
+
+    All session paths (kb/, code_kb/, report.md) must resolve through
+    the same function or a legacy directory would receive the KB while
+    the report lands in the canonical one.
+    """
+    return SESSIONS_DIR / resolve_session_slug(game, SESSIONS_DIR)
+
+
+# Event kinds that are loop bookkeeping, not evidence. The dead-end
+# detector must ignore them: the analyst and critic append one each per
+# iteration, so counting them would make the KB "grow" every verdict
+# and the detector could never fire.
+_BOOKKEEPING_EVENT_KINDS = (EVT_ANALYSIS, EVT_VERDICT, EVT_CONSOLIDATED)
+
+
+def _stable_content_hash(value: Any) -> str:
+    """Lossless identity for persisted evidence payloads.
+
+    Hash the complete normalized value rather than a text prefix: expanded
+    disassembly windows commonly share their opening lines while adding the
+    decisive evidence near the end.
+    """
+    if isinstance(value, str):
+        normalized = value
+    else:
+        normalized = json.dumps(
+            value, sort_keys=True, separators=(",", ":"), default=str,
+        )
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _tool_result_is_substantive(payload: dict[str, Any]) -> bool:
+    """Whether a successful tool result represents newly gathered evidence.
+
+    Parent-KB calls are read-only views of facts/events already counted by
+    this function; recording another query must not manufacture progress.
+    Likewise Code-KB metadata/export modes are introspection, not evidence.
+    Other Code-KB modes can expose code evidence from the separate layered
+    store, so they remain substantive.
+    """
+    if not payload.get("ok"):
+        return False
+    tool = str(payload.get("tool") or "").strip().lower()
+    mode = str(payload.get("mode") or "").strip().lower()
+    if tool == "kb":
+        return False
+    if tool == "code_kb" and mode in {"stats", "schema", "export"}:
+        return False
+    return True
+
+
+def _substantive_event_count(store: KnowledgeStore) -> int:
+    """Count DISTINCT substantive facts in the KB (dead-end growth signal).
+
+    Identity rules (tracker 0.2):
+    - bookkeeping kinds (analysis / verdict / consolidated) never count;
+    - failed and read-only/introspective tool calls never count — a retry or
+      KB-query loop is not progress;
+    - evidence-bearing tool results are keyed on a full normalized-content
+      hash, NOT step_id, so identical replans add nothing while an expanded
+      result with new evidence at the tail does count;
+    - derived facts are keyed on their stable payload identity (label
+      addr+name, routine start+end, hypothesis text, …), so re-emitting
+      a known fact adds nothing while a genuinely new one counts.
+
+    O(substantive events) per critic verdict — acceptable for now;
+    indexing this is part of tracker 1.6.
+    """
+    try:
+        rows = store.query(
+            "SELECT kind, payload_json FROM events WHERE kind NOT IN (?, ?, ?)",
+            _BOOKKEEPING_EVENT_KINDS,
+        )
+    except Exception:  # noqa: BLE001
+        return int(store.stats().get("events_total", 0))
+
+    idents: set[tuple] = set()
+    for r in rows:
+        kind = r.get("kind")
+        try:
+            p = json.loads(r.get("payload_json") or "{}")
+        except Exception:  # noqa: BLE001
+            p = {}
+        if not isinstance(p, dict):
+            p = {}
+
+        if kind == EVT_TOOL_RESULT:
+            if not _tool_result_is_substantive(p):
+                continue
+            ident = (
+                kind,
+                str(p.get("tool") or "").strip().lower(),
+                _stable_content_hash(p.get("data", "")),
+            )
+        elif kind == EVT_LABEL:
+            ident = (kind, p.get("addr"), p.get("name"))
+        elif kind == EVT_ROUTINE:
+            ident = (kind, p.get("start"), p.get("end"))
+        elif kind == EVT_DATA_STRUCTURE:
+            ident = (kind, p.get("start"), p.get("end"), p.get("kind"))
+        elif kind == EVT_HYPOTHESIS:
+            ident = (kind, (p.get("text") or "").strip())
+        else:
+            # ingest_* and future kinds: stable payload identity with
+            # per-run volatile keys stripped.
+            stable = {
+                k: v for k, v in p.items() if k not in ("step_id", "ts")
+            }
+            ident = (
+                kind,
+                _stable_content_hash(stable),
+            )
+        idents.add(ident)
+    return len(idents)
 
 
 def _normalize_plan_ids(plan: list[dict[str, Any]], state: C64State) -> list[dict[str, Any]]:
@@ -477,7 +607,7 @@ def _normalize_plan_ids(plan: list[dict[str, Any]], state: C64State) -> list[dic
 def load_inputs(state: C64State) -> dict[str, Any]:
     """Hydrate the KB: open store, ingest dump + partial asm idempotently."""
     game = state.get("game", "unknown")
-    kb_handle = str(SESSIONS_DIR / _slug(game) / "kb")
+    kb_handle = str(_session_dir(game) / "kb")
     Path(kb_handle).mkdir(parents=True, exist_ok=True)
 
     store = get_store(kb_handle)
@@ -554,8 +684,11 @@ def load_inputs(state: C64State) -> dict[str, Any]:
         "kb_digest": initial_digest,
         "iteration": 0,
         "replan_count": 0,
+        "revise_count": 0,
         "budget_used": 0.0,
-        "last_kb_event_count": int(s.get("events_total", 0)),
+        # Substantive (non-bookkeeping) events only — same measure the
+        # critic uses, so the first verdict's growth check is honest.
+        "last_kb_event_count": _substantive_event_count(store),
         "messages": [AIMessage(content=m) for m in msgs],
     }
 
@@ -591,7 +724,7 @@ def _hydrate_code_kb(
         msgs.append(f"code_kb disabled (import failed): {e}")
         return None, msgs
 
-    handle_path = SESSIONS_DIR / _slug(game) / "code_kb"
+    handle_path = _session_dir(game) / "code_kb"
     handle_path.mkdir(parents=True, exist_ok=True)
     code_store = get_code_store(str(handle_path))
 
@@ -747,7 +880,7 @@ def _format_evidence(evidence: list[Any], store: "KnowledgeStore | None") -> str
 
 def write_report(state: C64State) -> dict[str, Any]:
     game = state.get("game", "unknown")
-    out_dir = SESSIONS_DIR / _slug(game)
+    out_dir = _session_dir(game)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     candidate = state.get("candidate_answer") or {}
@@ -899,6 +1032,28 @@ def planner_node(state: C64State) -> dict[str, Any]:
         f"Most recent critic feedback:\n{critique}\n\n" if critique else ""
     )
 
+    # When the previous plan blocked on unsatisfiable dependencies the
+    # planner must see why, or it will re-emit the same broken shape
+    # (tracker 0.6). The structured failures are in `tool_results`.
+    blocked_block = ""
+    if state.get("plan_blocked"):
+        blocked = [
+            r for r in state.get("tool_results", []) or []
+            if r.get("rejection") == "dependency_unsatisfied"
+        ][-8:]
+        if blocked:
+            lines = [
+                f"- {r.get('step_id')}: {str(r.get('data', ''))[:220]}"
+                for r in blocked
+            ]
+            blocked_block = (
+                "**The previous plan BLOCKED** — these steps had failed or "
+                "unsatisfiable dependencies. Your new plan MUST reference "
+                "only step ids it itself contains in `depends_on`, and must "
+                "not depend on tools/steps that failed permanently:\n"
+                + "\n".join(lines) + "\n\n"
+            )
+
     vice_mcp = os.getenv("VICE_MCP_URL", "").strip()
     if vice_mcp:
         vice_runtime = (
@@ -926,6 +1081,7 @@ def planner_node(state: C64State) -> dict[str, Any]:
         f"Iteration: {state.get('iteration', 0)}  ·  "
         f"replan_count: {state.get('replan_count', 0)}\n\n"
         f"{vice_runtime}"
+        f"{blocked_block}"
         f"{critique_block}"
         f"{suggested_block}"
         "KB schema (use these EXACT column names if you emit raw SQL —\n"
@@ -984,6 +1140,20 @@ def planner_node(state: C64State) -> dict[str, Any]:
         plan_raw = fallback_plan
     plan = _normalize_plan_ids(plan_raw, state)
 
+    # Enforce the plan-size cap RECURSION_LIMIT is derived from
+    # (tracker 0.1). Preserve dependency references exactly: if a retained
+    # step depended on a dropped/later step, the executor must diagnose the
+    # now-missing dependency and replan. Silently deleting the edge would
+    # make the step runnable with unresolved inputs (tracker 0.6).
+    truncated_note = ""
+    if len(plan) > MAX_PLAN_STEPS:
+        dropped = len(plan) - MAX_PLAN_STEPS
+        plan = plan[:MAX_PLAN_STEPS]
+        truncated_note = (
+            f" (truncated: dropped {dropped} step(s) beyond the "
+            f"{MAX_PLAN_STEPS}-step cap; dependency references preserved)"
+        )
+
     # If we are replanning (we already have a verdict), bump replan_count
     # so the dead-end detector can react.
     new_replan_count = state.get("replan_count", 0)
@@ -992,9 +1162,12 @@ def planner_node(state: C64State) -> dict[str, Any]:
 
     return {
         "plan": plan,
+        "plan_blocked": False,
         "iteration": state.get("iteration", 0) + 1,
         "replan_count": new_replan_count,
-        "messages": [AIMessage(content=f"Planner produced {len(plan)} steps.")],
+        "messages": [AIMessage(
+            content=f"Planner produced {len(plan)} steps.{truncated_note}",
+        )],
     }
 
 
@@ -1013,33 +1186,95 @@ def executor_node(state: C64State) -> dict[str, Any]:
        The enriched args are merged back into the plan so every downstream
        tool node sees them.
     """
-    done = {r.get("step_id") for r in state.get("tool_results", [])}
+    tool_results = state.get("tool_results", []) or []
+    status = step_status(tool_results)
     plan = list(state.get("plan", []) or [])
 
-    runnable = []
-    for s in plan:
-        if s.get("id") in done:
-            continue
-        deps = s.get("depends_on") or []
-        if all(d in done for d in deps):
-            runnable.append(s)
+    # A step is "done" only when it succeeded or its retries are
+    # exhausted — `ok=False` results used to permanently burn the step
+    # (tracker 0.3). Runnable steps come back untried-first so a flaky
+    # step being retried never starves fresh work.
+    runnable = runnable_steps(state)
 
     if not runnable:
-        # If pending steps remain but none are runnable the plan has a
-        # dependency cycle — fall back to FIFO so we don't stall.
-        pending = [s for s in plan if s.get("id") not in done]
+        pending = [s for s in plan if str(s.get("id")) not in status.done]
         if not pending:
-            return {"current_step_id": None}
-        runnable = [pending[0]]
+            return {"current_step_id": None, "plan_blocked": False}
+        # Blocked plan: every pending step has an unsatisfied dependency
+        # (a prerequisite that failed permanently, a dep id missing from
+        # the plan, or a dependency cycle). The old fallback dispatched
+        # pending[0] anyway — usually with unresolved null args producing
+        # plausible-but-wrong results. Instead: record a structured
+        # failure per blocked step and raise `plan_blocked`, which
+        # `route_tool` turns into a deterministic replan (bounded by
+        # MAX_ITERS) rather than letting the analyst/critic accept an
+        # answer built on a broken plan (tracker 0.6).
+        plan_ids = {str(s.get("id")) for s in plan}
+        blocked_results: list[dict[str, Any]] = []
+        blocked_ids: list[str] = []
+        for s in pending:
+            sid = str(s.get("id"))
+            blocked_ids.append(sid)
+            reasons: list[str] = []
+            for d in (s.get("depends_on") or []):
+                d = str(d)
+                if d in status.succeeded:
+                    continue
+                if d in status.exhausted:
+                    reasons.append(f"`{d}` failed permanently")
+                elif d not in plan_ids:
+                    reasons.append(f"`{d}` is missing from the plan")
+                else:
+                    reasons.append(f"`{d}` can never run (dependency cycle)")
+            blocked_results.append({
+                "step_id": sid,
+                "tool": s.get("tool", "?"),
+                "ok": False,
+                "retryable": False,
+                "rejection": "dependency_unsatisfied",
+                "data": (
+                    f"dependency_unsatisfied: step {sid} is blocked — "
+                    + ("; ".join(reasons) or "no runnable prerequisite")
+                    + ". Plan aborted for replan: the next plan must "
+                    "reference only steps it contains and must not "
+                    "depend on permanently-failed work."
+                ),
+            })
+        return {
+            "current_step_id": None,
+            "plan_blocked": True,
+            "tool_results": blocked_results,
+            "messages": [AIMessage(content=(
+                f"Executor: plan blocked — {len(pending)} step(s) with "
+                f"unsatisfiable dependencies ({', '.join(blocked_ids)}); "
+                "routing to replan."
+            ))],
+        }
 
     nxt = runnable[0]
     step_id = nxt["id"]
+
+    # When retrying a previously-failed step, show the executor LLM the
+    # last error so it can repair the args instead of repeating them.
+    prev_failures = [
+        r for r in tool_results
+        if str(r.get("step_id")) == str(step_id) and not r.get("ok")
+    ]
+    retry_block = ""
+    if prev_failures:
+        last_err = str(prev_failures[-1].get("data", ""))[:600]
+        retry_block = (
+            f"NOTE: this step already FAILED {len(prev_failures)} time(s). "
+            "Adjust the args so the retry can succeed.\n"
+            f"Last error:\n{last_err}\n\n"
+        )
 
     # Ask the executor LLM to enrich / validate the args using current KB state.
     kb_snippet = _kb_digest_for_state(state)
     prompt = (
         f"Question (context): {state.get('question')}\n\n"
         f"Selected step (next to execute):\n{json.dumps(nxt, default=str)}\n\n"
+        f"{retry_block}"
         f"Current KB digest (facts discovered so far):\n{kb_snippet[:8_000]}\n\n"
         "Fill in any null arg values using facts from the KB digest above, "
         "then emit JSON exactly per your role contract: "
@@ -1072,6 +1307,7 @@ def executor_node(state: C64State) -> dict[str, Any]:
     return {
         "current_step_id": step_id,
         "plan": updated_plan,
+        "plan_blocked": False,
         "messages": [
             AIMessage(
                 content=(
@@ -1452,9 +1688,22 @@ def analyst_node(state: C64State) -> dict[str, Any]:
             f"{json.dumps(state.get('candidate_answer') or {}, indent=2, default=str)[:4_000]}\n\n"
         )
 
+    # Surface permanently-failed steps so the analyst never reads the
+    # absence of that evidence as negative evidence (tracker 0.3).
+    failed_notes = failed_step_notes(state)
+    failed_block = ""
+    if failed_notes:
+        failed_block = (
+            "The following plan steps FAILED — their evidence was NEVER "
+            "gathered. Do NOT treat its absence as negative evidence; "
+            "mention material gaps in `open_questions`:\n"
+            + "\n".join(failed_notes) + "\n\n"
+        )
+
     prompt = (
         f"Question: {state.get('question')}\n\n"
         f"{revision_block}"
+        f"{failed_block}"
         "KB digest (the COMPLETE evidence available to you — do not invent "
         "anything outside it):\n"
         "----- BEGIN DIGEST -----\n"
@@ -1597,11 +1846,27 @@ def critic_node(state: C64State) -> dict[str, Any]:
 
     critique = out.get("critique") or fallback["critique"]
     suggested = out.get("suggested_steps") or []
+    optional_followups = list(out.get("optional_followups") or [])
 
-    # Force `replan` when the critic asked for new tool calls but
-    # decided `revise`/`accept` (common LLM inconsistency).
+    # `suggested_steps` are BLOCKING tool work by contract; non-blocking
+    # ideas belong in `optional_followups` (which accompanies `accept`
+    # untouched). An `accept` or `revise` carrying suggested_steps is
+    # inconsistent — the required work would otherwise silently vanish —
+    # so both escalate to `replan` and the planner consumes the steps
+    # (tracker 0.5).
     if suggested and decision == "accept":
-        decision = "revise"
+        decision = "replan"
+        critique += (
+            "\n\n_(auto-guardrail: `accept` + `suggested_steps` — "
+            "suggested steps are blocking tool work, so escalated to "
+            "`replan`; use `optional_followups` for non-blocking ideas.)_"
+        )
+    elif suggested and decision == "revise":
+        decision = "replan"
+        critique += (
+            "\n\n_(auto-guardrail: `revise` + `suggested_steps` — "
+            "escalated to `replan` so the suggested tool calls run.)_"
+        )
 
     # Late guardrail: very-high-confidence answer with no evidence cited
     # is suspicious — bump to revise unless the critic explicitly accepted.
@@ -1613,31 +1878,67 @@ def critic_node(state: C64State) -> dict[str, Any]:
             "empty; demoted to `revise`.)_"
         )
 
+    # Revise cap — applied LAST so no guardrail above can keep the
+    # analyst↔critic ping-pong alive forever (tracker 0.4).
+    revise_count = int(state.get("revise_count", 0))
+    if decision == "revise" and revise_count >= MAX_CONSECUTIVE_REVISES:
+        decision = "accept"
+        critique += (
+            f"\n\n_(auto-guardrail: {revise_count} consecutive `revise` "
+            "verdicts — forcing `accept`; the remaining concerns above "
+            "are recorded in the report.)_"
+        )
+    new_revise_count = revise_count + 1 if decision == "revise" else 0
+
     verdict = {
         "decision": decision,
         "critique": critique,
         "suggested_steps": suggested,
+        "optional_followups": optional_followups,
         "_role_used": out.get("_role_used"),
     }
 
-    # Persist verdict + snapshot the KB size so the dead-end detector
-    # can tell whether the next replan actually adds new facts.
-    last_kb_event_count = 0
+    # Persist verdict + snapshot the substantive KB event count. The
+    # growth comparison must run against the snapshot taken at the
+    # PREVIOUS verdict, *before* we overwrite it — the old code wrote
+    # the fresh count into the same state update the dead-end router
+    # then read, so "KB grew" was always false (tracker 0.2).
+    prev_count = int(state.get("last_kb_event_count", 0))
+    new_count = prev_count
     if state.get("kb_handle"):
         store = get_store(state["kb_handle"])
+        new_count = _substantive_event_count(store)
+        verdict["kb_grew_since_last_verdict"] = new_count > prev_count
         store.append_event(EVT_VERDICT, "critic", verdict)
-        last_kb_event_count = int(store.stats().get("events_total", 0))
+    else:
+        # Unknown growth must never terminate a possibly-productive replan.
+        verdict["kb_grew_since_last_verdict"] = True
+
+    updates: dict[str, Any] = {
+        "verdict": verdict,
+        "history": [verdict],
+        "last_kb_event_count": new_count,
+        "revise_count": new_revise_count,
+    }
+
+    # On accept, surface the optional follow-ups in the final answer's
+    # open questions so they reach the report instead of vanishing.
+    if decision == "accept" and optional_followups:
+        cand = dict(state.get("candidate_answer") or {})
+        open_qs = list(cand.get("open_questions") or [])
+        for f in optional_followups:
+            text = f.get("goal") if isinstance(f, dict) else str(f)
+            if text:
+                open_qs.append(f"Follow-up suggested by critic: {text}")
+        cand["open_questions"] = open_qs
+        updates["candidate_answer"] = cand
 
     role_used = verdict.get("_role_used")
     suffix = f" (via {role_used})" if role_used and role_used != "critic" else ""
-    return {
-        "verdict": verdict,
-        "history": [verdict],
-        "last_kb_event_count": last_kb_event_count,
-        "messages": [
-            AIMessage(content=f"Critic verdict: {decision}{suffix}."),
-        ],
-    }
+    updates["messages"] = [
+        AIMessage(content=f"Critic verdict: {decision}{suffix}."),
+    ]
+    return updates
 
 
 # --------------------------------------------------------------------------- #
@@ -2109,7 +2410,8 @@ def capstone_node(state: C64State) -> dict[str, Any]:
 
     if not state.get("kb_handle"):
         return _record_result(
-            "capstone", step_id, False, "no KB handle", extra={"mode": mode},
+            "capstone", step_id, False, "no KB handle",
+            extra={"mode": mode, "retryable": False},
         )
 
     store = get_store(state["kb_handle"])
@@ -2123,7 +2425,7 @@ def capstone_node(state: C64State) -> dict[str, Any]:
         return _record_result(
             "capstone", step_id, False,
             f"capstone {mode} requires a dump, but none is loaded",
-            extra={"mode": mode},
+            extra={"mode": mode, "retryable": False},
         )
 
     handler = _CAPSTONE_MODES.get(mode)
@@ -2175,7 +2477,7 @@ def tavily_node(state: C64State) -> dict[str, Any]:
         return _record_result(
             "tavily", step.get("id", "?"), False,
             "TAVILY_API_KEY not set — skipped real search",
-            extra={"query": query},
+            extra={"query": query, "retryable": False},
         )
 
     try:
@@ -2188,7 +2490,8 @@ def tavily_node(state: C64State) -> dict[str, Any]:
                 f"({sys.executable}). Install with: "
                 "`pip install tavily-python` (or re-run `pip install -e .` "
                 "after pulling pyproject changes).",
-                extra={"query": query, "interpreter": sys.executable},
+                extra={"query": query, "interpreter": sys.executable,
+                       "retryable": False},
             )
 
         client = TavilyClient(api_key=api_key)
@@ -2334,7 +2637,8 @@ def _vice_disassemble_fallback(
         return _record_result(
             "capstone", step_id, False,
             f"capstone failed ({capstone_err}); VICE_MCP_URL not set for fallback",
-            extra={"start": start, "length": length, "fallback_attempted": False},
+            extra={"start": start, "length": length,
+                   "fallback_attempted": False, "retryable": False},
         )
     try:
         requested_addr = f"${start:04X}"
@@ -2416,7 +2720,7 @@ def vice_mcp_node(state: C64State) -> dict[str, Any]:
         return _record_result(
             "vice", step_id, False,
             "VICE_MCP_URL not set — skipped (start vice-mcp server to enable)",
-            extra={"method": method, "args": args},
+            extra={"method": method, "args": args, "retryable": False},
         )
 
     # Reject low-value diagnostic calls that produce no code facts.
@@ -2590,7 +2894,10 @@ def kb_query_node(state: C64State) -> dict[str, Any]:
     args = step.get("args", {}) or {}
     step_id = step.get("id", "?")
     if not state.get("kb_handle"):
-        return _record_result("kb", step_id, False, "no KB handle")
+        return _record_result(
+            "kb", step_id, False, "no KB handle",
+            extra={"retryable": False},
+        )
 
     store = get_store(state["kb_handle"])
     mode = str(args.get("mode") or ("sql" if args.get("sql") else "stats")).lower()
