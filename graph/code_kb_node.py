@@ -73,7 +73,8 @@ CODE_KB_SCHEMA_HINT = (
     "  code_routines(start_addr PK, end_addr, name, summary, source_file,"
     "                entries_json, exits_json, size_bytes, annotation_id,"
     "                confidence)\n"
-    "  code_xrefs(src_addr, dst_addr, via_vector, kind, annotation_id)\n"
+    "  code_xrefs(src_addr, dst_addr, via_vector, kind, source_file,\n"
+    "             annotation_id)  -- one row per (edge, source)\n"
     "    kind ∈ {jsr, jmp, branch, jmp_indirect, fallthrough}\n"
     "  code_smc_sites(src_addr, dst_addr, mnemonic, operand, smc_kind)\n"
     "  code_class(addr PK, classification, confidence, evidence)\n"
@@ -218,8 +219,10 @@ def _mode_routine(store, args, step_id):
 
 def _mode_xrefs_to(store, args, step_id):
     addr = _hex_to_int(args.get("addr") or args.get("dst") or 0, 0)
+    # DISTINCT: xref rows are per-source (Phase 2 hardening) — the same
+    # edge asserted by several files must show once here.
     rows = store.query(
-        "SELECT src_addr, kind, annotation_id FROM code_xrefs"
+        "SELECT DISTINCT src_addr, kind FROM code_xrefs"
         " WHERE dst_addr = ? ORDER BY src_addr LIMIT ?",
         (addr & 0xFFFF, int(args.get("limit", 100))),
     )
@@ -237,7 +240,7 @@ def _mode_xrefs_from(store, args, step_id):
     src = _hex_to_int(args.get("addr") or args.get("src") or 0, 0)
     end = _hex_to_int(args.get("end"), src)
     rows = store.query(
-        "SELECT src_addr, dst_addr, kind, via_vector, annotation_id"
+        "SELECT DISTINCT src_addr, dst_addr, kind, via_vector"
         "  FROM code_xrefs WHERE src_addr BETWEEN ? AND ?"
         "  ORDER BY src_addr LIMIT ?",
         (src, end, int(args.get("limit", 200))),
@@ -619,32 +622,56 @@ def _invoke_layer1(
     system_prompt: str, user_prompt: str,
 ) -> tuple[dict | None, str | None, str | None]:
     """Try the LLM once per role; return (parsed_json, role_used, last_err)."""
+    from graph import usage as llm_usage
     from graph.llm import get_llm
     from graph.nodes import _flatten_lc_ai_message_content
 
     last_err = None
     for r in [role, *backup_roles]:
+        model_name = None
         try:
             llm = get_llm(r)
+            model_name = (
+                getattr(llm, "model_name", None) or getattr(llm, "model", None)
+            )
             msg = llm.invoke([
                 SystemMessage(system_prompt),
                 HumanMessage(user_prompt),
             ])
         except Exception as e:  # noqa: BLE001
+            llm_usage.record({
+                "role": f"layer1:{r}", "model": model_name,
+                "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0,
+                "ok": False, "error": f"{type(e).__name__}: {e}"[:200],
+            })
             last_err = f"{r}: {type(e).__name__}: {e}"
             print(f"[code_kb:layer1:{r}] FAILED — {last_err}",
                   file=sys.stderr, flush=True)
             continue
 
+        # Layer-1 annotation calls count against the run budget too
+        # (tracker 1.3/1.4) — they used to be entirely invisible. `ok`
+        # means "usable parsed contract", not transport success (review
+        # finding 5): empty/non-JSON replies are demoted below.
+        in_tok, out_tok = llm_usage.extract_usage(msg)
+        entry = llm_usage.record({
+            "role": f"layer1:{r}", "model": model_name,
+            "input_tokens": in_tok, "output_tokens": out_tok,
+            "cost_usd": llm_usage.estimate_cost_usd(model_name, in_tok, out_tok),
+            "ok": True, "transport_ok": True,
+        })
+
         content = _flatten_lc_ai_message_content(msg)
         if not content.strip():
             last_err = f"{r}: empty response"
+            llm_usage.mark_failed(entry, "empty response")
             print(f"[code_kb:layer1:{r}] empty response", file=sys.stderr, flush=True)
             continue
         parsed = _try_parse_json(content)
         if isinstance(parsed, dict):
             return parsed, r, None
         last_err = f"{r}: non-JSON response ({len(content)} chars)"
+        llm_usage.mark_failed(entry, f"non-JSON response ({len(content)} chars)")
         print(f"[code_kb:layer1:{r}] non-JSON response", file=sys.stderr, flush=True)
     return None, None, last_err
 

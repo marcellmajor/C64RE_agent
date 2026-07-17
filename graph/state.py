@@ -69,6 +69,13 @@ class C64State(TypedDict, total=False):
     # `plan_utils.normalize_truncated_state`.
     termination_reason: str | None
 
+    # Index into `tool_results` up to which the synthesizer has already
+    # considered results for LLM extraction. Results past this index are
+    # accumulated and extracted in one batched LLM call when the plan
+    # drains or the batch fills (tracker 1.2). `tool_results` only grows
+    # (its reducer is `add`), so an index high-water mark is stable.
+    synth_processed_count: int
+
     # --- control ---
     iteration: int
     replan_count: int
@@ -76,7 +83,19 @@ class C64State(TypedDict, total=False):
     # forces `accept` once this reaches MAX_CONSECUTIVE_REVISES so the
     # analyst↔critic ping-pong terminates (tracker 0.4).
     revise_count: int
-    budget_used: float
+    # Accumulated estimated USD across all LLM calls (tracker 1.4).
+    # Nodes return per-drain deltas; stays 0.0 when config/llm.json has
+    # no "pricing" section (tokens are still tracked in `llm_usage`).
+    budget_used: Annotated[float, add]
+    # Accumulated total tokens (input+output) across all LLM calls —
+    # the always-available budget fallback (`routers.token_budget()`)
+    # so unpriced models still hit a runtime cap. Deliberately a
+    # separate field from `budget_used`: no unit mixing.
+    tokens_used: Annotated[int, add]
+    # One entry per LLM call: role, model, tokens, cost, ok (usable
+    # contract response) / transport_ok / error. Aggregated per-role in
+    # the report (tracker 1.4).
+    llm_usage: Annotated[list[dict[str, Any]], add]
 
     # --- transcript (LangChain message log; viewable in Studio/LangSmith) ---
     messages: Annotated[list, add_messages]

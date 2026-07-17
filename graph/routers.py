@@ -13,17 +13,54 @@ from __future__ import annotations
 
 from typing import Literal
 
+import os
+
 from graph.plan_utils import MAX_ITERS, pending_steps
 from graph.state import C64State
 from memory import get_store
 
-# Token budget over which the curator should compact tool_result events.
-KB_TOKEN_THRESHOLD = 80_000
+# Token volume of UNCOMPACTED tool_result events over which the curator
+# runs (tracker 2.1). The old gate keyed on total kb.json size, which is
+# append-only and never shrinks — once a game's KB crossed the threshold,
+# every synthesizer step in every future session paid a curator LLM call
+# forever. Compaction advances a high-water mark, so this gate closes.
+UNCOMPACTED_TOKEN_THRESHOLD = 40_000
 
 # Hard caps for the outer critic loop. MAX_ITERS lives in
 # graph.plan_utils (RECURSION_LIMIT is derived from it) and is
 # re-exported here for existing importers.
-BUDGET_CAP = 5.0  # USD or tokens (depending on what `budget_used` tracks)
+#
+# Two budget limits, deliberately in distinct units/fields (review
+# finding 3): `budget_used` is estimated USD and only accrues when
+# config/llm.json has a "pricing" section; `tokens_used` always accrues,
+# so unpriced/unknown models still hit a runtime cap.
+BUDGET_CAP = 5.0  # USD (estimated; requires a pricing table to accrue)
+
+# Fallback token cap: ~MAX_ITERS iterations of a busy plan at ~20k
+# tokens per LLM call stay well under this; a runaway loop does not.
+DEFAULT_TOKEN_BUDGET = 3_000_000
+
+
+def token_budget() -> int:
+    """Resolve the total-token cap: env → config default → constant.
+
+    Env: ``C64RE_TOKEN_BUDGET``; config: ``defaults.token_budget`` in
+    `config/llm.json`.
+    """
+    env = os.getenv("C64RE_TOKEN_BUDGET", "").strip()
+    if env:
+        try:
+            return int(env)
+        except ValueError:
+            pass
+    try:
+        from graph.llm import load_config
+        v = (load_config().get("defaults") or {}).get("token_budget")
+        if v:
+            return int(v)
+    except Exception:  # noqa: BLE001
+        pass
+    return DEFAULT_TOKEN_BUDGET
 
 
 def _pending_steps(state: C64State) -> list[dict]:
@@ -37,12 +74,12 @@ def _pending_steps(state: C64State) -> list[dict]:
     return pending_steps(state)
 
 
-def _kb_size_tokens(state: C64State) -> int:
-    """Use the real KB size when a handle is available."""
+def _uncompacted_tokens(state: C64State) -> int:
+    """Token volume of tool_result events past the compaction high-water."""
     handle = state.get("kb_handle")
     if handle:
         try:
-            return get_store(handle).kb_size_tokens()
+            return get_store(handle).uncompacted_tool_result_tokens()
         except Exception:  # noqa: BLE001
             pass
     return 1_000 * len(state.get("tool_results", []))
@@ -101,7 +138,7 @@ def post_synth_router(
     state: C64State,
 ) -> Literal["curate", "executor", "analyst"]:
     """Merged curator-gate + more-steps decision (see graph doc §7)."""
-    if _kb_size_tokens(state) > KB_TOKEN_THRESHOLD:
+    if _uncompacted_tokens(state) > UNCOMPACTED_TOKEN_THRESHOLD:
         return "curate"
     if _pending_steps(state):
         return "executor"
@@ -116,6 +153,8 @@ def verdict_router(
     state: C64State,
 ) -> Literal["accept", "revise", "replan", "budget_exceeded"]:
     if state.get("budget_used", 0.0) >= BUDGET_CAP:
+        return "budget_exceeded"
+    if int(state.get("tokens_used", 0) or 0) >= token_budget():
         return "budget_exceeded"
     if state.get("iteration", 0) >= MAX_ITERS:
         return "budget_exceeded"

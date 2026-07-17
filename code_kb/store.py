@@ -17,7 +17,9 @@ shadow) it but never remove it. The SQLite view always reflects the
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 import sqlite3
 import threading
 import uuid
@@ -42,6 +44,7 @@ from code_kb.schema import (
     EVT_DISASM_WINDOW,
     EVT_INGEST_ASM,
     EVT_INGEST_DUMP,
+    EVT_INVALIDATE_SOURCE,
     EVT_LAYER_RUN,
     SCHEMA_DDL,
 )
@@ -50,6 +53,26 @@ from code_kb.schema import (
 # Module-level cache so multiple nodes in the same process share a handle.
 _CODE_STORE_CACHE: dict[str, "CodeKnowledgeStore"] = {}
 _CACHE_LOCK = threading.Lock()
+
+
+# Pre-hardening layer-0 classification payloads lacked `source_file`, but
+# their evidence templates embedded the source path verbatim. Recovering
+# it at replay time lets path-based invalidation reach legacy rows
+# without touching the append-only event log (Phase 2 hardening).
+_LEGACY_CLASSIFY_PATTERNS = (
+    re.compile(r"consecutive parsed instructions in (?P<path>.+)$"),
+    re.compile(r"gap marker in (?P<path>.+?) \(\d+ bytes\)$"),
+)
+
+
+def _recover_classify_source(payload_inner: dict[str, Any]) -> str | None:
+    """Best-effort provenance for legacy `classify` payloads."""
+    evidence = str(payload_inner.get("evidence_text") or "")
+    for pat in _LEGACY_CLASSIFY_PATTERNS:
+        m = pat.search(evidence)
+        if m:
+            return m.group("path")
+    return None
 
 
 def get_code_store(handle: str | Path) -> "CodeKnowledgeStore":
@@ -259,25 +282,46 @@ class CodeKnowledgeStore:
 
     # ---- ingestion convenience ------------------------------------------ #
 
-    def ingest_dump(self, path: Path) -> str | None:
-        """Idempotent: skip if a dump with this path is already recorded."""
+    def ingest_dump(self, path: Path) -> tuple[str | None, bool]:
+        """Content-aware idempotent dump ingest (tracker 2.2).
+
+        Returns ``(event_id_or_None, changed)``: `event_id` is None when
+        the dump is already current; `changed` is True when the file's
+        content differs from a previously ingested version under the
+        same path (the caller should invalidate dump-derived rows).
+        """
         path = Path(path)
+        if not path.exists():
+            return None, False
+        data = path.read_bytes()
+        sha = hashlib.sha256(data).hexdigest()
+
+        prev_sha: str | None = None
+        seen_path = False
         for evt in self._iter_events():
             if (
                 evt["kind"] == EVT_INGEST_DUMP
                 and evt["payload"].get("path") == str(path)
             ):
-                self._dump_bytes = path.read_bytes() if path.exists() else None
-                self._dump_path = path if path.exists() else None
-                return None
-        if not path.exists():
-            return None
-        self._dump_bytes = path.read_bytes()
+                seen_path = True
+                prev_sha = evt["payload"].get("sha256")
+
+        self._dump_bytes = data
         self._dump_path = path
-        return self.append_event(
-            EVT_INGEST_DUMP, "load_inputs",
-            {"path": str(path), "size": len(self._dump_bytes)},
-        )
+        if seen_path and prev_sha == sha:
+            return None, False
+
+        payload: dict[str, Any] = {
+            "path": str(path), "size": len(data), "sha256": sha,
+        }
+        changed = False
+        if seen_path:
+            if prev_sha is not None:
+                payload["refreshed_from"] = prev_sha
+                changed = True
+            else:
+                payload["sha_backfill"] = True  # legacy event lacked a hash
+        return self.append_event(EVT_INGEST_DUMP, "load_inputs", payload), changed
 
     def ingest_asm_doc(
         self, path: Path, *, content: str, instructions: int, routines: int,
@@ -294,6 +338,7 @@ class CodeKnowledgeStore:
                 "path": str(path),
                 "size": size,
                 "mtime": mtime,
+                "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
                 "content": content,
                 "instructions": int(instructions),
                 "routines": int(routines),
@@ -301,6 +346,7 @@ class CodeKnowledgeStore:
         )
 
     def already_ingested_asm(self, path: Path) -> bool:
+        """Path-only check (legacy). Prefer `asm_freshness` (tracker 2.2)."""
         path = str(Path(path))
         for evt in self._iter_events():
             if (
@@ -309,6 +355,65 @@ class CodeKnowledgeStore:
             ):
                 return True
         return False
+
+    def asm_freshness(self, path: Path, content: str) -> str:
+        """"new" | "current" | "changed" for an asm file's content.
+
+        `already_ingested_asm` was path-only — an asm file edited under
+        the same filename was silently skipped, leaving stale Layer-0
+        facts (tracker 2.2). Compares the content sha256 against the
+        latest ingest event for the path; legacy events without a hash
+        fall back to size+mtime.
+        """
+        latest: dict[str, Any] | None = None
+        for evt in self._iter_events():
+            if (
+                evt["kind"] == EVT_INGEST_ASM
+                and evt["payload"].get("path") == str(Path(path))
+            ):
+                latest = evt["payload"]
+        if latest is None:
+            return "new"
+
+        sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        prev_sha = latest.get("sha256")
+        if prev_sha is not None:
+            return "current" if prev_sha == sha else "changed"
+
+        # Legacy event without a hash: size + mtime approximation.
+        try:
+            mtime = Path(path).stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        if (
+            int(latest.get("size") or -1) == len(content)
+            and float(latest.get("mtime") or 0.0) >= mtime
+        ):
+            return "current"
+        return "changed"
+
+    def invalidate_source(self, source_file: str, *, like: bool = False) -> str:
+        """Append an event that removes everything *source_file* produced.
+
+        Event-based so a full rebuild replays the deletion BEFORE the
+        re-ingest events that follow it, reproducing the same state
+        (tracker 2.2). `like=True` treats *source_file* as a SQL LIKE
+        pattern (used to drop `capstone:%`/`vice:%` disasm windows when
+        the dump content changes).
+
+        Replay semantics (Phase 2 hardening, final): the source's
+        CANONICAL annotation rows are deleted (all kinds — routines,
+        labels, instructions, hypotheses, xrefs, SMC sites,
+        classifications), then every typed projection is re-materialized
+        from the surviving annotations in stable (ts, id) order. That
+        restores a surviving source's fact on singleton-keyed views
+        where the invalidated source had overwritten it, and preserves
+        per-source xref/SMC provenance rows exactly.
+        """
+        return self.append_event(
+            EVT_INVALIDATE_SOURCE, "load_inputs",
+            {"source_file": str(source_file), "like": bool(like)},
+        )
 
     # ---- reads ----------------------------------------------------------- #
 
@@ -416,6 +521,40 @@ class CodeKnowledgeStore:
         if evt["kind"] == EVT_ANNOTATION:
             self._apply_annotation_to_sqlite(evt)
 
+        if evt["kind"] == EVT_INVALIDATE_SOURCE:
+            # Source file changed on disk (tracker 2.2, hardened): drop
+            # the source's CANONICAL annotations, then re-materialize
+            # every typed projection from the surviving annotations. The
+            # earlier per-table DELETE could not restore a surviving
+            # source's fact after the overwriting source was invalidated
+            # (singleton keys: routines/labels/instructions/class).
+            # Runs identically live, after reopen, and under full replay.
+            p = evt["payload"]
+            pattern = str(p.get("source_file") or "")
+            if pattern:
+                op = "LIKE" if p.get("like") else "="
+                self._db.execute(
+                    f"DELETE FROM annotations WHERE source_file {op} ?",  # noqa: S608
+                    (pattern,),
+                )
+                self._db.execute(
+                    f"DELETE FROM asm_docs WHERE path {op} ?",
+                    (pattern,),
+                )
+                # Conservative sweep (documented): deterministic layer-0
+                # classification annotations whose provenance could NOT
+                # be recovered (hand-altered legacy payloads) cannot be
+                # judged current after ANY source changed — drop them so
+                # stale facts are never presented as current; a re-ingest
+                # re-creates them with full provenance.
+                self._db.execute(
+                    "DELETE FROM annotations WHERE kind = ? AND layer = 0"
+                    " AND producer = 'deterministic'"
+                    " AND source_file IS NULL",
+                    (ANN_CLASSIFY,),
+                )
+                self._rematerialize_projections()
+
         if evt["kind"] in (EVT_LAYER_RUN, EVT_DISASM_WINDOW, EVT_INGEST_DUMP):
             return
 
@@ -430,23 +569,128 @@ class CodeKnowledgeStore:
         producer = str(p.get("producer", "unknown"))
         confidence = float(p.get("confidence", 0.5))
         payload_inner = p.get("payload") or {}
+        flags = p.get("flags") or []
+        # Provenance for source invalidation (Phase 2 hardening) — every
+        # annotation row carries the source_file its payload declares.
+        # Legacy pre-hardening `classify` payloads lacked it: recover it
+        # from their evidence template so path-based invalidation reaches
+        # them too (the append-only event log itself is never modified).
+        source_file = payload_inner.get("source_file")
+        if source_file is None and kind == ANN_CLASSIFY:
+            source_file = _recover_classify_source(payload_inner)
+
+        # Append-order sequence (Phase 2 final hardening): replay assigns
+        # 1..N in event-log order; live appends continue with MAX+1
+        # (survivors keep their seq after invalidation deletes, so the
+        # relative order of surviving annotations never changes — the
+        # exact invariant rematerialization sorts by). A re-apply of an
+        # already-known annotation id keeps its original seq.
+        prev = self._db.execute(
+            "SELECT seq FROM annotations WHERE id = ?", (ann_id,),
+        ).fetchone()
+        if prev is not None and prev["seq"] is not None:
+            seq = int(prev["seq"])
+        else:
+            row = self._db.execute(
+                "SELECT COALESCE(MAX(seq), 0) AS m FROM annotations",
+            ).fetchone()
+            seq = int(row["m"]) + 1
 
         self._db.execute(
             "INSERT OR REPLACE INTO annotations"
             " (id, layer, kind, start_addr, end_addr, producer, confidence,"
-            "  payload_json, evidence_json, supersedes_json, flags_json, ts)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "  payload_json, evidence_json, supersedes_json, flags_json,"
+            "  source_file, seq, ts)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 ann_id, layer, kind, start_addr, end_addr, producer,
                 confidence,
                 json.dumps(payload_inner),
                 json.dumps(p.get("evidence") or []),
                 json.dumps(p.get("supersedes") or []),
-                json.dumps(p.get("flags") or []),
+                json.dumps(flags),
+                source_file,
+                seq,
                 evt["ts"],
             ),
         )
 
+        self._project_annotation(
+            ann_id=ann_id, layer=layer, kind=kind, start_addr=start_addr,
+            end_addr=end_addr, producer=producer, confidence=confidence,
+            payload_inner=payload_inner, flags=flags,
+            source_file=source_file,
+        )
+
+    def _rematerialize_projections(self) -> None:
+        """Rebuild every typed projection from the surviving canonical
+        annotations, in TRUE append order (`seq`).
+
+        Called after a source invalidation deleted canonical rows: the
+        singleton-keyed views (`code_routines`, `code_labels`,
+        `instructions`, `code_class`) may have been last written by the
+        invalidated source even though another source still asserts the
+        same fact — replaying the survivors restores that provenance
+        instead of leaving the key empty (Phase 2 hardening).
+
+        Ordering is the explicit `seq` column, never `(ts, id)`:
+        timestamps tie within a bulk ingest and event ids are random
+        UUID fragments, so sorting by them could reverse the append
+        order of equal-timestamp annotations and flip which fact wins a
+        singleton key (reproduced defect). `seq` survives deletions
+        unchanged, so later annotations keep winning exactly as they did
+        before the invalidation — live, after reopen, and under full
+        event-log replay alike.
+        """
+        assert self._db is not None
+        for table in ("code_routines", "code_labels", "instructions",
+                      "hypotheses", "code_xrefs", "code_smc_sites",
+                      "code_class"):
+            self._db.execute(f"DELETE FROM {table}")  # noqa: S608 — fixed tuple
+        rows = self._db.execute(
+            "SELECT id, layer, kind, start_addr, end_addr, producer,"
+            " confidence, payload_json, flags_json, source_file"
+            " FROM annotations ORDER BY seq ASC",
+        ).fetchall()
+        for r in rows:
+            try:
+                payload_inner = json.loads(r["payload_json"] or "{}")
+            except Exception:  # noqa: BLE001
+                payload_inner = {}
+            try:
+                row_flags = json.loads(r["flags_json"] or "[]")
+            except Exception:  # noqa: BLE001
+                row_flags = []
+            self._project_annotation(
+                ann_id=r["id"], layer=int(r["layer"]), kind=str(r["kind"]),
+                start_addr=int(r["start_addr"]), end_addr=int(r["end_addr"]),
+                producer=str(r["producer"]),
+                confidence=float(r["confidence"] or 0.5),
+                payload_inner=payload_inner, flags=row_flags,
+                source_file=r["source_file"],
+            )
+
+    def _project_annotation(
+        self,
+        *,
+        ann_id: str,
+        layer: int,
+        kind: str,
+        start_addr: int,
+        end_addr: int,
+        producer: str,
+        confidence: float,
+        payload_inner: dict[str, Any],
+        flags: list[Any],
+        source_file: str | None,
+    ) -> None:
+        """Project one canonical annotation into the typed views.
+
+        Factored out of `_apply_annotation_to_sqlite` so
+        `_rematerialize_projections` can replay projections from the
+        surviving canonical rows after a source invalidation.
+        """
+        assert self._db is not None
         # ---- project into typed views ----
         if kind == ANN_ROUTINE:
             self._db.execute(
@@ -458,7 +702,7 @@ class CodeKnowledgeStore:
                     start_addr, end_addr,
                     payload_inner.get("name"),
                     payload_inner.get("summary"),
-                    payload_inner.get("source_file"),
+                    source_file,
                     json.dumps(payload_inner.get("entries") or []),
                     json.dumps(payload_inner.get("exits") or []),
                     int(payload_inner.get("size_bytes") or (end_addr - start_addr + 1)),
@@ -478,25 +722,38 @@ class CodeKnowledgeStore:
                 via=int(via) & 0xFFFF if isinstance(via, int) else None,
                 kind=xkind,
                 ann_id=ann_id,
+                source_file=source_file,
             )
 
         elif kind == ANN_SMC:
-            self._db.execute(
-                "INSERT OR REPLACE INTO code_smc_sites"
-                " (src_addr, dst_addr, mnemonic, operand, smc_kind,"
-                "  annotation_id) VALUES (?, ?, ?, ?, ?, ?)",
+            # NULL-safe per-(site, source) dedup, mirroring xrefs: the
+            # same site from two sources keeps two provenance rows so
+            # invalidating one source preserves the other's.
+            smc_vals = (
+                int(payload_inner.get("src_addr") or start_addr) & 0xFFFF,
                 (
-                    int(payload_inner.get("src_addr") or start_addr) & 0xFFFF,
-                    (
-                        int(payload_inner["dst_addr"]) & 0xFFFF
-                        if isinstance(payload_inner.get("dst_addr"), int)
-                        else None
-                    ),
-                    payload_inner.get("mnemonic"),
-                    payload_inner.get("operand"),
-                    payload_inner.get("smc_kind", "unknown"),
-                    ann_id,
+                    int(payload_inner["dst_addr"]) & 0xFFFF
+                    if isinstance(payload_inner.get("dst_addr"), int)
+                    else None
                 ),
+                payload_inner.get("mnemonic"),
+                payload_inner.get("operand"),
+                payload_inner.get("smc_kind", "unknown"),
+                source_file,
+                ann_id,
+            )
+            self._db.execute(
+                "INSERT INTO code_smc_sites"
+                " (src_addr, dst_addr, mnemonic, operand, smc_kind,"
+                "  source_file, annotation_id)"
+                " SELECT ?, ?, ?, ?, ?, ?, ?"
+                " WHERE NOT EXISTS ("
+                "   SELECT 1 FROM code_smc_sites"
+                "   WHERE src_addr = ? AND dst_addr IS ? AND smc_kind IS ?"
+                "     AND source_file IS ?"
+                " )",
+                smc_vals + (smc_vals[0], smc_vals[1], smc_vals[4],
+                            source_file),
             )
 
         elif kind == ANN_CLASSIFY:
@@ -504,12 +761,13 @@ class CodeKnowledgeStore:
                 self._db.execute(
                     "INSERT OR REPLACE INTO code_class"
                     " (addr, classification, confidence, evidence,"
-                    "  annotation_id) VALUES (?, ?, ?, ?, ?)",
+                    "  source_file, annotation_id) VALUES (?, ?, ?, ?, ?, ?)",
                     (
                         off & 0xFFFF,
                         payload_inner.get("classification", "ambiguous"),
                         confidence,
                         payload_inner.get("evidence_text"),
+                        source_file,
                         ann_id,
                     ),
                 )
@@ -522,7 +780,7 @@ class CodeKnowledgeStore:
                 (
                     start_addr,
                     str(payload_inner.get("name") or ""),
-                    payload_inner.get("source_file"),
+                    source_file,
                     ann_id,
                 ),
             )
@@ -543,7 +801,7 @@ class CodeKnowledgeStore:
                         str(ins.get("mnemonic") or "?").lower(),
                         ins.get("operand"),
                         int(ins.get("size_bytes") or 1),
-                        payload_inner.get("source_file"),
+                        source_file,
                         ann_id,
                     ),
                 )
@@ -562,9 +820,9 @@ class CodeKnowledgeStore:
                     payload_inner.get("idiom_match"),
                     json.dumps(payload_inner.get("hardware_touched") or []),
                     payload_inner.get("routine_id"),
-                    payload_inner.get("source_file"),
+                    source_file,
                     confidence,
-                    json.dumps(p.get("flags") or []),
+                    json.dumps(flags or []),
                     producer,
                 ),
             )
@@ -574,19 +832,22 @@ class CodeKnowledgeStore:
                     ann_id=ann_id,
                     confidence=confidence,
                     suggested_name=payload_inner.get("name_suggestion"),
-                    source_file=payload_inner.get("source_file"),
+                    source_file=source_file,
                 )
 
         elif kind == ANN_INDIRECT:
             src = int(payload_inner.get("src_addr") or start_addr) & 0xFFFF
             via = payload_inner.get("via_vector")
             tgt = payload_inner.get("resolved_target")
+            # source_file passed through (final hardening: indirect-jump
+            # xrefs projected with NULL provenance survived invalidation).
             self._upsert_xref(
                 src=src,
                 dst=int(tgt) & 0xFFFF if isinstance(tgt, int) else None,
                 via=int(via) & 0xFFFF if isinstance(via, int) else None,
                 kind="jmp_indirect",
                 ann_id=ann_id,
+                source_file=source_file,
             )
 
     def _upsert_xref(
@@ -597,25 +858,30 @@ class CodeKnowledgeStore:
         via: int | None,
         kind: str,
         ann_id: str,
+        source_file: str | None = None,
     ) -> None:
-        """Insert a cross-reference row, skipping silently if an identical row
-        already exists.
+        """Insert a cross-reference row, skipping silently if an identical
+        row from the SAME source already exists.
 
-        SQLite treats NULL != NULL in PRIMARY KEY uniqueness, so plain
-        ``INSERT OR REPLACE`` would create duplicate rows whenever
-        ``dst_addr`` or ``via_vector`` is NULL (the common case for direct
-        calls).  Using an explicit ``NOT EXISTS`` check with the ``IS``
-        operator gives correct NULL-safe equality.
+        SQLite treats NULL != NULL in uniqueness checks, so an explicit
+        ``NOT EXISTS`` with the ``IS`` operator gives NULL-safe equality.
+        Dedup is per (edge, source_file): the same edge asserted by two
+        sources keeps two rows, so invalidating one source never deletes
+        the other's provenance (Phase 2 hardening).
         """
         assert self._db is not None
         self._db.execute(
-            "INSERT INTO code_xrefs (src_addr, dst_addr, via_vector, kind, annotation_id)"
-            " SELECT ?, ?, ?, ?, ?"
+            "INSERT INTO code_xrefs"
+            " (src_addr, dst_addr, via_vector, kind, source_file,"
+            "  annotation_id)"
+            " SELECT ?, ?, ?, ?, ?, ?"
             " WHERE NOT EXISTS ("
             "   SELECT 1 FROM code_xrefs"
-            "   WHERE src_addr = ? AND dst_addr IS ? AND via_vector IS ? AND kind = ?"
+            "   WHERE src_addr = ? AND dst_addr IS ? AND via_vector IS ?"
+            "     AND kind = ? AND source_file IS ?"
             " )",
-            (src, dst, via, kind, ann_id, src, dst, via, kind),
+            (src, dst, via, kind, source_file, ann_id,
+             src, dst, via, kind, source_file),
         )
 
     def _promote_layer1_name(

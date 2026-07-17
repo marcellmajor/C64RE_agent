@@ -76,6 +76,13 @@ TRUNCATED_CONFIDENCE_CAP = 0.4
 # failure is a missing runtime dependency (API key, server, dump).
 _PERMANENT_REJECTIONS = {"banned_method", "dependency_unsatisfied"}
 
+# Address-key aliases planner LLMs keep inventing for vice calls. Shared
+# with graph.nodes (arg normalization) and `step_is_concrete` below.
+VICE_ADDRESS_ALIASES = (
+    "address", "addr", "start", "pc", "at", "from", "loc", "location",
+    "entry", "target", "where",
+)
+
 
 # ---------------------------------------------------------------------------
 # Game slug (tracker 0.7)
@@ -242,6 +249,126 @@ def failed_step_notes(state: dict[str, Any]) -> list[str]:
             f"FAILED: {last_fail.get(sid, 'unknown error')}"
         )
     return notes
+
+
+# ---------------------------------------------------------------------------
+# Executor LLM bypass (tracker 1.1)
+# ---------------------------------------------------------------------------
+
+def _has_value(args: dict[str, Any], *keys: str) -> bool:
+    return any(
+        args.get(k) is not None
+        and not (isinstance(args.get(k), str) and not args[k].strip())
+        for k in keys
+    )
+
+
+def step_is_concrete(step: dict[str, Any]) -> bool:
+    """True when a plan step can be dispatched without LLM enrichment.
+
+    The executor LLM's only job is filling args the planner deferred
+    (nulls, or references to prior discoveries). A step whose args are
+    all present, non-null, and cover the tool/mode's required keys can
+    go straight to the tool node — most planner steps arrive complete,
+    so this skips roughly half the per-step LLM calls (tracker 1.1).
+
+    Conservative by design: unknown tools and any null/empty arg values
+    return False so the LLM enrichment path still runs for them.
+    """
+    tool = str(step.get("tool") or "").strip().lower()
+    args = step.get("args")
+    if args is None:
+        args = {}
+    if not isinstance(args, dict):
+        return False
+
+    # A null/empty value is the planner's "executor, fill this in".
+    for v in args.values():
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return False
+
+    if tool == "kb":
+        mode = str(
+            args.get("mode") or ("sql" if args.get("sql") else "stats")
+        ).strip().lower()
+        required = {
+            "sql": ("sql",),
+            "text": ("q", "query"),           # either satisfies
+            "text_semantic": ("q", "query"),
+        }
+        if mode in ("text", "text_semantic"):
+            return _has_value(args, *required[mode])
+        if mode == "sql":
+            return _has_value(args, "sql")
+        return True  # stats / schema / labels / events need nothing more
+
+    if tool == "capstone":
+        mode = str(args.get("mode") or "linear").strip().lower()
+        if mode == "linear":
+            return _has_value(args, "start")
+        return True  # recursive/find_* / vectors / polymorphic self-default
+
+    if tool == "tavily":
+        return _has_value(args, "q", "query")
+
+    if tool == "vice":
+        method = str(
+            args.get("method") or step.get("method") or "",
+        ).strip().lower()
+        if not method:
+            return False
+        if "screenshot" in method:
+            return True
+        if "disassemble" in method:
+            return _has_value(args, *VICE_ADDRESS_ALIASES)
+        if "memory" in method and ("read" in method or "search" in method):
+            return (
+                _has_value(args, *VICE_ADDRESS_ALIASES)
+                and _has_value(args, "size", "length")
+            )
+        # Breakpoints/watchpoints are address-bearing too (review
+        # finding 4 — the old blanket True let a checkpoint step with no
+        # address bypass enrichment straight into a tool error).
+        if "checkpoint" in method or "breakpoint" in method:
+            return _has_value(args, *VICE_ADDRESS_ALIASES)
+        if "execution" in method or method in (
+            "vice.ping", "ping", "run", "step", "pause",
+        ):
+            return True  # genuinely argument-free
+        return False  # unknown vice methods → enrich conservatively
+
+    if tool == "code_kb":
+        mode = str(args.get("mode") or "").strip().lower()
+        # Requirements mirror graph.code_kb_node's mode handlers EXACTLY
+        # (review: a shared broad alias list accepted keys individual
+        # handlers ignore — e.g. `xrefs_to` with only `src` bypassed
+        # enrichment and then read a defaulted addr of 0).
+        if mode in ("stats", "schema", "hardware", "routines", "smc",
+                    "export"):
+            return True
+        if mode in ("routine", "annotate"):
+            # handlers read: start | addr | address
+            return _has_value(args, "start", "addr", "address")
+        if mode == "xrefs_to":
+            # handler reads: addr | dst
+            return _has_value(args, "addr", "dst")
+        if mode == "xrefs_from":
+            # handler reads: addr | src
+            return _has_value(args, "addr", "src")
+        if mode == "disasm":
+            # handler reads (vice engine): address | addr;
+            # (capstone/default engine): start | addr
+            engine = str(args.get("engine") or "capstone").strip().lower()
+            if engine == "vice":
+                return _has_value(args, "address", "addr")
+            return _has_value(args, "start", "addr")
+        if mode == "search":
+            return _has_value(args, "q", "query")
+        if mode == "sql":
+            return _has_value(args, "sql")
+        return False  # unknown/missing mode → enrich conservatively
+
+    return False
 
 
 # ---------------------------------------------------------------------------

@@ -23,13 +23,17 @@ from typing import Any
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from graph.llm import get_llm
+from graph import usage as llm_usage
 from graph.plan_utils import (
     MAX_CONSECUTIVE_REVISES,
     MAX_PLAN_STEPS,
+    VICE_ADDRESS_ALIASES as _VICE_ADDRESS_ALIASES,
     failed_step_notes,
+    pending_steps,
     resolve_session_slug,
     runnable_steps,
     slugify,
+    step_is_concrete,
     step_status,
 )
 from graph.prompts import MASTER_PREAMBLE, system_message
@@ -172,6 +176,88 @@ def _coerce_parsed_llm_json(
     return parsed
 
 
+# Envelope keys models wrap their payloads in despite the role contracts
+# requesting a bare object (same family `_unwrap_json_array_to_contract_dict`
+# tolerates for array-wrapped payloads).
+_DICT_ENVELOPE_KEYS = (
+    "candidate_answer", "result", "data", "output", "response", "parsed",
+    "verdict",
+)
+
+_CRITIC_DECISIONS = frozenset({"accept", "revise", "replan"})
+
+
+def _dict_contract_error(role: str, payload: dict[str, Any]) -> str | None:
+    """None when *payload* satisfies the role's minimal contract.
+
+    Review finding: `_safe_invoke` accepted ANY parsed dict as success —
+    an analyst reply of ``{"unexpected": 1}`` was returned, recorded
+    ok=True, and prevented backups from running. Validation is minimal
+    (the discriminator key per role, tolerant of optional fields) so
+    legitimate sparse replies still pass.
+    """
+    if role == "planner":
+        plan = payload.get("plan")
+        if not isinstance(plan, list) or not plan:
+            return "planner contract violated: no non-empty `plan` list"
+        return None
+    if role == "executor":
+        if not isinstance(payload.get("args"), dict):
+            return "executor contract violated: `args` missing or not a dict"
+        if not (payload.get("step_id") or payload.get("tool")):
+            return "executor contract violated: no step identity (step_id/tool)"
+        return None
+    if role == "synthesizer":
+        keys = ("labels", "routines", "data_structures", "hypotheses", "notes")
+        if not any(k in payload for k in keys):
+            return (
+                "synthesizer contract violated: none of "
+                f"{'/'.join(keys)} present"
+            )
+        return None
+    if role == "curator":
+        keys = ("summary", "addresses_kept", "events_compacted")
+        if not any(k in payload for k in keys):
+            return (
+                "curator contract violated: none of "
+                f"{'/'.join(keys)} present"
+            )
+        return None
+    if role == "analyst":
+        answer = payload.get("answer")
+        if not isinstance(answer, str) or not answer.strip():
+            return "analyst contract violated: no non-empty `answer`"
+        return None
+    if role == "critic":
+        decision = str(payload.get("decision") or "").strip().lower()
+        if decision not in _CRITIC_DECISIONS:
+            return (
+                "critic contract violated: `decision` missing or not one of "
+                "accept/revise/replan"
+            )
+        return None
+    return None  # unknown roles: no contract to enforce
+
+
+def _extract_role_contract_dict(
+    role: str, payload: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Return (usable_dict, None) or (None, contract_error).
+
+    Tolerates one level of harmless envelope nesting: if the outer dict
+    fails the role contract but a known envelope key holds an inner dict
+    that passes, the inner dict is what the node should consume.
+    """
+    err = _dict_contract_error(role, payload)
+    if err is None:
+        return payload, None
+    for ek in _DICT_ENVELOPE_KEYS:
+        inner = payload.get(ek)
+        if isinstance(inner, dict) and _dict_contract_error(role, inner) is None:
+            return dict(inner), None
+    return None, err
+
+
 def _flatten_lc_ai_message_content(msg: Any) -> str:
     """Turn an ``AIMessage`` body into plain text JSON-like consumers expect.
 
@@ -287,8 +373,8 @@ def _invoke_one(
     prompt: str,
     *,
     system_role: str | None = None,
-) -> tuple[str, str | None]:
-    """Run a single LLM call. Returns (content, error_or_None).
+) -> tuple[str, str | None, dict[str, Any] | None]:
+    """Run a single LLM call. Returns (content, error_or_None, usage_entry).
 
     `system_role` overrides which role-block is attached to the master
     preamble — useful when a backup model takes over for another role
@@ -298,13 +384,35 @@ def _invoke_one(
     An empty content string is treated as an error: Gemini in particular
     silently returns empty bodies when its safety filter triggers
     (`finish_reason=SAFETY`), which would otherwise look like success.
+
+    Usage accounting (review finding 5): the recorded entry's ``ok``
+    means "produced usable output", not "the HTTP call succeeded" —
+    ``transport_ok`` carries that separately. The live entry is returned
+    so `_safe_invoke` can demote it once contract parsing fails.
     """
+    as_role = system_role if system_role and system_role != role else None
+    model_name = None
     try:
         llm = get_llm(role)
+        model_name = getattr(llm, "model_name", None) or getattr(llm, "model", None)
         sys_prompt = system_message(system_role or role)
         msg = llm.invoke([SystemMessage(sys_prompt), HumanMessage(prompt)])
     except Exception as e:  # noqa: BLE001
-        return "", f"{type(e).__name__}: {e}"
+        entry = llm_usage.record({
+            "role": role, "as_role": as_role, "model": model_name,
+            "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0,
+            "ok": False, "transport_ok": False,
+            "error": f"{type(e).__name__}: {e}"[:200],
+        })
+        return "", f"{type(e).__name__}: {e}", entry
+
+    in_tok, out_tok = llm_usage.extract_usage(msg)
+    entry = llm_usage.record({
+        "role": role, "as_role": as_role, "model": model_name,
+        "input_tokens": in_tok, "output_tokens": out_tok,
+        "cost_usd": llm_usage.estimate_cost_usd(model_name, in_tok, out_tok),
+        "ok": True, "transport_ok": True,
+    })
 
     content = _flatten_lc_ai_message_content(msg)
     if not content.strip():
@@ -318,8 +426,10 @@ def _invoke_one(
                 "try increasing defaults.max_tokens, set agents.*.reasoning_effort, "
                 "or use C64RE_GPT5_MIN_MAX_TOKENS"
             )
-        return "", f"empty response (finish_reason={finish}){hint}"
-    return content, None
+        err = f"empty response (finish_reason={finish}){hint}"
+        llm_usage.mark_failed(entry, err)
+        return "", err, entry
+    return content, None, entry
 
 
 def _safe_invoke(
@@ -343,9 +453,12 @@ def _safe_invoke(
     """
     chain = [role, *(backup_roles or [])]
     errors: list[str] = []
+    last_entry: dict[str, Any] | None = None
 
     for r in chain:
-        content, err = _invoke_one(r, prompt, system_role=role)
+        content, err, entry = _invoke_one(r, prompt, system_role=role)
+        if entry is not None:
+            last_entry = entry
         if err:
             print(
                 f"[llm:{r}] CALL FAILED — {err}",
@@ -362,13 +475,27 @@ def _safe_invoke(
                 allow_plan_steps_array=allow_plan_steps_array,
             )
             if isinstance(shaped, dict):
-                if r != role:
-                    print(
-                        f"[llm:{role}] using backup `{r}` (primary failed)",
-                        file=sys.stderr, flush=True,
-                    )
-                shaped.setdefault("_role_used", r)
-                return shaped
+                # Role-aware contract check (review): ANY dict used to be
+                # accepted, so `{"unexpected": 1}` was returned as success
+                # and blocked backups. Validation is against the PRIMARY
+                # role — a backup stands in for it and must produce its
+                # shape. Envelope-wrapped payloads are unwrapped.
+                usable, contract_err = _extract_role_contract_dict(role, shaped)
+                if usable is not None:
+                    if r != role:
+                        print(
+                            f"[llm:{role}] using backup `{r}` (primary failed)",
+                            file=sys.stderr, flush=True,
+                        )
+                    usable.setdefault("_role_used", r)
+                    return usable
+                llm_usage.mark_failed(entry, contract_err or "contract violated")
+                print(
+                    f"[llm:{r}] {contract_err}",
+                    file=sys.stderr, flush=True,
+                )
+                errors.append(f"{r}: {contract_err}")
+                continue  # try the next backup role
             if isinstance(shaped, list):
                 if allow_plan_steps_array and _looks_like_plan_steps(shaped):
                     if r != role:
@@ -385,6 +512,13 @@ def _safe_invoke(
                 )
                 errors.append(f"{r}: JSON array lacks role contract")
 
+        # Contract failure detected after transport success — demote the
+        # usage entry so the report's failure column is honest (review
+        # finding 5). This also covers the raw-text fallback below: text
+        # that couldn't be parsed is NOT a usable contract response even
+        # though the caller salvages it.
+        llm_usage.mark_failed(entry, f"non-contract response ({len(content)} chars)")
+
         preview = content[:160].replace("\n", " ")
         print(
             f"[llm:{r}] response was not JSON-parseable "
@@ -398,9 +532,39 @@ def _safe_invoke(
                     f"[llm:{role}] using backup `{r}` text (no JSON)",
                     file=sys.stderr, flush=True,
                 )
+            # Raw-text salvage IS a fallback activation — flag it on the
+            # final attempt's entry rather than counting an extra call.
+            if entry is not None:
+                entry["fallback_activated"] = True
             return {"_text": content, "_role_used": r, **fallback}
 
+    # Every role in the chain failed to produce a usable contract —
+    # heuristic fallback. Flag the final attempt (no extra call counted).
+    if last_entry is not None:
+        last_entry["fallback_activated"] = True
     return {"_error": " ; ".join(errors) or "all LLM calls failed", **fallback}
+
+
+def _usage_update() -> dict[str, Any]:
+    """Drain pending LLM-usage entries into a node state delta (tracker 1.4).
+
+    Merged into every LLM-calling node's return so `budget_used` (add
+    reducer) and `llm_usage` accumulate in state; nested calls made while
+    the node ran (backups, vision, auto-annotation) are attributed to it.
+    """
+    entries = llm_usage.drain()
+    if not entries:
+        return {}
+    return {
+        "llm_usage": entries,
+        "budget_used": sum(float(e.get("cost_usd") or 0.0) for e in entries),
+        # Token fallback budget (review finding 3): always populated, so
+        # runs on unpriced models still hit a runtime cap.
+        "tokens_used": sum(
+            int(e.get("input_tokens") or 0) + int(e.get("output_tokens") or 0)
+            for e in entries
+        ),
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -606,6 +770,9 @@ def _normalize_plan_ids(plan: list[dict[str, Any]], state: C64State) -> list[dic
 
 def load_inputs(state: C64State) -> dict[str, Any]:
     """Hydrate the KB: open store, ingest dump + partial asm idempotently."""
+    # Run start: a reused execution context (pooled thread) must not
+    # leak a prior run's un-drained usage entries into this run.
+    llm_usage.reset()
     game = state.get("game", "unknown")
     kb_handle = str(_session_dir(game) / "kb")
     Path(kb_handle).mkdir(parents=True, exist_ok=True)
@@ -686,6 +853,7 @@ def load_inputs(state: C64State) -> dict[str, Any]:
         "replan_count": 0,
         "revise_count": 0,
         "budget_used": 0.0,
+        "tokens_used": 0,
         # Substantive (non-bookkeeping) events only — same measure the
         # critic uses, so the first verdict's growth check is honest.
         "last_kb_event_count": _substantive_event_count(store),
@@ -731,8 +899,18 @@ def _hydrate_code_kb(
     if dump_path_raw:
         dp = Path(dump_path_raw)
         if dp.exists():
-            evt = code_store.ingest_dump(dp)
-            if evt:
+            evt, dump_changed = code_store.ingest_dump(dp)
+            if dump_changed:
+                # The dump was overwritten in place (tracker 2.2):
+                # disassembly windows derived from the OLD bytes are
+                # stale — drop them so they get re-derived on demand.
+                code_store.invalidate_source("capstone:%", like=True)
+                code_store.invalidate_source("vice:%", like=True)
+                msgs.append(
+                    f"code_kb: dump {dp.name} CHANGED on disk — re-ingested "
+                    "and invalidated stale disassembly windows."
+                )
+            elif evt:
                 msgs.append(
                     f"code_kb: ingested dump {dp.name} ({dp.stat().st_size} bytes)."
                 )
@@ -763,9 +941,23 @@ def _hydrate_code_kb(
     ingested = 0
     skipped = 0
     for p in scoping.selected:
-        if code_store.already_ingested_asm(p):
+        try:
+            content = p.read_text(errors="replace")
+        except OSError as e:
+            msgs.append(f"code_kb: cannot read {p.name}: {e}")
+            continue
+        # Content-aware freshness (tracker 2.2): a file edited under the
+        # same name used to be skipped forever, leaving stale Layer-0 rows.
+        freshness = code_store.asm_freshness(p, content)
+        if freshness == "current":
             skipped += 1
             continue
+        if freshness == "changed":
+            code_store.invalidate_source(str(p))
+            msgs.append(
+                f"code_kb: {p.name} CHANGED on disk — invalidated its "
+                "stale rows, re-indexing."
+            )
         try:
             pf = _parse_asm(p)
         except Exception as e:  # noqa: BLE001
@@ -776,7 +968,7 @@ def _hydrate_code_kb(
                 stats = build_from_parsed_asm(pf, code_store)
                 code_store.ingest_asm_doc(
                     p,
-                    content=p.read_text(errors="replace"),
+                    content=content,
                     instructions=stats.instructions,
                     routines=stats.routines,
                 )
@@ -958,6 +1150,74 @@ def write_report(state: C64State) -> dict[str, Any]:
         for step in state.get("plan", [])
     ]
 
+    # ---- per-role LLM usage + budget + tool-call counters (tracker 1.4) ----
+    usage_entries = state.get("llm_usage") or []
+    usage_rows = llm_usage.summarize_by_role(usage_entries)
+    budget_used = float(state.get("budget_used") or 0.0)
+    if usage_rows:
+        u_lines = [
+            "| role | model | calls | failures | backup | fallback "
+            "| in-tok | out-tok | est. USD |",
+            "|---|---|---|---|---|---|---|---|---|",
+        ]
+        for u in usage_rows:
+            u_lines.append(
+                f"| {u['role']} | {u['model']} | {u['calls']} "
+                f"| {u['failures']} | {u['backup_activations']} "
+                f"| {u['fallback_activations']} "
+                f"| {u['input_tokens']} | {u['output_tokens']} "
+                f"| {u['cost_usd']:.4f} |"
+            )
+        total_tok = sum(
+            u["input_tokens"] + u["output_tokens"] for u in usage_rows
+        )
+        tokens_used = int(state.get("tokens_used") or 0) or total_tok
+        priced_calls = sum(
+            1 for e in usage_entries if float(e.get("cost_usd") or 0.0) > 0
+        )
+        unpriced_calls = len(usage_entries) - priced_calls
+
+        # Which budget limit (if any) terminated the run — recomputed
+        # against the same thresholds the router enforces.
+        from graph.routers import BUDGET_CAP, token_budget
+        token_cap = token_budget()
+        enforced = []
+        if budget_used >= BUDGET_CAP:
+            enforced.append(f"USD cap (${BUDGET_CAP:.2f})")
+        if tokens_used >= token_cap:
+            enforced.append(f"token cap ({token_cap:,})")
+
+        pricing_note = ""
+        if priced_calls == 0 and total_tok > 0:
+            pricing_note = (
+                "\n_No `pricing` section in `config/llm.json` — USD shows "
+                "0.00; the token budget above still protects the run._"
+            )
+        usage_block = (
+            "\n".join(u_lines)
+            + "\n\n**Budget:**\n"
+            + f"- total tokens: {tokens_used:,} / {token_cap:,} (token cap)\n"
+            + f"- estimated cost: ${budget_used:.4f} / ${BUDGET_CAP:.2f} (USD cap)\n"
+            + f"- calls priced/unpriced: {priced_calls}/{unpriced_calls}\n"
+            + f"- budget limit enforced: {', '.join(enforced) or 'none'}"
+            + pricing_note
+        )
+    else:
+        usage_block = "_no LLM usage recorded_"
+
+    all_tool_results = state.get("tool_results", []) or []
+    tool_counts: dict[str, list[int]] = {}
+    for r in all_tool_results:
+        t = str(r.get("tool") or "?")
+        row = tool_counts.setdefault(t, [0, 0])
+        row[0] += 1
+        if not r.get("ok"):
+            row[1] += 1
+    tool_lines = [
+        f"- {t}: {n} call(s), {f} failure(s)"
+        for t, (n, f) in sorted(tool_counts.items())
+    ] or ["_none_"]
+
     report = f"""# C64-RE Report — {game}
 
 **Question:** {state.get("question", "")}
@@ -988,6 +1248,14 @@ def write_report(state: C64State) -> dict[str, Any]:
 
 {chr(10).join(tr_lines) if tr_lines else "_none_"}
 
+## LLM usage (per role)
+
+{usage_block}
+
+## Tool calls
+
+{chr(10).join(tool_lines)}
+
 ## KB stats
 
 ```
@@ -1016,7 +1284,10 @@ def planner_node(state: C64State) -> dict[str, Any]:
     # follow-ups verbatim. The role-specific contract (tool args, ordering
     # rules) lives in `graph.prompts.PLANNER_ROLE` and is applied by
     # `_invoke_one` via the system message.
-    digest = _kb_digest_for_state(state)
+    #
+    # Reuse the digest refreshed by the synthesizer/load_inputs instead of
+    # rebuilding from SQL — it is at most one step stale (tracker 1.5).
+    digest = state.get("kb_digest") or _kb_digest_for_state(state)
     last_verdict = state.get("verdict") or {}
     suggested = last_verdict.get("suggested_steps") or []
     critique = last_verdict.get("critique") or ""
@@ -1168,6 +1439,7 @@ def planner_node(state: C64State) -> dict[str, Any]:
         "messages": [AIMessage(
             content=f"Planner produced {len(plan)} steps.{truncated_note}",
         )],
+        **_usage_update(),
     }
 
 
@@ -1260,6 +1532,23 @@ def executor_node(state: C64State) -> dict[str, Any]:
         r for r in tool_results
         if str(r.get("step_id")) == str(step_id) and not r.get("ok")
     ]
+
+    # LLM bypass (tracker 1.1): most planner steps arrive with complete,
+    # concrete args — enrichment has nothing to do for them. Dispatch
+    # directly and skip the executor LLM call (and its 8k-char digest
+    # prompt). Retries always go through the LLM so it can repair the
+    # args using the recorded failure.
+    if not prev_failures and step_is_concrete(nxt):
+        return {
+            "current_step_id": step_id,
+            "plan_blocked": False,
+            "messages": [AIMessage(content=(
+                f"Executor selected step {step_id} → {nxt['tool']} "
+                "(LLM skipped — args already concrete)."
+            ))],
+            **_usage_update(),
+        }
+
     retry_block = ""
     if prev_failures:
         last_err = str(prev_failures[-1].get("data", ""))[:600]
@@ -1269,8 +1558,10 @@ def executor_node(state: C64State) -> dict[str, Any]:
             f"Last error:\n{last_err}\n\n"
         )
 
-    # Ask the executor LLM to enrich / validate the args using current KB state.
-    kb_snippet = _kb_digest_for_state(state)
+    # Ask the executor LLM to enrich / validate the args using current KB
+    # state. Reuse the synthesizer-refreshed digest (at most one step
+    # stale; the prompt truncates it to 8k anyway — tracker 1.5).
+    kb_snippet = state.get("kb_digest") or _kb_digest_for_state(state)
     prompt = (
         f"Question (context): {state.get('question')}\n\n"
         f"Selected step (next to execute):\n{json.dumps(nxt, default=str)}\n\n"
@@ -1316,19 +1607,129 @@ def executor_node(state: C64State) -> dict[str, Any]:
                 )
             )
         ],
+        **_usage_update(),
     }
 
 
+# Batched LLM synthesis (tracker 1.2): the extraction LLM runs once per
+# batch instead of once per step. A flush happens when the plan has no
+# pending steps (the analyst runs next and must see extracted facts) or
+# when the accumulated LLM-worthy material crosses either bound.
+SYNTH_BATCH_MAX_RESULTS = 4
+SYNTH_BATCH_MAX_CHARS = 20_000
+
+# Layer-1 auto-annotation budget per synthesizer invocation (tracker 1.3).
+# Previously every extracted routine with confidence ≥ 0.5 fired a full
+# hidden LLM call — six routines meant six invisible calls.
+MAX_AUTO_ANNOTATE_PER_SYNTH = 2
+
+# Capstone modes whose structured `extra` payloads are extracted
+# mechanically — the LLM adds nothing to them.
+_MECHANICAL_CAPSTONE_MODES = {"find_entry", "entry", "vectors"}
+
+
+def _llm_worthy_result(r: dict[str, Any]) -> bool:
+    """Only free-text evidence needs the extraction LLM (tracker 1.2).
+
+    Failed results carry no facts; `kb`/`code_kb` results are reads of
+    stores whose facts are already persisted; mechanical capstone modes
+    are handled deterministically. What remains — disassembly listings,
+    vice output, tavily snippets, screenshot descriptions — is prose.
+    """
+    if not r.get("ok"):
+        return False
+    tool = str(r.get("tool") or "").lower()
+    if tool in ("kb", "code_kb"):
+        return False
+    if (
+        tool == "capstone"
+        and str(r.get("mode") or "").lower() in _MECHANICAL_CAPSTONE_MODES
+    ):
+        return False
+    return True
+
+
+def _mechanical_extract(
+    store: KnowledgeStore, result: dict[str, Any], ev_id: str,
+) -> dict[str, int]:
+    """Deterministically persist facts from structured tool outputs.
+
+    Runs only for freshly recorded events (stage-1 dedup guarantees
+    each result is seen once), so it cannot duplicate facts. Emitted
+    payloads carry ``provenance: "mechanical"``.
+    """
+    counts = {"labels": 0, "hypotheses": 0}
+    if not result.get("ok") or str(result.get("tool") or "").lower() != "capstone":
+        return counts
+    mode = str(result.get("mode") or "").lower()
+
+    if mode == "vectors":
+        info = result.get("info") or {}
+        for group in ("hw_vectors", "ram_vectors"):
+            for row in info.get(group) or []:
+                tgt = _addr_to_int(row.get("target"))
+                name = str(row.get("name") or "").strip()
+                if tgt is None or tgt == 0 or not name:
+                    continue
+                slug_name = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+                store.append_event(EVT_LABEL, "synthesizer_mechanical", {
+                    "addr": tgt,
+                    "name": f"{slug_name}_target",
+                    "kind": "vector",
+                    "confidence": 0.9,
+                    "evidence": (
+                        f"{group} entry {row.get('vector')} (event {ev_id})"
+                    ),
+                    "provenance": "mechanical",
+                })
+                counts["labels"] += 1
+
+    elif mode in ("find_loops", "loops"):
+        for c in (result.get("candidates") or [])[:3]:
+            addr = _addr_to_int(c.get("address"))
+            if addr is None:
+                continue
+            reasons = "; ".join(str(x) for x in (c.get("reasons") or [])[:4])
+            store.append_event(EVT_HYPOTHESIS, "synthesizer_mechanical", {
+                # Deterministic id: re-detection updates instead of duplicating.
+                "id": f"h_loop_{addr:04x}",
+                "text": (
+                    f"Main-loop candidate at ${addr:04X} "
+                    f"(score {c.get('score')}): {reasons}"
+                ),
+                "status": "open",
+                "evidence": [ev_id],
+                "provenance": "mechanical",
+            })
+            counts["hypotheses"] += 1
+
+    return counts
+
+
+def _question_relevance(question: str, text: str) -> float:
+    """Cheap word-overlap score in [0, 1] for annotate prioritisation."""
+    q_words = {w for w in re.findall(r"[a-z0-9]{3,}", (question or "").lower())}
+    t_words = {w for w in re.findall(r"[a-z0-9]{3,}", (text or "").lower())}
+    if not q_words or not t_words:
+        return 0.0
+    return len(q_words & t_words) / len(q_words)
+
+
 def synthesizer_node(state: C64State) -> dict[str, Any]:
-    """Mechanical dedup + LLM extraction of structured KB facts.
+    """Mechanical dedup + deterministic extraction + batched LLM extraction.
 
-    Two stages:
+    Stages (tracker 1.2):
 
-    1. **Dedup**: write previously-unrecorded `tool_results` as
-       `EVT_TOOL_RESULT` events (idempotent — same as before).
-    2. **Extract**: ask the synthesizer LLM to derive structured
-       facts (labels, routines, data structures, hypotheses) from the
-       new results and persist them into the SQLite-derived view.
+    1. **Dedup/record**: write previously-unrecorded `tool_results` as
+       `EVT_TOOL_RESULT` events — indexed content-hash lookup, not a
+       full log scan (tracker 1.6).
+    1.5 **Mechanical extraction**: structured capstone outputs
+       (`vectors`, `find_loops`) become labels/hypotheses with
+       ``provenance: mechanical`` — no LLM.
+    2. **Batched LLM extraction**: free-text results (disassembly,
+       vice, tavily) accumulate across steps and are extracted in ONE
+       LLM call when the plan drains or the batch fills. Failed and
+       `kb`/`code_kb` results never reach the LLM.
 
     The extractor is the single biggest reason the multi-agent system
     can outperform a flat one-shot prompt: the KB accumulates *typed*
@@ -1338,54 +1739,73 @@ def synthesizer_node(state: C64State) -> dict[str, Any]:
         return {"messages": [AIMessage(content="Synthesizer: no KB handle.")]}
 
     store = get_store(state["kb_handle"])
+    all_results = state.get("tool_results", []) or []
 
     # ---- Stage 1: idempotent recording of raw tool_results ----
-    already = {
-        (
-            json.loads(r["payload_json"]).get("tool"),
-            json.loads(r["payload_json"]).get("step_id"),
-            str(json.loads(r["payload_json"]).get("data", ""))[:256],
-        )
-        for r in store.query(
-            "SELECT payload_json FROM events WHERE kind = ?", (EVT_TOOL_RESULT,)
-        )
-    }
-
-    new_raw = [
-        r for r in state.get("tool_results", [])
-        if (
-            r.get("tool"),
-            r.get("step_id"),
-            str(r.get("data", ""))[:256],
-        ) not in already
-    ]
-
+    new_raw: list[dict[str, Any]] = []
     new_event_ids: list[str] = []
-    for r in new_raw:
-        new_event_ids.append(store.append_event(EVT_TOOL_RESULT, "synthesizer", r))
+    for r in all_results:
+        if store.has_tool_result(r):
+            continue
+        new_event_ids.append(
+            store.append_event(EVT_TOOL_RESULT, "synthesizer", r),
+        )
+        new_raw.append(r)
 
-    # ---- Stage 2: LLM extraction of structured facts ----
+    # ---- Stage 1.5: mechanical extraction (structured outputs) ----
+    mech_counts = {"labels": 0, "hypotheses": 0}
+    for ev_id, r in zip(new_event_ids, new_raw):
+        for k, v in _mechanical_extract(store, r, ev_id).items():
+            mech_counts[k] += v
+
+    # ---- Stage 2: batched LLM extraction of structured facts ----
+    processed = int(state.get("synth_processed_count", 0) or 0)
+    unprocessed = all_results[processed:]
+    worthy = [r for r in unprocessed if _llm_worthy_result(r)]
+    worthy_chars = sum(len(str(r.get("data", ""))) for r in worthy)
+    # The analyst runs next once no step needs a (re)run — extraction
+    # must flush before it reads the digest.
+    plan_drained = not pending_steps(state)
+
+    flush = bool(worthy) and (
+        plan_drained
+        or len(worthy) >= SYNTH_BATCH_MAX_RESULTS
+        or worthy_chars >= SYNTH_BATCH_MAX_CHARS
+    )
+
     extracted_counts = {"labels": 0, "routines": 0, "data_structures": 0,
                         "hypotheses": 0}
     notes_msg = ""
+    annotate_notes: list[str] = []
+    new_processed_count: int | None = None
+    if not worthy and unprocessed:
+        # Nothing LLM-worthy in the tail — mark it considered.
+        new_processed_count = len(all_results)
 
-    if new_raw:
-        # Compact view of the new tool outputs for the extractor.
+    if flush:
+        new_processed_count = len(all_results)
+        # Compact view of the batched tool outputs for the extractor.
+        # (Results recorded in earlier deferred passes are labelled by
+        # tool/step_id; their event ids live in the KB.)
+        per_result_budget = max(
+            4_000, SYNTH_BATCH_MAX_CHARS // max(1, len(worthy)),
+        )
         observations: list[str] = []
-        for ev_id, r in zip(new_event_ids, new_raw):
+        for r in worthy:
             data = str(r.get("data", ""))
-            if len(data) > 24_000:
-                data = data[:24_000] + "\n... [truncated]"
+            if len(data) > per_result_budget:
+                data = data[:per_result_budget] + "\n... [truncated]"
             observations.append(
-                f"### event {ev_id}  ({r.get('tool')}/{r.get('step_id')}, "
-                f"ok={r.get('ok')})\n"
-                f"extra={json.dumps({k: v for k, v in r.items() if k not in {'data', 'tool', 'step_id', 'ok'}}, default=str)[:6_000]}\n"
+                f"### result {r.get('tool')}/{r.get('step_id')} "
+                f"(ok={r.get('ok')})\n"
+                f"extra={json.dumps({k: v for k, v in r.items() if k not in {'data', 'tool', 'step_id', 'ok'}}, default=str)[:2_000]}\n"
                 f"data:\n{data}"
             )
 
         prompt = (
             f"Question (background only): {state.get('question')}\n\n"
-            "New tool outputs to synthesise into structured KB facts:\n\n"
+            f"New tool outputs ({len(worthy)} results, batched) to "
+            "synthesise into structured KB facts:\n\n"
             + "\n\n".join(observations)
             + "\n\nReply JSON only, exactly per your role contract."
         )
@@ -1395,6 +1815,10 @@ def synthesizer_node(state: C64State) -> dict[str, Any]:
                       "hypotheses": [], "notes": ""},
             backup_roles=["analyst", "planner", "executor"],
         )
+
+        # Layer-1 annotation candidates queued by the routines loop and
+        # executed (capped + prioritised) after all extraction loops.
+        annotate_candidates: list[tuple[float, int]] = []
 
         # Persist extracted facts. We're permissive about input shape
         # (LLMs occasionally emit "address" instead of "addr", etc.).
@@ -1428,6 +1852,7 @@ def synthesizer_node(state: C64State) -> dict[str, Any]:
                 "kind": lab.get("kind", "code"),
                 "confidence": confidence,
                 "evidence": lab.get("evidence"),
+                "provenance": "llm",
             })
             # Mirror into code_kb so node labels appear in the call graph.
             if _code_store is not None:
@@ -1467,6 +1892,7 @@ def synthesizer_node(state: C64State) -> dict[str, Any]:
                 "calls_to": calls_to,
                 "called_by": called_by,
                 "confidence": confidence,
+                "provenance": "llm",
             })
 
             # Mirror into code_kb so the call graph + routines panel in
@@ -1513,9 +1939,9 @@ def synthesizer_node(state: C64State) -> dict[str, Any]:
 
             extracted_counts["routines"] += 1
 
-            # Auto-run Layer-1 annotation when the synthesizer writes a new
-            # routine and the existing hypothesis confidence is below the
-            # incoming confidence. Fires silently — errors are non-fatal.
+            # Queue Layer-1 annotation candidates instead of firing a
+            # hidden LLM call per routine (tracker 1.3). Candidates are
+            # prioritised and capped after the extraction loops.
             if _code_store is not None and confidence >= 0.50:
                 try:
                     existing = _code_store.query(
@@ -1526,14 +1952,12 @@ def synthesizer_node(state: C64State) -> dict[str, Any]:
                     )
                     existing_conf = float(existing[0]["confidence"]) if existing else 0.0
                     if confidence > existing_conf:
-                        from graph.code_kb_node import _mode_annotate
-                        _mode_annotate(
-                            state, _code_store,
-                            {
-                                "start": f"${start & 0xFFFF:04X}",
-                                "auto_disasm_if_missing": True,
-                            },
-                            f"auto_ann_{start & 0xFFFF:04X}",
+                        relevance = _question_relevance(
+                            state.get("question", "") or "",
+                            f"{rt.get('name') or ''} {rt.get('summary') or ''}",
+                        )
+                        annotate_candidates.append(
+                            (confidence * (1.0 + relevance), start),
                         )
                 except Exception:
                     pass
@@ -1548,6 +1972,7 @@ def synthesizer_node(state: C64State) -> dict[str, Any]:
                 "end": end,
                 "kind": ds.get("kind"),
                 "fields": ds.get("fields") or {},
+                "provenance": "llm",
             })
             extracted_counts["data_structures"] += 1
 
@@ -1560,66 +1985,137 @@ def synthesizer_node(state: C64State) -> dict[str, Any]:
                 "text": text,
                 "status": hyp.get("status", "open"),
                 "evidence": hyp.get("evidence") or [],
+                "provenance": "llm",
             })
             extracted_counts["hypotheses"] += 1
 
         if out.get("notes"):
             notes_msg = " " + str(out.get("notes"))[:500]
 
-    # Refresh the digest in state so the analyst & critic see the same
-    # evidence sheet when they run next.
-    digest = store.digest_for_question(
-        state.get("question", "") or "", max_chars=32_000,
-    )
+        # Run the queued Layer-1 annotations — highest-priority first,
+        # capped per invocation, and logged so the calls are visible in
+        # the transcript instead of silent (tracker 1.3).
+        if annotate_candidates and _code_store is not None:
+            ranked = sorted(annotate_candidates, key=lambda t: -t[0])
+            for _prio, a_start in ranked[:MAX_AUTO_ANNOTATE_PER_SYNTH]:
+                addr_str = f"${a_start & 0xFFFF:04X}"
+                try:
+                    from graph.code_kb_node import _mode_annotate
+                    ann_out = _mode_annotate(
+                        state, _code_store,
+                        {
+                            "start": addr_str,
+                            "auto_disasm_if_missing": True,
+                        },
+                        f"auto_ann_{a_start & 0xFFFF:04X}",
+                    )
+                except Exception as e:  # noqa: BLE001
+                    annotate_notes.append(
+                        f"auto-annotation of {addr_str} crashed: "
+                        f"{type(e).__name__}"
+                    )
+                    continue
 
+                # `_mode_annotate` returns through `_record_result`, whose
+                # own drain moved the Layer-1 usage entries into this
+                # (otherwise discarded) return value — put them back into
+                # the collector so THIS node's drain ships them to state
+                # (review finding 1: they were silently thrown away).
+                for u in (ann_out or {}).get("llm_usage") or []:
+                    llm_usage.record(u)
+
+                ann_results = (ann_out or {}).get("tool_results") or []
+                if ann_results and ann_results[0].get("ok"):
+                    annotate_notes.append(f"auto-annotated {addr_str}")
+                else:
+                    detail = (
+                        str(ann_results[0].get("data", ""))[:120]
+                        if ann_results else "no result returned"
+                    ).replace("\n", " ")
+                    annotate_notes.append(
+                        f"auto-annotation of {addr_str} FAILED: {detail}"
+                    )
+            skipped_ann = len(ranked) - MAX_AUTO_ANNOTATE_PER_SYNTH
+            if skipped_ann > 0:
+                annotate_notes.append(
+                    f"{skipped_ann} annotation candidate(s) deferred "
+                    f"(cap {MAX_AUTO_ANNOTATE_PER_SYNTH}/pass)"
+                )
+
+    # Refresh the digest only when the KB gained extractable facts or the
+    # analyst runs next; on a pure defer the digest stays as-is (at most
+    # one batch stale for the executor prompt — tracker 1.5).
+    update: dict[str, Any] = {}
+    if flush or plan_drained or any(mech_counts.values()) or not all_results:
+        update["kb_digest"] = store.digest_for_question(
+            state.get("question", "") or "", max_chars=32_000,
+        )
+    if new_processed_count is not None:
+        update["synth_processed_count"] = new_processed_count
+
+    deferred = 0 if flush else len(worthy)
     s = store.stats()
     summary = (
         f"Synthesizer: +{len(new_raw)} tool_result(s), "
-        f"+{extracted_counts['labels']}L "
-        f"+{extracted_counts['routines']}R "
-        f"+{extracted_counts['data_structures']}DS "
-        f"+{extracted_counts['hypotheses']}H · KB events={s['events_total']}."
+        f"+{mech_counts['labels']}L/+{mech_counts['hypotheses']}H mechanical, "
+        + (
+            f"LLM batch of {len(worthy)}: "
+            f"+{extracted_counts['labels']}L "
+            f"+{extracted_counts['routines']}R "
+            f"+{extracted_counts['data_structures']}DS "
+            f"+{extracted_counts['hypotheses']}H"
+            if flush
+            else f"LLM deferred ({deferred} result(s) batched)"
+        )
+        + f" · KB events={s['events_total']}."
         + notes_msg
+        + (" · " + "; ".join(annotate_notes) if annotate_notes else "")
     )
     return {
-        "kb_digest": digest,
+        **update,
         "messages": [AIMessage(content=summary)],
+        **_usage_update(),
     }
 
 
 def curator_node(state: C64State) -> dict[str, Any]:
     """Compact verbose tool_result events into a single summary event.
 
-    The router only routes here when KB tokens exceed
-    `KB_TOKEN_THRESHOLD`, so being aggressive is safe. We summarise the
-    last ~20 raw tool_result events with the curator LLM, write a
-    `consolidated_observation` event, and trim the in-memory
-    `tool_results` list so the analyst doesn't get overwhelmed.
+    The router only routes here when the volume of UNCOMPACTED
+    tool_result events exceeds `UNCOMPACTED_TOKEN_THRESHOLD`
+    (tracker 2.1). Each pass consumes the OLDEST uncompacted events;
+    bookkeeping is by EXACT event ids (`events_compacted` → the derived
+    `compacted_tool_results` table), never by timestamp cursor, so
+    equal-timestamp events can't be skipped and consecutive passes never
+    re-summarise the same events (the old code always took the newest 20
+    by timestamp). Once the backlog is compacted the gate closes instead
+    of taxing every future synthesizer step forever. `through_ts` on the
+    payload is informational only.
     """
     if not state.get("kb_handle"):
         return {"messages": [AIMessage(content="Curator: no KB handle.")]}
 
     store = get_store(state["kb_handle"])
-    rows = store.query(
-        "SELECT id, payload_json FROM events WHERE kind = ?"
-        " ORDER BY ts DESC LIMIT ?",
-        (EVT_TOOL_RESULT, 20),
-    )
+    rows = store.uncompacted_tool_results(limit=20)
     if not rows:
         return {"messages": [AIMessage(content="Curator: nothing to compact.")]}
 
     inputs = []
     event_ids = []
+    through_ts = None
     for r in rows:
         try:
             p = json.loads(r["payload_json"])
         except Exception:  # noqa: BLE001
             continue
         event_ids.append(r["id"])
+        through_ts = max(through_ts or r["ts"], r["ts"])
         data = str(p.get("data", ""))[:4_000]
         inputs.append(
             f"### event {r['id']}  ({p.get('tool')}/{p.get('step_id')})\n{data}"
         )
+    if not event_ids:
+        return {"messages": [AIMessage(content="Curator: nothing to compact.")]}
 
     prompt = (
         f"Question (background): {state.get('question')}\n\n"
@@ -1635,10 +2131,15 @@ def curator_node(state: C64State) -> dict[str, Any]:
 
     summary = (out.get("summary") or "").strip() or out.get("_text", "")
     if summary:
+        # `through_ts` / `events_compacted` are OUR mechanically-derived
+        # values, never the LLM's — the high-water mark must be exact.
+        # When the LLM fails entirely (no summary) nothing is written,
+        # so no events are marked compacted without a real summary.
         store.append_event(EVT_CONSOLIDATED, "curator", {
             "summary": summary,
             "addresses_kept": out.get("addresses_kept") or [],
-            "events_compacted": out.get("events_compacted") or event_ids,
+            "events_compacted": event_ids,
+            "through_ts": through_ts,
         })
 
     # NB: `tool_results` uses an `add` reducer in C64State, so we cannot
@@ -1652,6 +2153,7 @@ def curator_node(state: C64State) -> dict[str, Any]:
         "messages": [
             AIMessage(content=f"Curator compacted {len(event_ids)} events."),
         ],
+        **_usage_update(),
     }
 
 
@@ -1779,6 +2281,7 @@ def analyst_node(state: C64State) -> dict[str, Any]:
                 content=f"Analyst confidence={candidate['confidence']}{suffix}."
             )
         ],
+        **_usage_update(),
     }
 
 
@@ -1938,6 +2441,7 @@ def critic_node(state: C64State) -> dict[str, Any]:
     updates["messages"] = [
         AIMessage(content=f"Critic verdict: {decision}{suffix}."),
     ]
+    updates.update(_usage_update())
     return updates
 
 
@@ -1962,6 +2466,9 @@ def _record_result(
         "messages": [
             AIMessage(content=f"[tool:{tool}] {badge} step={step_id} — {snippet}")
         ],
+        # Tool nodes are LLM-free except the vice screenshot vision call;
+        # draining here attributes that usage to the tool result (1.4).
+        **_usage_update(),
     }
 
 
@@ -2035,12 +2542,9 @@ def _vice_normalize_method(raw_method: str) -> str:
     return f"vice.{m}" if m else "vice.ping"
 
 
-# Address-key aliases the planner LLM keeps inventing. We accept all of
-# them, but log the canonicalised result so the trace is unambiguous.
-_VICE_ADDRESS_ALIASES = (
-    "address", "addr", "start", "pc", "at", "from", "loc", "location",
-    "entry", "target", "where",
-)
+# Address-key aliases the planner LLM keeps inventing: shared constant
+# `plan_utils.VICE_ADDRESS_ALIASES` (imported above as
+# `_VICE_ADDRESS_ALIASES`) — `step_is_concrete` uses the same list.
 
 
 def _coerce_vice_address(raw: Any) -> str | None:
@@ -2571,18 +3075,38 @@ def _describe_screenshot(data_uri: str) -> str:
         "Be precise and terse — this description goes into a reverse-engineering KB."
     )
     for role in ("analyst", "critic", "planner"):
+        model_name = None
         try:
             llm = get_llm(role)
+            model_name = getattr(llm, "model_name", None) or getattr(llm, "model", None)
             sys_prompt = system_message(role)
             multimodal_msg = HumanMessage(content=[
                 {"type": "image_url", "image_url": {"url": data_uri}},
                 {"type": "text", "text": prompt_text},
             ])
             resp = llm.invoke([SystemMessage(sys_prompt), multimodal_msg])
+            in_tok, out_tok = llm_usage.extract_usage(resp)
             description = _flatten_lc_ai_message_content(resp).strip()
+            # ok = usable output produced (review finding 5) — an empty
+            # description falls through to the next role and is a failure.
+            llm_usage.record({
+                "role": f"vision:{role}", "model": model_name,
+                "input_tokens": in_tok, "output_tokens": out_tok,
+                "cost_usd": llm_usage.estimate_cost_usd(
+                    model_name, in_tok, out_tok,
+                ),
+                "ok": bool(description), "transport_ok": True,
+                **({} if description else {"error": "empty description"}),
+            })
             if description:
                 return f"[screenshot description via {role}]\n{description}"
         except Exception as e:  # noqa: BLE001
+            llm_usage.record({
+                "role": f"vision:{role}", "model": model_name,
+                "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0,
+                "ok": False, "transport_ok": False,
+                "error": f"{type(e).__name__}: {e}"[:200],
+            })
             print(
                 f"[vice/screenshot] vision call via {role} failed: "
                 f"{type(e).__name__}: {e}",
@@ -2792,8 +3316,10 @@ KB_SCHEMA_HINT = (
     "    `addr_hex`. There is no separate hex column — format hex in\n"
     "    your client (or use kb mode='labels' which adds addr_hex).\n"
     "  routines(start INTEGER PK, end INTEGER, name, summary,\n"
-    "           calls_to_json, called_by_json)\n"
+    "           calls_to_json, called_by_json, confidence REAL)\n"
     "    NOTE: the columns are `start`/`end`, NOT `start_addr`/`end_addr`.\n"
+    "    Replay is confidence-aware: re-emitting a label/routine with\n"
+    "    LOWER confidence does not overwrite the stored fact.\n"
     "  data_structures(start INTEGER PK, end INTEGER, kind, fields_json)\n"
     "  hypotheses(id TEXT PK, text, status, evidence_json)\n"
     "  text_docs(path TEXT PK, ts, size, mtime, content TEXT,\n"

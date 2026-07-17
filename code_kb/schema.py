@@ -26,6 +26,10 @@ from __future__ import annotations
 
 EVT_INGEST_ASM = "ingest_asm"               # an entire .asm/.txt file ingested
 EVT_INGEST_DUMP = "ingest_dump"             # raw 64 KB binary attached
+# A source file changed on disk (tracker 2.2): replaying this event
+# deletes the derived rows attributed to that source_file BEFORE the
+# re-ingest events that follow it, so rebuilds reproduce the same state.
+EVT_INVALIDATE_SOURCE = "invalidate_source"
 EVT_ANNOTATION = "annotation"               # a layered annotation row
 EVT_DISASM_WINDOW = "disasm_window"         # results of a disasm tool call
 EVT_LAYER_RUN = "layer_run"                 # bookkeeping: which layer ran when
@@ -77,12 +81,22 @@ CREATE TABLE IF NOT EXISTS annotations (
     evidence_json   TEXT,
     supersedes_json TEXT,
     flags_json      TEXT,
+    source_file     TEXT,
+    -- Monotonic APPEND order (Phase 2 final hardening): assigned when
+    -- the annotation is applied — 1, 2, 3 … in event-log order during
+    -- replay, MAX+1 on live appends. Timestamps tie and event ids are
+    -- random, so neither is an ordering surrogate; `seq` is what
+    -- rematerialization sorts by so later annotations keep winning
+    -- singleton keys exactly as they did before an invalidation.
+    seq             INTEGER,
     ts              TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_ann_layer  ON annotations(layer);
 CREATE INDEX IF NOT EXISTS idx_ann_kind   ON annotations(kind);
 CREATE INDEX IF NOT EXISTS idx_ann_start  ON annotations(start_addr);
 CREATE INDEX IF NOT EXISTS idx_ann_prod   ON annotations(producer);
+CREATE INDEX IF NOT EXISTS idx_ann_src    ON annotations(source_file);
+CREATE INDEX IF NOT EXISTS idx_ann_seq    ON annotations(seq);
 
 CREATE TABLE IF NOT EXISTS code_routines (
     start_addr   INTEGER PRIMARY KEY,
@@ -97,15 +111,22 @@ CREATE TABLE IF NOT EXISTS code_routines (
     confidence   REAL DEFAULT 0.0
 );
 
+-- Per-SOURCE rows (Phase 2 hardening): the same edge asserted by two
+-- source files yields two rows, so invalidating one source can never
+-- delete another source's valid provenance. Dedup happens NULL-safely
+-- per (edge, source) at insert time; consumers wanting unique edges
+-- SELECT DISTINCT on the address columns.
 CREATE TABLE IF NOT EXISTS code_xrefs (
     src_addr     INTEGER NOT NULL,
     dst_addr     INTEGER,
     via_vector   INTEGER,
     kind         TEXT NOT NULL,
-    annotation_id TEXT,
-    PRIMARY KEY (src_addr, dst_addr, kind, via_vector)
+    source_file  TEXT,
+    annotation_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_xrefs_dst ON code_xrefs(dst_addr);
+CREATE INDEX IF NOT EXISTS idx_xrefs_src ON code_xrefs(src_addr);
+CREATE INDEX IF NOT EXISTS idx_xrefs_source ON code_xrefs(source_file);
 
 CREATE TABLE IF NOT EXISTS code_smc_sites (
     src_addr     INTEGER NOT NULL,
@@ -113,15 +134,18 @@ CREATE TABLE IF NOT EXISTS code_smc_sites (
     mnemonic     TEXT,
     operand      TEXT,
     smc_kind     TEXT,
-    annotation_id TEXT,
-    PRIMARY KEY (src_addr, dst_addr, smc_kind)
+    source_file  TEXT,
+    annotation_id TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_smc_src ON code_smc_sites(src_addr);
+CREATE INDEX IF NOT EXISTS idx_smc_source ON code_smc_sites(source_file);
 
 CREATE TABLE IF NOT EXISTS code_class (
     addr         INTEGER PRIMARY KEY,
     classification TEXT NOT NULL,
     confidence   REAL,
     evidence     TEXT,
+    source_file  TEXT,
     annotation_id TEXT
 );
 

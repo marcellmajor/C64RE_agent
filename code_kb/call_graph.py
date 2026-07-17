@@ -204,7 +204,7 @@ def local_dot(
 
         # Outgoing: callees from anywhere in the routine range.
         out_rows = store.query(
-            "SELECT src_addr, dst_addr, kind, via_vector"
+            "SELECT DISTINCT src_addr, dst_addr, kind, via_vector"
             "  FROM code_xrefs"
             " WHERE src_addr BETWEEN ? AND ?"
             "   AND kind IN ('jsr', 'jmp', 'jmp_indirect')",
@@ -254,7 +254,7 @@ def local_dot(
 
         # Incoming: callers landing inside this routine range.
         in_rows = store.query(
-            "SELECT src_addr, dst_addr, kind FROM code_xrefs"
+            "SELECT DISTINCT src_addr, dst_addr, kind FROM code_xrefs"
             " WHERE dst_addr BETWEEN ? AND ?"
             "   AND kind IN ('jsr', 'jmp', 'jmp_indirect')",
             (cur.start, cur.end),
@@ -406,7 +406,7 @@ def routines_dot(
 
     # All xrefs whose src is inside one selected routine and dst inside another.
     rows = store.query(
-        "SELECT src_addr, dst_addr, kind FROM code_xrefs"
+        "SELECT DISTINCT src_addr, dst_addr, kind FROM code_xrefs"
         " WHERE dst_addr IS NOT NULL"
         "   AND kind IN ('jsr', 'jmp', 'jmp_indirect')",
         (),

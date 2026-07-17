@@ -46,17 +46,17 @@ ones in the legend above.
 | 0.5 | Distinguish blocking critic gaps from optional follow-ups so accepted answers are not incorrectly revised. | [x] Done |
 | 0.6 | Detect dependency cycles or unsatisfied dependencies and replan instead of running blocked steps with null arguments. | [x] Done |
 | 0.7 | Use one canonical game slug everywhere while preserving aliases for existing session directories. | [x] Done |
-| 1.1 | Skip the executor LLM when a plan step already has complete, concrete tool arguments. | [ ] Not started |
-| 1.2 | Extract structured tool results deterministically and batch the remaining free-text LLM synthesis work. | [ ] Not started |
-| 1.3 | Cap and prioritize automatic Layer-1 routine annotations to prevent hidden LLM-call fan-out. | [ ] Not started |
-| 1.4 | Track real per-role token, cost, LLM-call, tool-call, and VICE-call usage against the run budget. | [ ] Not started |
-| 1.5 | Reuse and memoize KB digests, partial-asm metadata, and question embeddings instead of rebuilding them per node. | [ ] Not started |
-| 1.6 | Replace repeated full event-log scans with indexed lookups and replay high-water marks. | [ ] Not started |
+| 1.1 | Skip the executor LLM when a plan step already has complete, concrete tool arguments. | [x] Done |
+| 1.2 | Extract structured tool results deterministically and batch the remaining free-text LLM synthesis work. | [x] Done |
+| 1.3 | Cap and prioritize automatic Layer-1 routine annotations to prevent hidden LLM-call fan-out. | [x] Done |
+| 1.4 | Track real per-role token, cost, LLM-call, tool-call, and VICE-call usage against the run budget. | [x] Done |
+| 1.5 | Reuse and memoize KB digests, partial-asm metadata, and question embeddings instead of rebuilding them per node. | [x] Done |
+| 1.6 | Replace repeated full event-log scans with indexed lookups and replay high-water marks. | [x] Done |
 | 1.7 | Run independent read-only plan steps in parallel with LangGraph fan-out after batching and retry semantics stabilize. | [-] Deferred |
-| 2.1 | Compact only new, uncompacted events and expose consolidated observations in question digests. | [ ] Not started |
-| 2.2 | Detect changed dump and assembly inputs by content metadata and invalidate stale derived analysis. | [ ] Not started |
-| 2.3 | Store routine confidence and prevent lower-confidence replay events from overwriting stronger facts. | [ ] Not started |
-| 2.4 | Implement durable CLI checkpoint resume with `SqliteSaver`, or correct the resume claim if KB-only persistence is retained. | [ ] Not started |
+| 2.1 | Compact only new, uncompacted events and expose consolidated observations in question digests. | [x] Done |
+| 2.2 | Detect changed dump and assembly inputs by content metadata and invalidate stale derived analysis. | [x] Done |
+| 2.3 | Store routine confidence and prevent lower-confidence replay events from overwriting stronger facts. | [x] Done |
+| 2.4 | Implement durable CLI checkpoint resume with `SqliteSaver`, or correct the resume claim if KB-only persistence is retained. | [x] Done |
 | 2.5 | Persist semantic vectors and embed only cache misses once semantic search is enabled by default. | [-] Deferred |
 | 3.1 | Add named memory snapshots, diffs, and monotonic scans for locating changing game-state variables. | [ ] Not started |
 | 3.2 | Add a safe VICE watchpoint/trace workflow and allow register reads when a checkpoint is armed. | [ ] Not started |
@@ -76,7 +76,7 @@ ones in the legend above.
 | 4.8 | Bound or compact `tool_results` in graph state after persisted results no longer need full payloads. | [-] Deferred |
 | 5.1 | Add a golden-question regression suite that checks expected evidence, confidence, cost, and runtime. | [ ] Not started |
 | 5.2 | Add deterministic unit tests and compact synthetic dump fixtures for core parsing, routing, and disassembly behavior. | [ ] Not started |
-| 5.3 | Add a per-role calls, tokens, failures, and fallback-activation table to generated reports. | [ ] Not started |
+| 5.3 | Add a per-role calls, tokens, failures, and fallback-activation table to generated reports. | [x] Done (delivered with 1.4) |
 | 5.4 | Persist one queryable run-summary event containing outcome, iterations, confidence, and cost. | [ ] Not started |
 | 5.5 | Add human ratings and LangSmith datasets after the product/UI work is ready to collect them. | [-] Deferred |
 | 6.1 | Add human approval/edit interrupts for plans and mutating VICE operations, plus UI cancellation. | [ ] Not started |
@@ -265,7 +265,7 @@ growth scan is O(events) per verdict — indexing belongs to 1.6. `RECURSION_LIM
 Roughly halves LLM calls per iteration and makes spend visible. Do after Phase 0 so savings are measured on a loop
 that actually completes.
 
-- [ ] **1.1 Skip the executor LLM for already-concrete steps** ✅ (LLM-per-step confirmed)
+- [x] **1.1 Skip the executor LLM for already-concrete steps** ✅ (LLM-per-step confirmed)
   - **Now:** `executor_node` (`graph/nodes.py:1001-1083`) makes an LLM call for *every* step (with an 8k-char digest),
     even `{"mode":"stats"}` or fully-specified capstone steps.
   - **Fix:** per-tool/mode `is_step_complete(step)` validator; call the executor LLM only when a required arg is
@@ -275,7 +275,7 @@ that actually completes.
   - **Effort:** ~half day · **Impact:** High · **Source:** F §2.1, G #1, S (strong overlap)
   - **My call:** Do — highest-ROI first patch per GPT.
 
-- [ ] **1.2 Deterministic synthesis for structured tool output; batch the LLM rest** ✅ (all 3 reports)
+- [x] **1.2 Deterministic synthesis for structured tool output; batch the LLM rest** ✅ (all 3 reports)
   - **Now:** `synthesizer_node` runs an LLM extraction after *every* step, including structured JSON (`capstone
     find_entry/vectors/find_loops`, `code_kb` rows, `kb` rows), failed steps, and `kb stats`.
   - **Fix:** mechanical extractors for structured modes (find_loops→hypotheses, vectors→labels, code_kb routine
@@ -286,7 +286,7 @@ that actually completes.
   - **Effort:** ~1 day · **Impact:** High (highest cross-report consensus) · **Source:** F §2.2, G #3, Ge §1.3, S
   - **My call:** Do — pairs with 1.1 as the flagship efficiency patch.
 
-- [ ] **1.3 Cap the hidden Layer-1 auto-annotate fan-out** ✅
+- [x] **1.3 Cap the hidden Layer-1 auto-annotate fan-out** ✅
   - **Now:** synthesizer fires `_mode_annotate` (a full LLM call, possibly with auto-disasm) for *every* routine with
     confidence ≥ 0.5 (`graph/nodes.py:1283-1303`) — six routines = six invisible extra LLM calls.
   - **Fix:** cap at 1–2 per synthesizer invocation, prioritized by (confidence × question-term relevance); log each as
@@ -295,7 +295,7 @@ that actually completes.
   - **Effort:** ~2h · **Impact:** Medium-High · **Source:** F §2.3
   - **My call:** Do — silent unbounded cost.
 
-- [ ] **1.4 Real budget/cost accounting + per-role report table** ✅ (dead code confirmed)
+- [x] **1.4 Real budget/cost accounting + per-role report table** ✅ (dead code confirmed)
   - **Now:** `budget_used` is checked (`graph/routers.py:98`) but only ever set to `0.0` in `load_inputs`
     (`graph/nodes.py:557`). Zero token telemetry.
   - **Fix:** read `usage_metadata` off each `AIMessage` in `_invoke_one`; accumulate (input,output) tokens per role;
@@ -305,7 +305,7 @@ that actually completes.
   - **Effort:** ~half day · **Impact:** High (unblocks measuring everything else) · **Source:** F §1.4, G #4a, S
   - **My call:** Do early in Phase 1 so 1.1/1.2 savings are quantifiable.
 
-- [ ] **1.5 Stop rebuilding the digest / re-embedding per node** ✅ (partial-asm scan confirmed hot)
+- [x] **1.5 Stop rebuilding the digest / re-embedding per node** ✅ (partial-asm scan confirmed hot)
   - **Now:** `planner_node` and `executor_node` both call `_kb_digest_for_state` (full SQL rebuild) though
     `state["kb_digest"]` is refreshed by the synthesizer each step; every digest build calls `partial_asm_excerpt`
     which re-reads/JSON-parses the entire `kb.json` (O(events) per digest); semantic-on re-embeds the question each node.
@@ -315,7 +315,7 @@ that actually completes.
   - **Effort:** ~half day · **Impact:** Medium (scales with KB) · **Source:** F §2.4
   - **My call:** Do — cheap once budget telemetry shows the waste.
 
-- [ ] **1.6 Remove O(N) full-log scans on hot paths** ✅ (dedup scan confirmed)
+- [x] **1.6 Remove O(N) full-log scans on hot paths** ✅ (dedup scan confirmed)
   - **Now:** synthesizer stage-1 dedup loads+parses *all* `tool_result` events every call (`graph/nodes.py:1107-1116`);
     `ingest_text_file`/`ingest_dump`/`ingest_partial_asm`/`load_or_init` do full scans at startup.
   - **Fix:** index dedup keys (`(tool, step_id, hash(data))`); query `text_docs` by `path/mtime`; store latest-dump
@@ -329,11 +329,151 @@ that actually completes.
   - **My call:** Defer. Real wall-clock win, but it interacts with the batch-synthesis and failed-step-retry changes;
     land those first, then revisit so we don't design the batching twice.
 
+### Phase 1 implementation notes (2026-07-17; hardening round + final hardening pass applied — for reviewer)
+
+> **STATUS: Phase 1 implemented (1.1–1.6; 1.7 stays deferred), hardened per the GPT 5.6 Sol review
+> (6 findings — "Hardening-round changes" below), and re-hardened per the final review's 3 reproduced
+> probes ("Final hardening pass" below — all three probes are now permanent passing tests).
+> Full suite: 182 tests passing; `compileall` clean; `git diff --check` clean; graph compiles; both
+> runners import. Telemetry is trustworthy under nested (Layer-1), threaded, AND asyncio execution —
+> the condition set for keeping 1.4/5.3 marked complete.**
+
+**New module `graph/usage.py`** (1.4) — thread-safe usage collector + cost estimation + per-role aggregation.
+Every LLM call (`_invoke_one`, the screenshot vision path, failures included) records
+`{role, as_role, model, input/output_tokens, cost_usd, ok, error}`; each node drains pending entries at return
+time (`_usage_update()` in nodes.py) into two new state fields: `llm_usage` (add-reducer list) and `budget_used`
+(now an **add-reducer float** actually incremented — was dead code). The router's `BUDGET_CAP` check is live once
+pricing exists. **Cost policy (deliberate):** no fabricated price table — `config/llm.json` MAY define an optional
+top-level `"pricing"` map (`model-prefix → {input_per_mtok, output_per_mtok}`, longest prefix wins); without it,
+costs report 0.0 and tokens are still tracked (the report says so explicitly). I did **not** edit the user's
+`config/llm.json`. The report gained `## LLM usage (per role)` (calls/failures/backup-activations/tokens/USD —
+this also delivers item 5.3) and `## Tool calls` (per-tool call/failure counts; vice calls visible per-tool).
+
+Per item:
+
+- **1.1** — `plan_utils.step_is_concrete(step)`: per-tool/mode required-arg validator (kb sql/text need
+  `sql`/`q`; capstone `linear` needs `start`; tavily needs `q`; vice disassemble/memory.read need an address
+  alias (+`size`); any null/empty arg value returns False). The executor dispatches concrete steps directly —
+  no LLM call, no digest build — logging "(LLM skipped — args already concrete)". **Retries always go through
+  the LLM** so it can repair args from the recorded failure. The planner's own fallback plan is now fully
+  LLM-free at the executor. `VICE_ADDRESS_ALIASES` moved to plan_utils (shared with nodes' arg normalizer).
+- **1.2** — Synthesizer split into: stage 1 record (indexed dedup, see 1.6) → stage 1.5 **mechanical extraction**
+  (capstone `vectors` → vector labels; `find_loops` candidates → deterministic-id hypotheses `h_loop_<addr>`;
+  payloads carry `provenance: "mechanical"`) → stage 2 **batched LLM extraction**: LLM-worthy results (free text
+  only — failed results and `kb`/`code_kb` reads are never LLM'd; `vectors`/`find_entry` are mechanical-only;
+  `find_loops` is hybrid because it embeds an auto-disassembly listing) accumulate across steps via a
+  `synth_processed_count` index high-water in state and flush in ONE call when the plan drains (analyst next)
+  or the batch fills (`SYNTH_BATCH_MAX_RESULTS=4` / `SYNTH_BATCH_MAX_CHARS=20k`). LLM-extracted payloads carry
+  `provenance: "llm"`. On a pure defer the digest rebuild is also skipped.
+- **1.3** — The per-routine auto-`_mode_annotate` calls are queued as candidates, ranked by
+  confidence × (1 + question-term relevance), capped at `MAX_AUTO_ANNOTATE_PER_SYNTH=2` per synthesizer pass,
+  and logged in the transcript (including how many candidates were deferred) instead of firing silently.
+- **1.4** — See `graph/usage.py` above.
+- **1.5** — Planner and executor reuse `state["kb_digest"]` (≤1 step stale) instead of rebuilding;
+  `digest_for_question` memoized on `(question, events_total, max_chars)` (events_total covers all derived
+  content, so growth self-invalidates); `partial_asm_excerpt` resolves via the events *table* + caches the head
+  (was: re-read + JSON-parse the entire kb.json per digest build); the semantic question-embedding is memoized
+  per query text (bounded cache).
+- **1.6** — (a) synthesizer dedup via new derived table `tool_result_keys(key PK, event_id)` where key =
+  sha256(tool|step_id|**full** data) — indexed lookup instead of parsing every tool_result event per pass, and
+  full-content identity matches the 0.2 review direction (a 256-char-prefix would drop evidence past it);
+  (b) `ingest_dump`/`ingest_partial_asm` idempotency and `_warm_dump_cache` now query the derived events table;
+  `ingest_text_file` checks `text_docs.path/mtime` directly (was O(files × events)); (c) **incremental replay**:
+  the derived SQLite view persists across processes with `meta.schema_version` + `meta.replay_offset` (byte
+  high-water into kb.json, advanced on every append); startup replays only the JSONL tail; full rebuild on
+  version mismatch, truncated/replaced log, or a corrupt tail (`SCHEMA_VERSION="2"` bumped in memory/schema.py —
+  existing derived DBs rebuild once, transparently). Side benefit: two processes sharing a KB no longer clobber
+  each other's derived rows at open (the old code dropped all tables on every start).
+
+**Tests:** 182 passing (113 added across Phase 1 + both hardening rounds): `test_executor_skip.py`
+(concrete-step table incl. mode-exact `code_kb` aliases with positive AND negative cases per address-bearing
+mode, vice checkpoint/execution cases, bypass/retry integration), `test_synth_batch.py` (defer/flush/batch-fill,
+unworthy results never reach the LLM, mechanical vectors-only, hybrid find_loops, no duplicate mechanical facts,
+annotate cap + relevance priority, **annotate usage reaches the state update**, **failed annotation not logged
+as success** — real KB + code-KB stores), `test_usage.py` (extraction, longest-prefix pricing, honest-zero for
+unknown models, aggregation, success/transport-failure/backup recording, **empty/non-JSON/invalid-contract
+responses counted as failures even when salvaged**, **thread AND asyncio contexts cannot cross-drain** (the
+reviewer's exact repro), `reset()` behaviour, copy-on-write `mark_failed` amendment, **wrong-shaped dicts
+rejected per role / valid minimal contracts accepted / envelope unwrap / invalid critic decision**, **fallback
+vs backup activation distinct + counted exactly once**, report table + budget block content), `test_routers.py`
+(+ **token budget terminates an unpriced over-budget run**, env resolution), `test_store_perf.py` (incremental
+reopen without full rebuild, foreign-tail replay, truncation/schema-mismatch rebuilds, **same-size log
+replacement and prefix-edit rebuilds**, full-content dedup identity, ingest idempotency incl. mtime refresh,
+digest/partial-asm memoization).
+
+**Hardening-round changes (GPT 5.6 Sol review of Phase 1 — all six findings fixed, 2026-07-17):**
+1. **Nested Layer-1 telemetry no longer discarded.** `_mode_annotate()` returns through `_record_result()`,
+   whose drain had moved the Layer-1 usage entries into a return value the synthesizer threw away. The
+   synthesizer now captures that return, **re-records** its `llm_usage` entries so its own drain ships them to
+   state, and inspects the nested tool result: "auto-annotated $XXXX" is logged only on `ok=True`; handled
+   failures log "auto-annotation of $XXXX FAILED: <reason>" (crashes too). Cap of 2/pass preserved.
+2. **Usage collection is invocation-local.** `graph/usage.py` replaced the module-global pending list with a
+   `contextvars.ContextVar` bucket: concurrent Streamlit/LangGraph runs (threads, or asyncio tasks with copied
+   contexts) cannot drain each other's entries; nested calls within a node still land in that node's drain.
+   Residual (documented): a reused executor thread can inherit stragglers only if a node crashed between
+   record and drain — `drain()` always clears, so they never accumulate.
+3. **Token-budget fallback.** `tokens_used` (new add-reducer state field, distinct from USD `budget_used` — no
+   unit mixing) always accrues; `verdict_router` enforces `routers.token_budget()`
+   (env `C64RE_TOKEN_BUDGET` → config `defaults.token_budget` → `DEFAULT_TOKEN_BUDGET = 3,000,000`).
+   The report's Budget block shows total tokens vs token cap, est. USD vs USD cap, priced/unpriced call
+   counts, and **which limit was enforced** — so unpriced models are protected at runtime.
+4. **`step_is_concrete` per-mode validation.** `code_kb` now mirrors the real mode handlers: metadata modes
+   (stats/schema/hardware/routines/smc/export) are arg-free; routine/annotate/disasm/xrefs_to/xrefs_from
+   require an address; search requires `q`; sql requires `sql`; unknown modes → enrich. VICE
+   checkpoint/breakpoint methods now require an address (the old blanket-True false positive); unknown vice
+   methods → enrich. Retries still always use the LLM.
+5. **Honest failure accounting.** A usage entry's `ok` now means "produced a usable role-contract response";
+   `transport_ok` tracks HTTP success separately. Empty bodies are demoted at record time; `_safe_invoke`
+   demotes non-JSON / non-contract responses in place via `usage.mark_failed()` (the salvaged raw-text
+   fallback is still handed to the caller but counted as a failure). Same treatment in the screenshot-vision
+   path (empty description = failure) and `_invoke_layer1` (empty/non-JSON = failure).
+6. **Replaced-log detection in incremental replay.** The derived view persists a `replay_fingerprint`
+   (sha256 over the first and last 4KB of the replayed prefix + the offset) alongside `replay_offset`;
+   same-size replacement, head edits, and edits near the replay boundary all trigger a full rebuild while
+   normal appended-tail replay stays O(tail). **Accepted blind spot (documented in code):** an edit strictly
+   inside the un-probed middle of a >8KB prefix; full-content hashing per startup would reinstate the
+   O(all-events) cost the feature removes.
+
+**Final hardening pass (2026-07-17 — three defects the final review reproduced, all fixed):**
+1. **Asyncio usage cross-draining.** The ContextVar held a *mutable list*; asyncio context copies are shallow,
+   so tasks inherited the SAME list and one task's `drain()` (clear) emptied another's (reproduced as
+   `A=['a','b'], B=[]`). Storage is now an **immutable tuple with copy-on-write `set()`** — an inherited value
+   is never mutated, so threads and asyncio tasks are both isolated while nested calls within one node still
+   drain together. `record()` still returns the live entry dict for `mark_failed()`. New `usage.reset()` is
+   called at run start (`load_inputs`) so a reused execution context cannot leak prior-run stragglers.
+   The reviewer's exact two-task probe is a permanent test (`test_asyncio_tasks_cannot_cross_drain`).
+2. **Role-contract dict validation.** `_safe_invoke` accepted ANY parsed dict — `{"unexpected": 1}` was
+   returned as analyst "success", recorded ok=True, and blocked backups. `_dict_contract_error()` now
+   validates the minimal discriminator per PRIMARY role (planner: non-empty `plan` list; executor: dict
+   `args` + step identity; synthesizer: any extraction key; curator: any compaction key; analyst: non-empty
+   `answer`; critic: `decision ∈ {accept, revise, replan}`), with one level of envelope unwrapping preserved
+   (`candidate_answer`/`result`/…). Rejection marks the usage entry failed with the contract reason and tries
+   the next backup; the heuristic fallback runs only after the chain is exhausted. **Fallback telemetry:**
+   heuristic/raw-text fallback activation is flagged on the final attempt's entry
+   (`fallback_activated=True` — never an extra call), aggregated separately from backup activations, and shown
+   in a new `fallback` column of the report table.
+3. **`code_kb` mode-exact argument aliases.** The shared alias list accepted keys handlers ignore
+   (`xrefs_to`+`src` and `xrefs_from`+`dst` were confirmed false positives). `step_is_concrete` now mirrors
+   each handler exactly: routine/annotate → start|addr|address; xrefs_to → addr|dst; xrefs_from → addr|src;
+   disasm → address|addr (vice engine) / start|addr (capstone/default); search → q|query; sql → sql; metadata
+   modes arg-free; unknown modes → enrich. Positive AND negative alias cases per mode are in the test table;
+   retries still always use executor enrichment.
+
+**Known limitations / deliberate choices for review:**
+1. On a deferred batch the executor sees a digest that is at most one batch stale (fresh facts still reach the
+   analyst — a flush always precedes it).
+2. `budget_used` counts only LLM cost; tool/VICE calls are counted (report) but not priced.
+3. The fingerprint blind spot from hardening item 6 above (middle-of-prefix edits on >8KB logs).
+4. Straggler entries from a node that crashed between record and drain are dropped at the next run's
+   `usage.reset()` (in `load_inputs`) rather than attributed — they can no longer leak across runs or tasks.
+5. Contract validation checks each role's minimal discriminator, not full schemas — a dict with the right
+   discriminator but malformed optional fields still reaches the node's existing permissive parsing.
+
 ---
 
 ## Phase 2 — Persistence & curator honesty
 
-- [ ] **2.1 Curator: uncompacted-size gate + high-water mark + digest section** ✅ (invisible output confirmed)
+- [x] **2.1 Curator: uncompacted-size gate + high-water mark + digest section** ✅ (invisible output confirmed)
   - **Bug (3 parts):** (a) `post_synth_router` gates on total `kb.json` size (`graph/routers.py:84`), which only grows,
     so once a game crosses ~80k tokens *every* future synthesizer step pays a curator call forever; (b) `curator_node`
     always takes the last 20 tool_results by ts and never marks them compacted, so it re-summarizes near-identical
@@ -346,7 +486,7 @@ that actually completes.
   - **Effort:** ~half day · **Impact:** High · **Source:** F §1.3, G #8, S
   - **My call:** Do — removes a permanent tax and restores long-term memory to the analyst.
 
-- [ ] **2.2 Dump/asm freshness (content hash, not path-idempotence)** ✅
+- [x] **2.2 Dump/asm freshness (content hash, not path-idempotence)** ✅
   - **Bug:** `ingest_dump` skips on path-seen-before (no hash/mtime); `already_ingested_asm` keys on path alone. Text
     docs *do* re-ingest on newer mtime — dumps/asm should too. Overwriting `petch_ingame.bin` silently poisons later turns.
   - **Fix:** key dumps/asm by `(path, sha256|mtime, size)`; on change append a new ingest event, invalidate derived
@@ -355,7 +495,7 @@ that actually completes.
   - **Effort:** ~half day · **Impact:** Medium-High · **Source:** Gr §1.3
   - **My call:** Do — real correctness bug for iterative users.
 
-- [ ] **2.3 Confidence-aware replay + add `confidence` to `routines`** ✅
+- [x] **2.3 Confidence-aware replay + add `confidence` to `routines`** ✅
   - **Bug:** `SYNTHESIZER_ROLE` promises "KB overwrites when confidence improves," but `_apply_event_to_sqlite`
     (`memory/store.py:368-448`) uses unconditional `INSERT OR REPLACE`; `routines` has **no confidence column**
     (`memory/schema.py:38-45`), and a later lower-confidence label re-emit clobbers a higher one.
@@ -365,7 +505,7 @@ that actually completes.
   - **Effort:** ~2h · **Impact:** Medium · **Source:** F §1.6
   - **My call:** Do — stops silent fact downgrades.
 
-- [ ] **2.4 Make CLI resume real (`SqliteSaver`) or fix the help text** ✅
+- [x] **2.4 Make CLI resume real (`SqliteSaver`) or fix the help text** ✅
   - **Bug:** `main.py:189` compiles with `MemorySaver`, so `--thread-id` ("Resume an existing session") never resumes
     across processes; only the KB persists. `tools/agent_runner.py:40` same, plus a fresh thread_id per UI turn.
   - **Fix:** use `SqliteSaver` at `sessions/<slug>/checkpoint.sqlite` (also gives crash-resume mid-iteration), or, if we
@@ -377,6 +517,142 @@ that actually completes.
 - [-] **2.5 Persist the semantic vector index (embed only cache misses)**
   - **Source:** F §2.7, G #10 · **Effort:** ~1 day
   - **My call:** Defer until semantic search is actually enabled by default (it's `enabled:false` today). Track behind 2.1.
+
+### Phase 2 implementation notes (2026-07-17; hardening-round fixes applied 2026-07-18 — for reviewer)
+
+> **STATUS: Phase 2 implemented (2.1–2.4; 2.5 stays deferred), hardened per the GPT 5.6 Sol review's two
+> reproduced defects, and finished per the follow-up review's three source-invalidation defects (see
+> "Hardening-round changes" below — including the final-round provenance/re-materialization design and the
+> append-order `seq` ordering fix). Full suite: 214 tests passing; `git diff --check` clean; `compileall`
+> clean; `graph.build`/`main`/`tools.agent_runner` import; no checkpoint or test artifact under the
+> repository's real `sessions/` tree.**
+
+Per item (final behavior):
+
+- **2.1 (curator honesty)** — The gate now keys on the token volume of **uncompacted** tool_result events
+  (`store.uncompacted_tool_result_tokens()`, threshold `UNCOMPACTED_TOKEN_THRESHOLD = 40_000` — replaces the
+  total-kb.json-size gate that could never close). The curator consumes the **oldest** uncompacted events
+  (`uncompacted_tool_results()`, oldest-first, ties broken by id) and records the mechanically-derived
+  `events_compacted` ids on the consolidated payload — **never** the LLM's claimed list; an LLM failure writes
+  nothing, so no events are marked compacted without a real summary. **Bookkeeping is exact and ID-based**
+  (hardening — see below): replaying a consolidated event registers its listed ids in the derived
+  `compacted_tool_results` table (`SCHEMA_VERSION` → "4"), and "uncompacted" everywhere means
+  `id NOT IN compacted_tool_results` — never a timestamp comparison. `through_ts` on the payload is
+  informational only. `digest_for_question` gained a `## Consolidated observations` section (latest 3
+  summaries) and its raw "Recent tool results" section excludes only **genuinely** compacted events —
+  restoring the long-term memory the curator's output previously never reached.
+- **2.2 (content freshness)** — General KB: `ingest_dump` is idempotent on **content sha256**, not path; a dump
+  overwritten in place appends a fresh ingest event with `refreshed_from: <old-sha>` and the digest's KB-stats
+  section flags `dump_refreshed: True` (warning that older dump-derived facts may be stale). Legacy ingest
+  events without a hash get a one-time `sha_backfill` re-ingest, not a false "refreshed" flag. Code KB:
+  `asm_freshness(path, content)` returns new/current/changed (sha-based; size+mtime fallback for legacy
+  events) replacing the path-only `already_ingested_asm` in `_hydrate_code_kb`; a changed file triggers
+  `invalidate_source(path)` — an **event** (`EVT_INVALIDATE_SOURCE`) whose replay deletes that source's rows
+  from `code_routines`/`code_labels`/`instructions`/`hypotheses`/`asm_docs` *before* the re-ingest events that
+  follow, so full rebuilds reproduce the same state. `code_kb.ingest_dump` returns `(event_id, changed)`; on a
+  changed dump the hydrator invalidates `capstone:%`/`vice:%` disassembly-window rows (LIKE-pattern
+  invalidation). **Invalidation is now COMPLETE** (hardening — see below): `code_xrefs`, `code_smc_sites`,
+  `code_class`, and the canonical `annotations` rows all carry `source_file` provenance and are deleted with
+  the rest; the old "documented residue" no longer exists.
+- **2.3 (confidence-aware replay)** — `routines` gained a `confidence REAL` column
+  (`SCHEMA_VERSION` bumped to "3" → existing derived DBs rebuild once, transparently). Labels and routines now
+  replay via `ON CONFLICT … DO UPDATE … WHERE excluded.confidence >= existing.confidence`: a later
+  lower-confidence re-emission no longer clobbers a stronger fact (the synthesizer prompt's overwrite promise
+  is finally true). Pure derived-view change — the event log still records every emission. Equal confidence
+  refreshes (allows corrections at the same strength). Digest routine lines and `routines_summary` now show
+  confidence; the KB schema hint documents the CAS.
+- **2.4 (real resume)** — The CLI compiles with **`SqliteSaver`** at `sessions/<slug>/checkpoint.sqlite`
+  (new runtime dep `langgraph-checkpoint-sqlite`; graceful in-memory fallback with a warning if missing;
+  purged together with the game by `purge_persistence.py --game`; legacy-slug dirs honoured). Default
+  `--thread-id` is now **per-question** (`<game-slug>-<question-sha1[:8]>`): re-running the same game+question
+  resumes that thread's checkpointed state after a crash, while a different question gets a clean thread so
+  add-reducer state (tool_results/messages/llm_usage) can't bleed across questions. **Honest limitation
+  (documented in the flag's help):** re-invocation restarts the graph from the planner *on top of* the
+  checkpointed state — mid-node resume (input=None continuation) is left to the 6.2 notebook work. The
+  Streamlit runner intentionally keeps MemorySaver + fresh thread ids until 6.2.
+
+**Hardening-round changes (GPT 5.6 Sol review of Phase 2 — both reproduced defects fixed, 2026-07-18):**
+1. **Timestamp cursors eliminated from compaction bookkeeping.** The first pass used
+   `ts > last_consolidated.through_ts` as the boundary — an equal-timestamp event split across a batch limit
+   was silently skipped, and a legacy consolidated event (no `through_ts`) fell back to its own timestamp,
+   wrongly hiding EVERY earlier tool result even though the old curator summarised only its newest 20.
+   Design now: a derived, indexed `compacted_tool_results(event_id PK, consolidated_id)` table is populated on
+   replay of each consolidated event's `events_compacted` list; `uncompacted_tool_results()`,
+   `uncompacted_tool_result_tokens()`, and the digest's excerpt filter all use `id NOT IN (…)` membership.
+   Ordering is `ts ASC, id ASC` (deterministic, replay-stable); exclusion never depends on order. Legacy
+   consolidated events hide only the ids they actually listed — worst case is harmless re-compaction, never
+   hidden evidence. `last_consolidated_through_ts()` is deleted. **Migration:** `SCHEMA_VERSION` "3"→"4"
+   triggers one transparent full rebuild of existing derived DBs; the event log is untouched.
+2. **Source invalidation made complete.** `code_xrefs`, `code_smc_sites`, `code_class`, and `annotations`
+   gained `source_file` provenance (populated from annotation payloads; layer0's classify payloads now carry
+   it too; xref/SMC payloads already did in both the asm and disasm paths). The `EVT_INVALIDATE_SOURCE`
+   replay handler now deletes from all eight tables (+ `asm_docs`), works live, after reopen, and under full
+   replay (code_kb rebuilds its derived view on every open, so no migration machinery is needed).
+   **Multi-source provenance:** xref and SMC rows are per-(fact, source) — dedup is NULL-safe per source,
+   so the same edge asserted by two files keeps two rows and invalidating one source cannot delete the
+   other's provenance; consumers were updated to `SELECT DISTINCT` / `COUNT(DISTINCT …)`
+   (`code_kb_node` xrefs modes, `call_graph.local_dot`, `agent_runner.top_routines`).
+3. **Final round (2026-07-18): three further reproduced invalidation defects fixed.**
+   (a) *Indirect-jump xrefs lost provenance* — the `ANN_INDIRECT` projection called `_upsert_xref()` without
+   `source_file`, so its `code_xrefs` rows were NULL-attributed and survived invalidation. The annotation's
+   provenance now passes through every xref projection path.
+   (b) *Legacy source-less classifications survived invalidation* — pre-hardening layer-0 classify payloads
+   had no `source_file`. **Provenance recovery at replay time**: the legacy evidence templates
+   ("… consecutive parsed instructions in `<path>`", "gap marker in `<path>` (N bytes)") embed the path, and
+   `_recover_classify_source()` extracts it when the canonical row is applied — the append-only event log is
+   never modified. Recovered rows are removed by path invalidation like any other, removed ranges do not
+   survive when the new file emits no replacement, and unrelated sources are untouched.
+   **Conservative residue policy (documented):** a deterministic layer-0 classify row whose provenance cannot
+   be recovered (hand-altered evidence text) is dropped on ANY invalidation — it cannot be proven current, so
+   it must never be presented as such; a re-ingest re-creates it with full provenance.
+   (c) *Singleton projections discarded the surviving source* — with singleton keys
+   (`code_routines` by start, `code_labels` by addr+name, `instructions` by addr, `code_class` by addr), if
+   source A contributed a fact, B overwrote the key, and B was invalidated, the key was left empty though A's
+   canonical annotation still asserted the fact. **Re-materialization design**: the invalidation replay now
+   deletes the source's canonical `annotations` rows (single provenance-carrying source of truth), then
+   rebuilds ALL typed projections from the surviving annotations via the factored `_project_annotation()` —
+   invalidation is rare, so a full projection rebuild is cheap and provably consistent live, after reopen,
+   and under full event-log replay (the code KB replays its whole log on every open). Per-source xref/SMC
+   rows re-materialize exactly; the Layer-1 name-promotion path replays in order. The stale
+   `invalidate_source()` docstring was rewritten to match.
+   **Ordering fix (final):** the first re-materialization sorted by `(ts, id)` — but event ids are random
+   UUID fragments, so two equal-timestamp annotations could replay in REVERSED append order, flipping which
+   fact wins a singleton key after an *unrelated* invalidation (reproduced: A appended first with id
+   `zzzzzzzzzzzz`, B second with id `aaaaaaaaaaaa`, same timestamp → B correctly won live, then A wrongly won
+   after rematerialization and persisted across reopen). `annotations` now carries an explicit monotonic
+   **`seq`** column: assigned 1..N in event-log order during replay, `MAX(seq)+1` on live appends (under the
+   store's append lock; a re-apply of a known annotation id keeps its original seq). Invariants: deletions
+   never renumber survivors, so surviving relative order is immutable; a later append always sorts after
+   every survivor both live and in a from-scratch replay — hence identical winners live, after unrelated
+   invalidation, after overlapping invalidation, after reopen, and after full replay. Rematerialization
+   sorts by `ORDER BY seq ASC` only. (SQLite `rowid` was rejected: `INSERT OR REPLACE` churns it and VACUUM
+   may renumber implicit rowids — `seq` makes the invariant explicit.)
+
+**Tests:** 214 passing (32 net new across Phase 2 + all hardening rounds). Ordering-fix additions in
+`test_freshness.py`: the exact equal-timestamp/reversed-lexical-id reproducer, **parameterized across
+routines, labels, instructions, and classifications** — B (appended second, lexically earlier id) must remain
+the winner after an unrelated invalidation, after reopen/full replay, and A is restored only when B itself is
+invalidated; plus per-source xref/SMC rows verified byte-identical through a seq-ordered rematerialization.
+An empirical probe confirmed the old `(ts, id)` ordering reverses this exact case. Earlier final-round
+additions: indirect-xref provenance carried and invalidated (live + full replay); legacy classify
+fixture using the EXACT pre-hardening payload shape — recovered, invalidated, ranges stay removed without
+re-emission, unrelated source preserved; unattributable legacy classify swept conservatively on any
+invalidation; singleton restoration for routines/labels/instructions/classifications (B invalidated → A
+restored, live + replay); invalidating the older source preserves the current one. Earlier inventory:
+`test_curator.py` (gate opens on uncompacted
+volume and CLOSES after compaction; oldest-first, never-twice compaction with mechanical bookkeeping; failed
+LLM marks nothing compacted; digest shows consolidated section, hides compacted raw, keeps fresh evidence;
+**legacy consolidated event hides only its listed 20 of 25 — the older 5 stay visible**; **equal-timestamp
+events with limit=1 cannot be skipped** (frozen-clock); **bookkeeping survives a full derived-view rebuild**),
+`test_confidence_replay.py` (label/routine downgrade protection, equal/higher updates, CAS holds under
+from-scratch replay), `test_freshness.py` (dump content-change detection + `refreshed_from` provenance +
+digest flag + cache refresh; asm new/current/changed; event-based invalidation survives full replay;
+**invalidation covers xrefs/SMC/classification/annotations, preserves another source's rows including its
+provenance row for a shared identical edge, and holds after reopen/full replay**; **`capstone:%`/`vice:%`
+LIKE invalidation reaches xref and SMC rows**; code-KB dump change tuple), `test_resume.py` (per-question
+stable thread ids, checkpoint file creation, compiled-graph acceptance, legacy-dir reuse).
+`test_recursion_recovery` runs the durable checkpointer against tmp only; verified: no `checkpoint.sqlite`
+exists anywhere under the repository's real `sessions/` tree.
 
 ---
 
@@ -513,7 +789,7 @@ that actually completes.
     Add tiny synthetic 64KB fixture dumps. **Source:** F §4, G #12, S.
   - **My call:** Do — cheap and protects exactly the code Phases 0/3/4 touch.
 
-- [ ] **5.3 Per-role cost telemetry table in `write_report`** (depends on 1.4)
+- [x] **5.3 Per-role cost telemetry table in `write_report`** (depends on 1.4) — _delivered with 1.4_
   - role → calls / tokens / failures / backup-role activations. **Source:** F §4.
 
 - [ ] **5.4 `run_summary` event per completed run** (question, verdict, confidence, iterations, cost)

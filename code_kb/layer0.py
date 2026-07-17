@@ -410,6 +410,7 @@ def _build_from_parsed_asm_inner(
                     producer="deterministic", confidence=1.0,
                     payload={
                         "classification": "code",
+                        "source_file": parsed.path,
                         "evidence_text": (
                             f"{prev - run_start + 1} consecutive parsed "
                             f"instructions in {parsed.path}"
@@ -429,6 +430,7 @@ def _build_from_parsed_asm_inner(
                 producer="deterministic", confidence=1.0,
                 payload={
                     "classification": "code",
+                    "source_file": parsed.path,
                     "evidence_text": (
                         f"{prev - run_start + 1} consecutive parsed "
                         f"instructions in {parsed.path}"
@@ -449,6 +451,7 @@ def _build_from_parsed_asm_inner(
                 producer="deterministic", confidence=0.6,
                 payload={
                     "classification": "data",
+                    "source_file": parsed.path,
                     "evidence_text": (
                         f"gap marker in {parsed.path} ({g.end - g.start + 1} bytes)"
                     ),

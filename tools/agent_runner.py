@@ -452,7 +452,7 @@ def top_routines_by_xrefs(
         "         ELSE cr.name"
         "       END AS name,"
         "       CASE WHEN l1.annotation_id IS NULL THEN 0 ELSE 1 END AS has_layer1,"
-        "       COUNT(cx.src_addr) AS callers,"
+        "       COUNT(DISTINCT cx.src_addr) AS callers,"
         "       l1.text AS hypothesis_text,"
         "       l1.name_suggestion AS name_suggestion,"
         "       l1.idiom_match AS idiom_match,"

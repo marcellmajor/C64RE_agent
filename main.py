@@ -20,6 +20,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import argparse
+import hashlib
+from contextlib import nullcontext
 from pathlib import Path
 
 from langgraph.checkpoint.memory import MemorySaver
@@ -34,6 +36,45 @@ from graph.plan_utils import (
 )
 
 SESSIONS_DIR = Path(__file__).resolve().parent / "sessions"
+
+
+def _default_thread_id(game: str, question: str) -> str:
+    """Durable per-question thread id (tracker 2.4).
+
+    Same game + question → same thread, so re-running after a crash
+    continues on top of the checkpointed state. A different question
+    gets a fresh thread: the state's add-reducer fields (tool_results,
+    messages, llm_usage) would otherwise bleed between questions.
+    `--thread-id` overrides for explicit cross-run continuation.
+    """
+    q_hash = hashlib.sha1((question or "").encode("utf-8")).hexdigest()[:8]
+    return f"{slugify(game)}-{q_hash}"
+
+
+def _open_checkpointer(game: str):
+    """Context manager yielding the durable per-game checkpointer.
+
+    `--thread-id` claimed "Resume an existing session" but the CLI
+    compiled with `MemorySaver`, so nothing ever survived the process
+    (tracker 2.4). Checkpoints now live in
+    ``sessions/<slug>/checkpoint.sqlite`` (wiped together with the game
+    by `scripts/purge_persistence.py --game`). Falls back to in-memory
+    checkpoints with a warning when langgraph-checkpoint-sqlite is
+    unavailable — the run still works, only resume is disabled.
+    """
+    slug = resolve_session_slug(game, SESSIONS_DIR)
+    ckpt_dir = SESSIONS_DIR / slug
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        from langgraph.checkpoint.sqlite import SqliteSaver
+    except ImportError:
+        print(
+            "WARNING: langgraph-checkpoint-sqlite not installed — "
+            "checkpoints are in-memory and --thread-id will NOT resume "
+            "across runs."
+        )
+        return nullcontext(MemorySaver())
+    return SqliteSaver.from_conn_string(str(ckpt_dir / "checkpoint.sqlite"))
 
 
 def _truthy_env(name: str) -> bool:
@@ -178,8 +219,16 @@ def main() -> None:
              "previous run polluted the code KB with files from a "
              "different game.",
     )
-    parser.add_argument("--thread-id", default=None,
-                        help="Resume an existing session (default: <game-slug>)")
+    parser.add_argument(
+        "--thread-id", default=None,
+        help="Durable checkpoint thread to use/resume "
+             "(default: <game-slug>-<question-hash>). Checkpoints persist "
+             "in sessions/<slug>/checkpoint.sqlite: re-running with the "
+             "same thread id continues on top of that thread's saved "
+             "state (e.g. after a crash). NOTE: re-invocation restarts "
+             "the graph from the planner over the checkpointed state; "
+             "mid-node resume is future work (tracker 6.2).",
+    )
     parser.add_argument("--no-trace", action="store_true",
                         help="Disable LangSmith tracing for this run.")
     args = parser.parse_args()
@@ -195,8 +244,6 @@ def main() -> None:
     if args.no_trace:
         os.environ["LANGCHAIN_TRACING_V2"] = "false"
 
-    graph = build_graph().compile(checkpointer=MemorySaver())
-
     initial_state = {
         "game": args.game,
         "question": args.question,
@@ -211,7 +258,7 @@ def main() -> None:
         "messages": [],
     }
 
-    thread_id = args.thread_id or slugify(args.game)
+    thread_id = args.thread_id or _default_thread_id(args.game, args.question)
     # LangGraph defaults to 25 super-steps — one 7-step plan iteration.
     # RECURSION_LIMIT budgets the full MAX_ITERS loop (tracker 0.1).
     config = {
@@ -222,23 +269,30 @@ def main() -> None:
     print(f"=== Running C64-RE on {args.game!r} (thread_id={thread_id}) ===\n")
     seen = 0
     recursion_exhausted = False
-    try:
-        for event in graph.stream(initial_state, config, stream_mode="values"):
-            msgs = event.get("messages") or []
-            for m in msgs[seen:]:
-                print(f"  · {m.content}", flush=True)
-            seen = len(msgs)
-    except GraphRecursionError:
-        # Degrade into a best-effort low-confidence report instead of a
-        # stack trace: write_report is only reachable via the critic
-        # router, so on recursion exhaustion it never ran.
-        recursion_exhausted = True
-        print(
-            f"\n!! Recursion limit ({RECURSION_LIMIT} super-steps) exhausted "
-            "— emitting best-effort report from the last completed state."
-        )
+    # Durable checkpoints (tracker 2.4): everything that touches the
+    # graph must run inside the saver's context so its connection stays
+    # open through the final `get_state`.
+    with _open_checkpointer(args.game) as saver:
+        graph = build_graph().compile(checkpointer=saver)
+        try:
+            for event in graph.stream(initial_state, config,
+                                      stream_mode="values"):
+                msgs = event.get("messages") or []
+                for m in msgs[seen:]:
+                    print(f"  · {m.content}", flush=True)
+                seen = len(msgs)
+        except GraphRecursionError:
+            # Degrade into a best-effort low-confidence report instead of a
+            # stack trace: write_report is only reachable via the critic
+            # router, so on recursion exhaustion it never ran.
+            recursion_exhausted = True
+            print(
+                f"\n!! Recursion limit ({RECURSION_LIMIT} super-steps) "
+                "exhausted — emitting best-effort report from the last "
+                "completed state."
+            )
 
-    final = graph.get_state(config).values or {}
+        final = graph.get_state(config).values or {}
 
     if recursion_exhausted:
         # Normalize BEFORE reporting/printing: stamp the termination

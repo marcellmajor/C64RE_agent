@@ -6,6 +6,7 @@ requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.26",
     "langgraph>=0.2.50",
+    "langgraph-checkpoint-sqlite>=2.0.0",
     "langchain>=0.3.7",
     "langchain-core>=0.3.15",
     "langchain-openai>=0.2.8",

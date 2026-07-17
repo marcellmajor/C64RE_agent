@@ -1,14 +1,17 @@
 """Two-tier knowledge store.
 
 `kb.json` is the source-of-truth append-only event log. `kb.sqlite` is a
-derived, queryable view rebuilt from the event log on every
-`load_or_init` so it can never drift out of sync.
+derived, queryable view. The view persists between processes: on load,
+only the event-log tail beyond a recorded high-water byte offset is
+replayed (tracker 1.6); a schema-version or offset mismatch triggers a
+full rebuild from `kb.json`, so the view still can never drift.
 
 Per `CLAUDE.md` §2.5.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -23,6 +26,7 @@ from typing import Any, Iterable
 
 from memory.schema import (
     CLEAR_DDL,
+    EVT_CONSOLIDATED,
     EVT_DATA_STRUCTURE,
     EVT_HYPOTHESIS,
     EVT_INGEST_DUMP,
@@ -32,6 +36,7 @@ from memory.schema import (
     EVT_ROUTINE,
     EVT_TOOL_RESULT,
     SCHEMA_DDL,
+    SCHEMA_VERSION,
 )
 from memory.semantic_config import load_semantic_config
 from memory.semantic_documents import (
@@ -64,6 +69,19 @@ def get_store(handle: str | Path) -> "KnowledgeStore":
             store = KnowledgeStore.load_or_init(Path(key))
             _STORE_CACHE[key] = store
         return store
+
+
+def _tool_result_key(payload: dict[str, Any]) -> str:
+    """Content-hash identity of a tool result (tracker 1.6).
+
+    Full-data hash — not a text prefix — so an expanded window whose new
+    evidence appears after the opening lines is a distinct result.
+    """
+    data = payload.get("data", "")
+    if not isinstance(data, str):
+        data = json.dumps(data, sort_keys=True, default=str)
+    raw = f"{payload.get('tool')}|{payload.get('step_id')}|{data}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 # ----- partial-asm parsing helpers ----------------------------------------- #
@@ -110,6 +128,12 @@ class KnowledgeStore:
         # In-memory embedding index — rebuilt after SQLite replay when enabled.
         self._semantic_index: SemanticVectorIndex | None = None
         self._semantic_embed_ok: bool = False
+        # Memoization (tracker 1.5): digest keyed on
+        # (question, events_total, max_chars); partial-asm head keyed on
+        # max_lines; question-embedding vectors keyed on query text.
+        self._digest_cache: tuple[tuple, str] | None = None
+        self._partial_asm_cache: tuple[int, str] | None = None
+        self._q_embed_cache: dict[str, Any] = {}
 
     # ---- lifecycle ------------------------------------------------------- #
 
@@ -124,15 +148,14 @@ class KnowledgeStore:
         return store
 
     def _open_sqlite(self) -> None:
-        # Always rebuild the derived view so it can never drift from kb.json.
         self._db = sqlite3.connect(str(self.kb_sqlite), check_same_thread=False)
         self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA journal_mode=WAL")
-        # Drop + recreate all tables so this process gets a clean derived view
-        # that exactly mirrors kb.json — without unlinking the file, which
-        # would orphan any connection held by a concurrently-running process
-        # (e.g. `langgraph dev` alongside `streamlit run app.py`).
-        self._db.executescript(CLEAR_DDL)
+        # The derived view PERSISTS between processes now (tracker 1.6):
+        # only ensure missing tables exist here; `_replay_events` decides
+        # between an incremental tail replay and a full rebuild. Tables
+        # are never unlinked, which would orphan connections held by a
+        # concurrently-running process (`langgraph dev` + Streamlit).
         self._db.executescript(SCHEMA_DDL)
         self._db.commit()
 
@@ -145,20 +168,137 @@ class KnowledgeStore:
                 if raw:
                     yield json.loads(raw)
 
-    def _replay_events(self) -> None:
+    # Meta keys for the persistent derived view.
+    _META_SCHEMA_VERSION = "schema_version"
+    _META_REPLAY_OFFSET = "replay_offset"  # byte offset into kb.json
+    # Identity of the already-replayed prefix (review finding 6): a
+    # replaced log with the same byte size — or an edited prefix — must
+    # trigger a rebuild, not be silently treated as current.
+    _META_REPLAY_FINGERPRINT = "replay_fingerprint"
+
+    # Bytes probed at each end of the replayed prefix for the fingerprint.
+    _FINGERPRINT_PROBE = 4096
+
+    def _log_fingerprint(self, offset: int) -> str:
+        """Cheap identity of kb.json's first `offset` bytes.
+
+        Hashes the first and last `_FINGERPRINT_PROBE` bytes of the
+        replayed prefix (plus the offset itself), so same-size
+        replacement, head edits, and edits near the replay boundary are
+        all detected in O(8KB) instead of re-reading the whole log.
+        A modification strictly inside the un-probed middle of a >8KB
+        prefix is the accepted blind spot (documented limitation).
+        """
+        if offset <= 0 or not self.kb_json.exists():
+            return f"empty:{offset}"
+        h = hashlib.sha256()
+        h.update(str(offset).encode())
+        with self.kb_json.open("rb") as f:
+            head_len = min(self._FINGERPRINT_PROBE, offset)
+            h.update(f.read(head_len))
+            tail_start = max(head_len, offset - self._FINGERPRINT_PROBE)
+            if tail_start < offset:
+                f.seek(tail_start)
+                h.update(f.read(offset - tail_start))
+        return h.hexdigest()
+
+    def _meta_get(self, key: str) -> str | None:
+        assert self._db is not None
+        try:
+            row = self._db.execute(
+                "SELECT value FROM meta WHERE key = ?", (key,),
+            ).fetchone()
+        except sqlite3.Error:
+            return None
+        return row["value"] if row else None
+
+    def _meta_set(self, key: str, value: str) -> None:
+        assert self._db is not None
+        self._db.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+            (key, value),
+        )
+
+    def _full_rebuild(self) -> None:
+        """Drop + replay the complete event log (the pre-1.6 behaviour)."""
+        assert self._db is not None
+        size = self.kb_json.stat().st_size if self.kb_json.exists() else 0
+        self._db.executescript(CLEAR_DDL)
+        self._db.executescript(SCHEMA_DDL)
         for evt in self._iter_events():
             self._apply_event_to_sqlite(evt)
+        self._meta_set(self._META_SCHEMA_VERSION, SCHEMA_VERSION)
+        self._meta_set(self._META_REPLAY_OFFSET, str(size))
+        self._meta_set(self._META_REPLAY_FINGERPRINT, self._log_fingerprint(size))
+        self._db.commit()
+
+    def _replay_events(self) -> None:
+        """Bring the derived view up to date with kb.json.
+
+        Incremental: replay only the JSONL tail past the recorded
+        high-water byte offset (tracker 1.6 — startup used to be
+        O(all events) on every process start). Full rebuild when the
+        schema version changed, the offset is missing/ahead of the file
+        (truncated log), the already-replayed prefix's fingerprint no
+        longer matches (replaced/edited log, including same-size
+        replacement — review finding 6), or the tail fails to parse.
+        """
         assert self._db is not None
+        size = self.kb_json.stat().st_size if self.kb_json.exists() else 0
+
+        version = self._meta_get(self._META_SCHEMA_VERSION)
+        offset_raw = self._meta_get(self._META_REPLAY_OFFSET)
+        try:
+            offset = int(offset_raw) if offset_raw is not None else None
+        except ValueError:
+            offset = None
+
+        if version != SCHEMA_VERSION or offset is None or offset > size:
+            self._full_rebuild()
+            return
+
+        # Identity check on the replayed prefix: `offset == size` alone
+        # is not proof of currency — the log may have been replaced with
+        # different content of the same length.
+        stored_fp = self._meta_get(self._META_REPLAY_FINGERPRINT)
+        if stored_fp is None or stored_fp != self._log_fingerprint(offset):
+            self._full_rebuild()
+            return
+
+        if offset == size:
+            return  # already current
+
+        try:
+            # Binary mode: the recorded offset is a byte position at a
+            # line boundary (text-mode seek only accepts tell() values).
+            with self.kb_json.open("rb") as f:
+                f.seek(offset)
+                for raw in f:
+                    line = raw.decode("utf-8").strip()
+                    if line:
+                        self._apply_event_to_sqlite(json.loads(line))
+        except Exception:  # noqa: BLE001 — corrupt tail: rebuild from scratch
+            self._full_rebuild()
+            return
+        self._meta_set(self._META_REPLAY_OFFSET, str(size))
+        self._meta_set(self._META_REPLAY_FINGERPRINT, self._log_fingerprint(size))
         self._db.commit()
 
     def _warm_dump_cache(self) -> None:
         """Load the most recent ingested dump into memory if present."""
-        for evt in reversed(list(self._iter_events())):
-            if evt["kind"] == EVT_INGEST_DUMP:
-                path = Path(evt["payload"]["path"])
-                if path.exists():
-                    self._dump_bytes = path.read_bytes()
-                break
+        rows = self.query(
+            "SELECT payload_json FROM events WHERE kind = ?"
+            " ORDER BY ts DESC LIMIT 1",
+            (EVT_INGEST_DUMP,),
+        )
+        for r in rows:
+            try:
+                payload = json.loads(r["payload_json"])
+            except Exception:  # noqa: BLE001
+                continue
+            path = Path(payload.get("path", ""))
+            if path.exists():
+                self._dump_bytes = path.read_bytes()
 
     # ---- writes ---------------------------------------------------------- #
 
@@ -179,6 +319,14 @@ class KnowledgeStore:
             with self.kb_json.open("a") as f:
                 f.write(json.dumps(evt) + "\n")
             self._apply_event_to_sqlite(evt)
+            # Advance the replay high-water mark: we just appended the
+            # final line, so the derived view is current through EOF.
+            new_size = self.kb_json.stat().st_size
+            self._meta_set(self._META_REPLAY_OFFSET, str(new_size))
+            self._meta_set(
+                self._META_REPLAY_FINGERPRINT,
+                self._log_fingerprint(new_size),
+            )
             assert self._db is not None
             self._db.commit()
             self._semantic_on_append_locked(evt)
@@ -312,13 +460,20 @@ class KnowledgeStore:
             overlap = len(query_tokens & t_tokens)
             return min(1.0, overlap / max(1, len(query_tokens)))
 
-        try:
-            q_vecs = embed_texts_batched(cfg, [q_clean])
-        except EmbeddingServiceError as exc:
-            print("[kb_semantic] query embedding failed:", exc, file=sys.stderr)
-            return []
-
-        qv = q_vecs[0]
+        # Memoize the question vector — every digest build used to
+        # re-embed the same question, one HTTP call per node per step
+        # (tracker 1.5).
+        qv = self._q_embed_cache.get(q_clean)
+        if qv is None:
+            try:
+                q_vecs = embed_texts_batched(cfg, [q_clean])
+            except EmbeddingServiceError as exc:
+                print("[kb_semantic] query embedding failed:", exc, file=sys.stderr)
+                return []
+            qv = q_vecs[0]
+            if len(self._q_embed_cache) > 32:
+                self._q_embed_cache.clear()
+            self._q_embed_cache[q_clean] = qv
         ranked = self._semantic_index.search(qv, top_k=max(k * 8, k + 8))
         candidates: list[dict[str, Any]] = []
         for row in ranked:
@@ -374,12 +529,44 @@ class KnowledgeStore:
              json.dumps(evt["payload"])),
         )
 
+        if evt["kind"] == EVT_TOOL_RESULT:
+            # Indexed dedup identity for the synthesizer (tracker 1.6).
+            self._db.execute(
+                "INSERT OR REPLACE INTO tool_result_keys (key, event_id)"
+                " VALUES (?, ?)",
+                (_tool_result_key(evt["payload"]), evt["id"]),
+            )
+
+        if evt["kind"] == EVT_CONSOLIDATED:
+            # Register the EXACT tool_result ids this summary covered
+            # (tracker 2.1 hardening): membership in this table — never a
+            # timestamp comparison — is what marks an event compacted.
+            # Legacy consolidated events register only the ids they list;
+            # ids that match nothing (e.g. LLM-invented ones in very old
+            # events) are harmless.
+            for eid in evt["payload"].get("events_compacted") or []:
+                self._db.execute(
+                    "INSERT OR REPLACE INTO compacted_tool_results"
+                    " (event_id, consolidated_id) VALUES (?, ?)",
+                    (str(eid), evt["id"]),
+                )
+
         if evt["kind"] == EVT_LABEL:
+            # Confidence-aware compare-and-swap (tracker 2.3): a later,
+            # LOWER-confidence re-emit of the same (addr, name) must not
+            # clobber a stronger fact. The old INSERT OR REPLACE let a
+            # conservative re-observation downgrade good labels. Pure
+            # derived-view change — the event log keeps every emission.
             p = evt["payload"]
             self._db.execute(
-                "INSERT OR REPLACE INTO labels"
+                "INSERT INTO labels"
                 " (addr, name, kind, confidence, source_event_id)"
-                " VALUES (?, ?, ?, ?, ?)",
+                " VALUES (?, ?, ?, ?, ?)"
+                " ON CONFLICT(addr, name) DO UPDATE SET"
+                "   kind = excluded.kind,"
+                "   confidence = excluded.confidence,"
+                "   source_event_id = excluded.source_event_id"
+                " WHERE excluded.confidence >= labels.confidence",
                 (
                     int(p["addr"]),
                     p["name"],
@@ -406,11 +593,24 @@ class KnowledgeStore:
             )
 
         if evt["kind"] == EVT_ROUTINE:
+            # Same confidence CAS as labels (tracker 2.3) — the routines
+            # table previously had NO confidence column at all, so the
+            # synthesizer prompt's "the KB will overwrite the old entry
+            # automatically when confidence improves" promise was false.
             p = evt["payload"]
             self._db.execute(
-                "INSERT OR REPLACE INTO routines"
-                " (start, end, name, summary, calls_to_json, called_by_json)"
-                " VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO routines"
+                " (start, end, name, summary, calls_to_json,"
+                "  called_by_json, confidence)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(start) DO UPDATE SET"
+                "   end = excluded.end,"
+                "   name = excluded.name,"
+                "   summary = excluded.summary,"
+                "   calls_to_json = excluded.calls_to_json,"
+                "   called_by_json = excluded.called_by_json,"
+                "   confidence = excluded.confidence"
+                " WHERE excluded.confidence >= routines.confidence",
                 (
                     int(p["start"]),
                     int(p.get("end", p["start"])),
@@ -418,6 +618,7 @@ class KnowledgeStore:
                     p.get("summary"),
                     json.dumps(p.get("calls_to") or []),
                     json.dumps(p.get("called_by") or []),
+                    float(p.get("confidence", 0.5)),
                 ),
             )
 
@@ -449,21 +650,65 @@ class KnowledgeStore:
 
     # ---- ingestion ------------------------------------------------------- #
 
+    def has_tool_result(self, payload: dict[str, Any]) -> bool:
+        """Indexed identity check for tool-result dedup (tracker 1.6).
+
+        Identity = sha256(tool | step_id | full data). Replaces the
+        synthesizer's full event-log scan (which also compared only a
+        256-char prefix, losing evidence added past it).
+        """
+        assert self._db is not None
+        row = self._db.execute(
+            "SELECT 1 FROM tool_result_keys WHERE key = ?",
+            (_tool_result_key(payload),),
+        ).fetchone()
+        return row is not None
+
     def ingest_dump(self, path: Path) -> str | None:
-        """Idempotent: skips if a dump with this path is already recorded."""
+        """Idempotent on CONTENT, not just path (tracker 2.2).
+
+        A dump overwritten in place under the same filename used to be
+        silently ignored — stale static analysis then poisoned later
+        turns. The ingest event now records the content sha256; when the
+        file changed, a fresh ingest event is appended with
+        `refreshed_from` so the digest can flag that earlier
+        dump-derived analysis may be stale.
+        """
         path = Path(path)
-        for evt in self._iter_events():
-            if evt["kind"] == EVT_INGEST_DUMP and evt["payload"]["path"] == str(path):
-                self._dump_bytes = path.read_bytes() if path.exists() else None
-                return None
         if not path.exists():
             return None
-        self._dump_bytes = path.read_bytes()
-        return self.append_event(
-            EVT_INGEST_DUMP,
-            "load_inputs",
-            {"path": str(path), "size": len(self._dump_bytes)},
-        )
+        data = path.read_bytes()
+        sha = hashlib.sha256(data).hexdigest()
+
+        prev_sha: str | None = None
+        seen_path = False
+        for r in self.query(
+            "SELECT payload_json FROM events WHERE kind = ?"
+            " ORDER BY ts DESC",
+            (EVT_INGEST_DUMP,),
+        ):
+            try:
+                payload = json.loads(r["payload_json"])
+            except Exception:  # noqa: BLE001
+                continue
+            if payload.get("path") == str(path):
+                seen_path = True
+                prev_sha = payload.get("sha256")
+                break
+
+        self._dump_bytes = data
+        if seen_path and prev_sha == sha:
+            return None  # already current
+
+        evt_payload: dict[str, Any] = {
+            "path": str(path), "size": len(data), "sha256": sha,
+        }
+        if seen_path:
+            if prev_sha is not None:
+                evt_payload["refreshed_from"] = prev_sha  # genuine change
+            else:
+                evt_payload["sha_backfill"] = True  # legacy event lacked a hash
+        return self.append_event(EVT_INGEST_DUMP, "load_inputs", evt_payload)
 
     def ingest_text_file(self, path: Path) -> str | None:
         """Idempotent ingestion of a single text file.
@@ -477,12 +722,14 @@ class KnowledgeStore:
         size = path.stat().st_size
         mtime = path.stat().st_mtime
 
-        for evt in self._iter_events():
-            if evt["kind"] != EVT_INGEST_TEXT:
-                continue
-            p = evt.get("payload") or {}
-            if p.get("path") == str(path) and float(p.get("mtime") or 0.0) >= mtime:
-                return None  # already current
+        # The text_docs table already tracks path+mtime — query it instead
+        # of scanning the whole event log per file (tracker 1.6; the old
+        # loop made ingest_text_dir O(files × events)).
+        rows = self.query(
+            "SELECT mtime FROM text_docs WHERE path = ?", (str(path),),
+        )
+        if rows and float(rows[0].get("mtime") or 0.0) >= mtime:
+            return None  # already current
 
         try:
             raw_bytes = path.read_bytes()
@@ -626,14 +873,19 @@ class KnowledgeStore:
 
     def ingest_partial_asm(self, path: Path) -> str | None:
         path = Path(path)
-        for evt in self._iter_events():
-            if (
-                evt["kind"] == EVT_INGEST_PARTIAL_ASM
-                and evt["payload"]["path"] == str(path)
-            ):
+        for r in self.query(
+            "SELECT payload_json FROM events WHERE kind = ?",
+            (EVT_INGEST_PARTIAL_ASM,),
+        ):
+            try:
+                payload = json.loads(r["payload_json"])
+            except Exception:  # noqa: BLE001
+                continue
+            if payload.get("path") == str(path):
                 return None
         if not path.exists():
             return None
+        self._partial_asm_cache = None  # new source invalidates the head cache
         text = path.read_text(errors="replace")
         labels = _parse_partial_asm(text)
         evt_id = self.append_event(
@@ -789,7 +1041,8 @@ class KnowledgeStore:
 
     def routines_summary(self, limit: int = 30) -> list[dict[str, Any]]:
         return self.query(
-            "SELECT start, end, name, summary, calls_to_json, called_by_json"
+            "SELECT start, end, name, summary, calls_to_json,"
+            " called_by_json, confidence"
             " FROM routines ORDER BY start LIMIT ?",
             (limit,),
         )
@@ -808,15 +1061,97 @@ class KnowledgeStore:
             (limit,),
         )
 
-    def recent_tool_excerpts(
-        self, limit: int = 12, max_chars_per: int = 4_000,
-    ) -> list[dict[str, Any]]:
-        """Most recent tool_result events, each lightly truncated."""
+    # ---- curator bookkeeping helpers (tracker 2.1, hardened) ------------- #
+    #
+    # Compaction membership is EXACT: a tool_result counts as compacted
+    # iff its event id is registered in `compacted_tool_results` (derived
+    # from consolidated events' `events_compacted` lists on replay).
+    # Timestamps are never the cursor — equal-timestamp events can't be
+    # skipped, and a legacy consolidated event can only hide the ids it
+    # actually listed (worst case: harmless re-compaction, never hidden
+    # evidence).
+
+    def uncompacted_tool_result_tokens(self) -> int:
+        """Rough token volume of tool_result events NOT yet compacted.
+
+        The curator gate keys on this (tracker 2.1). The old gate used
+        total kb.json size, which only ever grows — once a game crossed
+        the threshold, every synthesizer step paid a curator LLM call
+        forever.
+        """
         rows = self.query(
-            "SELECT id, ts, source, payload_json FROM events"
-            " WHERE kind = ? ORDER BY ts DESC LIMIT ?",
+            "SELECT COALESCE(SUM(LENGTH(payload_json)), 0) AS n"
+            " FROM events WHERE kind = ? AND id NOT IN"
+            " (SELECT event_id FROM compacted_tool_results)",
+            (EVT_TOOL_RESULT,),
+        )
+        return int(rows[0]["n"]) // 4 if rows else 0
+
+    def uncompacted_tool_results(
+        self, limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Oldest-first tool_result events not yet compacted.
+
+        Oldest-first (ties broken by id for replay-stable determinism) so
+        consecutive curator passes drain the backlog contiguously instead
+        of re-summarising the same recent window.
+        """
+        return self.query(
+            "SELECT id, ts, payload_json FROM events"
+            " WHERE kind = ? AND id NOT IN"
+            " (SELECT event_id FROM compacted_tool_results)"
+            " ORDER BY ts ASC, id ASC LIMIT ?",
             (EVT_TOOL_RESULT, limit),
         )
+
+    def consolidated_observations(
+        self, limit: int = 3,
+    ) -> list[dict[str, Any]]:
+        """Latest curator summaries, newest first (for the digest)."""
+        rows = self.query(
+            "SELECT id, ts, payload_json FROM events WHERE kind = ?"
+            " ORDER BY ts DESC LIMIT ?",
+            (EVT_CONSOLIDATED, limit),
+        )
+        out = []
+        for r in rows:
+            try:
+                payload = json.loads(r["payload_json"])
+            except Exception:  # noqa: BLE001
+                continue
+            out.append({
+                "event_id": r["id"],
+                "ts": r["ts"],
+                "summary": str(payload.get("summary") or ""),
+                "addresses_kept": payload.get("addresses_kept") or [],
+                "events_compacted": payload.get("events_compacted") or [],
+            })
+        return out
+
+    def recent_tool_excerpts(
+        self, limit: int = 12, max_chars_per: int = 4_000,
+        exclude_compacted: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Most recent tool_result events, each lightly truncated.
+
+        `exclude_compacted` hides results a consolidated summary has
+        GENUINELY covered (exact id membership — tracker 2.1); evidence a
+        legacy summary did not list stays visible.
+        """
+        if exclude_compacted:
+            rows = self.query(
+                "SELECT id, ts, source, payload_json FROM events"
+                " WHERE kind = ? AND id NOT IN"
+                " (SELECT event_id FROM compacted_tool_results)"
+                " ORDER BY ts DESC LIMIT ?",
+                (EVT_TOOL_RESULT, limit),
+            )
+        else:
+            rows = self.query(
+                "SELECT id, ts, source, payload_json FROM events"
+                " WHERE kind = ? ORDER BY ts DESC LIMIT ?",
+                (EVT_TOOL_RESULT, limit),
+            )
         out = []
         for r in rows:
             try:
@@ -858,22 +1193,38 @@ class KnowledgeStore:
         return out
 
     def partial_asm_excerpt(self, max_lines: int = 120) -> str:
-        """Return the raw partial-asm content (head) if one was ingested."""
-        for evt in self._iter_events():
-            if evt["kind"] != EVT_INGEST_PARTIAL_ASM:
+        """Return the raw partial-asm content (head) if one was ingested.
+
+        Resolves the source path via the derived events table and caches
+        the built head — the old implementation re-read and JSON-parsed
+        the entire kb.json per digest build (tracker 1.5/1.6).
+        """
+        if self._partial_asm_cache and self._partial_asm_cache[0] == max_lines:
+            return self._partial_asm_cache[1]
+
+        head = ""
+        for r in self.query(
+            "SELECT payload_json FROM events WHERE kind = ?",
+            (EVT_INGEST_PARTIAL_ASM,),
+        ):
+            try:
+                payload = json.loads(r["payload_json"])
+            except Exception:  # noqa: BLE001
                 continue
-            path = Path(evt["payload"].get("path", ""))
+            path = Path(payload.get("path", ""))
             if not path.exists():
                 continue
             try:
                 lines = path.read_text(errors="replace").splitlines()
             except OSError:
-                return ""
+                break
             head = "\n".join(lines[:max_lines])
             if len(lines) > max_lines:
                 head += f"\n... [{len(lines) - max_lines} more lines]"
-            return head
-        return ""
+            break
+
+        self._partial_asm_cache = (max_lines, head)
+        return head
 
     def digest_for_question(
         self, question: str, *, max_chars: int = 32_000,
@@ -884,18 +1235,47 @@ class KnowledgeStore:
         contexts. Keeping it here (instead of inline in `analyst_node`)
         means both agents see exactly the same evidence — which is
         important for the critic to actually catch unsupported claims.
+
+        Memoized on (question, events_total, max_chars): all digest
+        inputs derive from events, so an unchanged event count means an
+        identical digest (tracker 1.5 — planner/executor/analyst used to
+        trigger a full rebuild each, per step).
         """
         s = self.stats()
+        cache_key = (question, s["events_total"], max_chars)
+        if self._digest_cache and self._digest_cache[0] == cache_key:
+            return self._digest_cache[1]
         terms = self._question_terms(question)
 
         sections: list[str] = []
+
+        # Freshness flag (tracker 2.2): warn when the latest dump ingest
+        # replaced earlier content — older dump-derived analysis in this
+        # KB may describe bytes that no longer exist.
+        dump_refreshed_note = ""
+        latest_dump = self.query(
+            "SELECT payload_json FROM events WHERE kind = ?"
+            " ORDER BY ts DESC LIMIT 1",
+            (EVT_INGEST_DUMP,),
+        )
+        if latest_dump:
+            try:
+                _ld = json.loads(latest_dump[0]["payload_json"])
+            except Exception:  # noqa: BLE001
+                _ld = {}
+            if _ld.get("refreshed_from"):
+                dump_refreshed_note = (
+                    "\n- dump_refreshed: True — the dump file's content "
+                    "changed since an earlier ingest; dump-derived facts "
+                    "recorded before the refresh may be stale."
+                )
 
         sections.append(
             f"## KB stats\n"
             f"- events_total: {s['events_total']}\n"
             f"- labels: {s['labels']}\n"
             f"- text_docs: {s.get('text_docs', 0)}\n"
-            f"- dump_bytes: {s['dump_bytes']}\n"
+            f"- dump_bytes: {s['dump_bytes']}{dump_refreshed_note}\n"
             f"- semantic_kb_enabled: {s.get('semantic_kb_enabled')}\n"
             f"- semantic_kb_ready (embeddings hydrated): "
             f"{s.get('semantic_kb_ready')} "
@@ -928,9 +1308,14 @@ class KnowledgeStore:
                     for c in calls[:6]
                 ]
                 calls_str = f" calls→ {', '.join(calls_hex)}" if calls_hex else ""
+                conf = r.get("confidence")
+                conf_str = (
+                    f" (conf={float(conf):.2f})"
+                    if isinstance(conf, (int, float)) else ""
+                )
                 r_lines.append(
                     f"- ${r['start']:04X}-${r['end']:04X}  "
-                    f"{r.get('name') or '(unnamed)'} — "
+                    f"{r.get('name') or '(unnamed)'}{conf_str} — "
                     f"{r.get('summary') or '(no summary)'}{calls_str}"
                 )
             sections.append("## Identified routines\n" + "\n".join(r_lines))
@@ -999,12 +1384,36 @@ class KnowledgeStore:
         if partial:
             sections.append("## Partial-asm head\n```\n" + partial + "\n```")
 
+        # Curator output (tracker 2.1): before this section existed, the
+        # consolidated summaries were written but NEVER read by anyone in
+        # the default configuration — old evidence survived only as
+        # extracted labels/routines. This restores long-term memory.
+        consolidated = self.consolidated_observations(limit=3)
+        if consolidated:
+            c_lines = []
+            for c in consolidated:
+                body = c["summary"][:2_000]
+                addrs = ", ".join(str(a) for a in c["addresses_kept"][:12])
+                c_lines.append(
+                    f"### consolidated `{c['event_id']}`"
+                    + (f"  (addresses: {addrs})" if addrs else "")
+                    + f"\n{body}"
+                )
+            sections.append(
+                "## Consolidated observations (older evidence, compacted)\n"
+                + "\n\n".join(c_lines)
+            )
+
         # Build the base digest (without raw tool dumps) first so we know
         # how much budget remains for the verbose tool excerpts.
         base_digest = "\n\n".join(sections)
         budget_for_recent = max_chars - len(base_digest) - 100
 
-        recent = self.recent_tool_excerpts(limit=12, max_chars_per=4_000)
+        # Exclude genuinely-compacted results — the consolidated section
+        # above carries them; raw excerpts show only fresh evidence.
+        recent = self.recent_tool_excerpts(
+            limit=12, max_chars_per=4_000, exclude_compacted=True,
+        )
         if recent and budget_for_recent > 200:
             ex_lines: list[str] = []
             used = 0
@@ -1031,4 +1440,5 @@ class KnowledgeStore:
         # budget-gated, but keeps behaviour deterministic.
         if len(digest) > max_chars:
             digest = digest[: max_chars - 200] + "\n\n... [digest truncated to fit context budget]"
+        self._digest_cache = (cache_key, digest)
         return digest
