@@ -319,6 +319,16 @@ def step_is_concrete(step: dict[str, Any]) -> bool:
             return False
         if "screenshot" in method:
             return True
+        # VICE composites (tracker 3.1 / 3.2).
+        if "snapshot" in method:
+            return _has_value(args, "name")
+        if "monotonic_scan" in method:
+            return _has_value(args, "snapshots")
+        if method.endswith("diff") or method.endswith("memory.diff"):
+            # `a` defaults to "dump"; `b` may be a live read — arg-free ok.
+            return True
+        if method.endswith("trace"):
+            return _has_value(args, *VICE_ADDRESS_ALIASES)
         if "disassemble" in method:
             return _has_value(args, *VICE_ADDRESS_ALIASES)
         if "memory" in method and ("read" in method or "search" in method):
@@ -344,13 +354,14 @@ def step_is_concrete(step: dict[str, Any]) -> bool:
         # handlers ignore — e.g. `xrefs_to` with only `src` bypassed
         # enrichment and then read a defaulted addr of 0).
         if mode in ("stats", "schema", "hardware", "routines", "smc",
-                    "export"):
+                    "export", "hardware_refs"):
+            # hardware_refs self-defaults to the full I/O range (3.4).
             return True
         if mode in ("routine", "annotate"):
             # handlers read: start | addr | address
             return _has_value(args, "start", "addr", "address")
-        if mode == "xrefs_to":
-            # handler reads: addr | dst
+        if mode in ("xrefs_to", "writes_to", "refs_to"):
+            # handlers read: addr | dst  (data-ref modes, tracker 3.4)
             return _has_value(args, "addr", "dst")
         if mode == "xrefs_from":
             # handler reads: addr | src

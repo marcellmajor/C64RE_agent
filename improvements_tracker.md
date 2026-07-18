@@ -58,21 +58,21 @@ ones in the legend above.
 | 2.3 | Store routine confidence and prevent lower-confidence replay events from overwriting stronger facts. | [x] Done |
 | 2.4 | Implement durable CLI checkpoint resume with `SqliteSaver`, or correct the resume claim if KB-only persistence is retained. | [x] Done |
 | 2.5 | Persist semantic vectors and embed only cache misses once semantic search is enabled by default. | [-] Deferred |
-| 3.1 | Add named memory snapshots, diffs, and monotonic scans for locating changing game-state variables. | [ ] Not started |
-| 3.2 | Add a safe VICE watchpoint/trace workflow and allow register reads when a checkpoint is armed. | [ ] Not started |
-| 3.3 | Add deterministic 6502 counter heuristics for lives, score, timers, HUD digits, and similar state. | [ ] Not started |
-| 3.4 | Index data reads/writes and zero-page use-def relationships, with query modes for references and hardware access. | [ ] Not started |
-| 3.5 | Pre-tag common C64/6502 code idioms before Layer-1 LLM annotation. | [ ] Not started |
-| 3.6 | Make disassembly bank-aware, avoid false ROM assumptions, and improve illegal-opcode handling. | [ ] Not started |
-| 3.7 | Decode PETSCII, screen RAM, and color RAM into searchable KB text. | [ ] Not started |
+| 3.1 | Add named memory snapshots, diffs, and monotonic scans for locating changing game-state variables. | [x] Done |
+| 3.2 | Add a safe VICE watchpoint/trace workflow and allow register reads when a checkpoint is armed. | [x] Done |
+| 3.3 | Add deterministic 6502 counter heuristics for lives, score, timers, HUD digits, and similar state. | [x] Done |
+| 3.4 | Index data reads/writes and zero-page use-def relationships, with query modes for references and hardware access. | [x] Done |
+| 3.5 | Pre-tag common C64/6502 code idioms before Layer-1 LLM annotation. | [x] Done |
+| 3.6 | Make disassembly bank-aware, avoid false ROM assumptions, and improve illegal-opcode handling. | [x] Done |
+| 3.7 | Decode PETSCII, screen RAM, and color RAM into searchable KB text. | [x] Done |
 | 3.8 | Explore refined loop scoring, pseudocode decompilation, and multimodal poke-and-peek after prerequisite work. | [-] Deferred |
-| 4.1 | Make BASIC `SYS` detection tolerate spaces and common separators before the entry-point digits. | [ ] Not started |
-| 4.2 | Require an explicit Capstone linear-disassembly start address instead of silently using `$0801`. | [ ] Not started |
-| 4.3 | Match hexadecimal addresses from the question when retrieving relevant KB labels. | [ ] Not started |
-| 4.4 | Give screenshot analysis a dedicated neutral vision prompt and preserve usable failure/output metadata. | [ ] Not started |
-| 4.5 | Encode VICE memory reads as compact hex dumps before truncation so most returned bytes are not lost. | [ ] Not started |
-| 4.6 | Broaden configurable Tavily research domains and support advanced search depth. | [ ] Not started |
-| 4.7 | Honor per-role output-token limits so planner and analyst JSON is not truncated mid-response. | [ ] Not started |
+| 4.1 | Make BASIC `SYS` detection tolerate spaces and common separators before the entry-point digits. | [x] Done |
+| 4.2 | Require an explicit Capstone linear-disassembly start address instead of silently using `$0801`. | [x] Done |
+| 4.3 | Match hexadecimal addresses from the question when retrieving relevant KB labels. | [x] Done |
+| 4.4 | Give screenshot analysis a dedicated neutral vision prompt and preserve usable failure/output metadata. | [x] Done |
+| 4.5 | Encode VICE memory reads as compact hex dumps before truncation so most returned bytes are not lost. | [x] Done |
+| 4.6 | Broaden configurable Tavily research domains and support advanced search depth. | [x] Done |
+| 4.7 | Honor per-role output-token limits so planner and analyst JSON is not truncated mid-response. | [x] Done |
 | 4.8 | Bound or compact `tool_results` in graph state after persisted results no longer need full payloads. | [-] Deferred |
 | 5.1 | Add a golden-question regression suite that checks expected evidence, confidence, cost, and runtime. | [ ] Not started |
 | 5.2 | Add deterministic unit tests and compact synthetic dump fixtures for core parsing, routing, and disassembly behavior. | [ ] Not started |
@@ -658,7 +658,7 @@ exists anywhere under the repository's real `sessions/` tree.
 
 ## Phase 3 — RE technique gains (biggest answer-quality jumps)
 
-- [ ] **3.1 Memory snapshot diffing (`vice.memory.diff` composite)** — flagship
+- [x] **3.1 Memory snapshot diffing (`vice.memory.diff` composite)** — flagship
   - **Why:** For "where is the lives/score/level counter?", differential memory analysis beats any static disassembly.
     Building blocks exist (`vice.memory.read` up to 64KB; the on-disk dump is itself a snapshot).
   - **Fix:** agent-side composite with modes `snapshot` (store named RAM snapshot event), `diff` (changed addresses
@@ -669,7 +669,7 @@ exists anywhere under the repository's real `sessions/` tree.
   - **Effort:** ~1–2 days · **Impact:** Highest quality gain · **Source:** F §3.1, G #6, Ge §2.1, S (all)
   - **My call:** Do — the single highest-value capability, but it needs a live VICE to shine (see 3.3/dump-catalog for the offline path).
 
-- [ ] **3.2 Watchpoint/trace composite (`vice.trace`) + un-ban registers-after-break** ✅ (contradiction confirmed)
+- [x] **3.2 Watchpoint/trace composite (`vice.trace`) + un-ban registers-after-break** ✅ (contradiction confirmed)
   - **Now:** `checkpoint_add`/`breakpoint` map to `vice.checkpoint.add` (`graph/nodes.py:1712-1713`) but have no arg
     normalization and aren't in the cheat-sheet; `vice.execution.step/run/pause` unexposed; the analyst prompt asks for
     breakpoint follow-ups it can't run; `PLANNER_ROLE` line 215 recommends `vice.registers.get` while
@@ -681,7 +681,7 @@ exists anywhere under the repository's real `sessions/` tree.
   - **Effort:** ~1–2 days · **Impact:** High (unlocks the dynamic verification the critic demands) · **Source:** F §3.2/§1.7, G #6, Ge §2.3, S (all)
   - **My call:** Do — pairs with 3.1 (static candidate ∩ dynamic trace = near-certainty).
 
-- [ ] **3.3 `find_counters` deterministic static heuristic**
+- [x] **3.3 `find_counters` deterministic static heuristic**
   - **Why:** `find_loops` finds control flow; nothing finds *state*. 6502 game-state idioms are regular and cheap to
     scan: `DEC/INC abs` below `$D000` (lives/timers), `SED…ADC/SBC…CLD` clusters (BCD score), stores into screen RAM
     `$0400-$07E7` with `ORA/ADC #$30` digit chains (HUD), `CMP #$0A` after `INC abs` (decimal rollover / multi-byte).
@@ -691,7 +691,7 @@ exists anywhere under the repository's real `sessions/` tree.
   - **Effort:** ~1 day · **Impact:** High (first-iteration answers for flagship questions) · **Source:** F §3.3, G #5, S
   - **My call:** Do — pure/testable, works offline, composes with 3.1.
 
-- [ ] **3.4 Index data references / zero-page use-def in Layer 0** ✅ (only ctrl-flow xrefs today)
+- [x] **3.4 Index data references / zero-page use-def in Layer 0** ✅ (only ctrl-flow xrefs today)
   - **Now:** `code_kb` Layer 0 records xrefs only for JSR/JMP/branches; every `LDA/STA/CMP abs` operand is discarded, so
     "what writes $D012?" needs fresh disasm + LLM eyeballing.
   - **Fix:** `ANN_DATAREF` (`src, dst, access∈{r,w,rmw}, index∈{none,x,y}`) captured in the same parse pass; query modes
@@ -701,7 +701,7 @@ exists anywhere under the repository's real `sessions/` tree.
   - **Effort:** ~2 days · **Impact:** Medium-High · **Source:** F §3.4, G #4, Ge §3.3, S (all)
   - **My call:** Do — turns many multi-iteration hunts into one SQL query.
 
-- [ ] **3.5 Deterministic idiom pre-tagging before Layer-1**
+- [x] **3.5 Deterministic idiom pre-tagging before Layer-1**
   - **Fix:** table-driven matcher for rigid signatures (raster wait `LDA $D012/CMP/BNE`, `DEX/BNE` delay, memcpy
     `LDA abs,X/STA abs,X/DEX/BNE`, jump-table dispatch, KERNAL trampolines `JMP $FFxx`, SID tick to `$D400-$D418`).
     Feed matches into the Layer-1 prompt as "pre-analysis found: raster_wait at $XXXX" so the LLM confirms rather than
@@ -710,7 +710,7 @@ exists anywhere under the repository's real `sessions/` tree.
   - **Effort:** ~2 days · **Impact:** Medium · **Source:** F §3.7, G #5, Ge §3.1, S (all)
   - **My call:** Do after 3.4 (shares the instruction index).
 
-- [ ] **3.6 Bank-awareness / RAM-under-ROM + illegal-opcode handling** ✅ (E000 penalty confirmed)
+- [x] **3.6 Bank-awareness / RAM-under-ROM + illegal-opcode handling** ✅ (E000 penalty confirmed)
   - **Now:** `find_loops` scans only `$0800-$CFFF` and penalizes ≥`$E000` by −30 (`tools/c64_disasm.py:464-468`) even
     though the input is a RAM dump; ROM-range vector seeds burn the `max_insns` budget on KERNAL; `bank` arg exists but
     the planner is never told bank names.
@@ -722,7 +722,7 @@ exists anywhere under the repository's real `sessions/` tree.
   - **Effort:** ~1–2 days · **Impact:** Medium (fewer hallucinations) · **Source:** F §3.5, G #7, Ge §3.2, S (all)
   - **My call:** Do the penalty/seed fixes (cheap, high value); treat the illegal-opcode decoder as optional stretch.
 
-- [ ] **3.7 PETSCII / screen + color RAM decode tool** (C64-specific, cheap)
+- [x] **3.7 PETSCII / screen + color RAM decode tool** (C64-specific, cheap)
   - **Fix:** deterministic dump→string extractor: given `$0001`/VIC state or defaults, decode screen RAM (+color RAM)
     to ASCII/PETSCII and write into the KB. Often answers "what does the HUD say / where is score text?" without vision.
   - **Files:** new tool + `graph/nodes.py`/`code_kb`, reuse `code_kb/hardware_pack.py`.
@@ -734,37 +734,172 @@ exists anywhere under the repository's real `sessions/` tree.
   - **My call:** Defer. Loop-scoring refinements are nice-to-have polish; pseudocode decompilation and poke-and-peek are
     larger bets that depend on 3.1/3.2 landing first and (for poke-and-peek) on `vice.memory.write` + HITL gating (6.1).
 
+### Phase 3 implementation notes (2026-07-18 — for reviewer)
+
+> **STATUS: Phase 3 implemented (3.1–3.7; 3.8 stays deferred). Full suite: 247 tests passing (33 new);
+> `git diff --check` clean; `compileall` clean; graph + both runners import; no snapshot/checkpoint artifact
+> under the repository's real `sessions/` tree. Awaiting GPT 5.6 Sol review before Phase 4.**
+
+Per item (final behavior):
+
+- **3.3 `find_counters` (flagship, offline).** `tools/c64_disasm.find_counters(insns)` scans a disassembled
+  stream for the regular 6502 game-state idioms: `DEC/INC abs` into RAM (< $D000) → lives/timer/counter (DEC
+  weighted higher for lives); stores inside a `SED…CLD` window → BCD score bytes; `ORA/ADC #$30` then STA into
+  screen RAM → HUD digit; `INC abs` then `CMP #$0A` → multibyte-counter rollover. Exposed as capstone
+  `mode='find_counters'` (recursive-disasms from the detected entry first) with an optional `kind` filter.
+  The synthesizer extracts the top candidates **mechanically** into `ram_var` labels (`candidate_<kind>_<addr>`)
+  — turning "where is the lives counter?" into a first-iteration KB lookup, no LLM.
+- **3.4 data-reference index.** New `ANN_DATAREF` annotation + `code_data_refs(src,dst,access,index_reg,
+  indirect,source_file,annotation_id)` table (per-source, NULL-safe dedup mirroring `code_xrefs`). Emitted by
+  **both** Layer-0 paths (asm parse + on-demand disasm window) for every load/store/cmp/RMW memory operand.
+  New code_kb modes `writes_to` / `refs_to` / `hardware_refs` (+ `SELECT DISTINCT` for cross-source dedup)
+  answer "who writes $D012 / all SID writes?" as one query instead of fresh disasm + LLM eyeballing. Rows carry
+  provenance, so a changed source invalidates its data-refs and they re-materialize with the survivors
+  (verified live + full replay). `stats()` reports `data_refs`. (Zero-page use-def *grouping* into
+  `data_structures` is the one sub-item I left for a follow-up — the index it needs now exists.)
+- **3.5 idiom pre-tagging.** `find_idioms(insns)` table-matches raster wait, delay loop, memcpy, jump-table
+  dispatch, KERNAL trampoline, and SID tick; capstone `mode='idioms'`; the synthesizer records each as a
+  deterministic-id hypothesis (`h_idiom_<addr>_<idiom>`) so Layer-1 confirms rather than rediscovers.
+- **3.6 bank-awareness.** New `banking_state(mem)` reads the dumped `$0001` (LORAM/HIRAM/CHAREN). `find_loops`
+  now only penalises the `$E000+` range as ROM when the KERNAL is actually banked in, and extends its scan to
+  `$FFF0` under RAM-under-ROM (the old flat −30 systematically hid RAM-under-KERNAL game loops).
+  `recursive_disasm` skips seeding HW-vector targets in `$E000+` when the KERNAL ROM is banked in (stops
+  burning the insn budget on KERNAL). Capstone `mode='bank'` reports the interpreted port; `vectors` now
+  includes the banking block. The illegal-opcode decoder remains the deliberate optional-stretch deferral.
+- **3.7 PETSCII/screen decode.** `decode_screen_ram(mem, screen_base, color_base)` maps screen codes → ASCII
+  (screen code $00 treated as padding, not `@`, to avoid all-zero-screen noise) and returns printable runs;
+  capstone `mode='screen_text'`. Answers "what does the HUD/score display say?" offline.
+- **3.1 memory diffing (flagship dynamic).** Pure engine `tools/mem_diff.py` (`classify_region`,
+  `diff_snapshots`, `monotonic_scan`, `summarize_diff`) — fully offline/unit-tested. Agent-side VICE
+  composites `vice.memory.snapshot` (saves the live 64 KB image to `sessions/<slug>/snapshots/<name>.bin`),
+  `vice.memory.diff` (two named snapshots; reserved name `dump` = the ingested dump; omit `b` to diff against a
+  fresh live read — I/O regions excluded by default so raster/timer noise doesn't drown the signal), and
+  `vice.memory.monotonic_scan` (addresses that changed by a fixed delta across ≥2 snapshots — the lives-counter
+  finder, restricted to plausible state regions).
+- **3.2 watchpoint trace + registers policy.** `vice.trace {address, frames}` composite: arm a write
+  watchpoint → run → read registers (via the internal call path) → parse PC → disasm ±16 bytes around the
+  writer — one call answers "how is $XXXX updated?", each sub-call degrading gracefully.
+  **Note (superseded by the Hardening pass below):** the first cut un-banned standalone `vice.registers.get`
+  on a planner `armed:` flag; that honor-system bypass was removed — see Hardening item 5 (option c):
+  `vice.registers.get` is now **always** rejected standalone and registers-at-hit come only through
+  `vice.trace`. Prompt cheat-sheet reflects the final policy.
+
+**Wiring:** all new capstone modes (`find_counters`/`idioms`/`screen_text`/`bank`) and code_kb modes
+(`writes_to`/`refs_to`/`hardware_refs`) are registered, documented in the planner cheat-sheet, validated by
+`step_is_concrete` (so complete steps skip the executor LLM, per 1.1), and — for the structured ones — routed
+through the synthesizer's deterministic/mechanical extraction (per 1.2). Snapshots/trace never touch the real
+`sessions/` tree in tests (all use `tmp_path`).
+
+**Tests:** 247 passing (33 new): `test_analyzers.py` (find_counters lives/score/HUD/rollover + IO/immediate
+exclusion; idioms raster/delay/trampoline/memcpy/SID; extract_data_refs access+index; screen decode +
+zero-padding-is-not-noise; banking_state; bank-aware find_loops penalty; ROM-vector seed skip),
+`test_data_refs.py` (projection + writes_to/refs_to/hardware_refs + stats + per-source invalidation survives
+replay), `test_mem_diff.py` (region classify, IO exclusion, region filter, monotonic scan incl. ≥2-snapshot
+guard and IO exclusion, summary), `test_vice_composites.py` (snapshot→diff against dump, diff-against-live,
+monotonic over saved snapshots, missing-snapshot error, trace resolves writer / requires address / degrades —
+`_vice_call` mocked, snapshots under tmp_path). _(The registers-when-armed test was replaced in the Hardening
+pass: `armed:` no longer bypasses the ban — see below.)_
+
+**Known limitations / deliberate choices for review:**
+1. Zero-page use-def *grouping* into `data_structures` (part of 3.4) is deferred; the `code_data_refs` index it
+   builds on is done and queryable.
+2. Illegal/undocumented-opcode decoding (optional stretch of 3.6) is deferred — Capstone MOS65XX still decodes
+   the documented set only; banked-region confidence is signalled via `bank`/`vectors`, not a second decoder.
+3. 3.1/3.2 composites need a live vice-mcp server to capture snapshots/traces; the offline value is
+   dump-vs-live diffing and the pure engine. Multi-frozen-dump cataloguing is the deferred 6.5 path.
+4. `find_counters`/`idioms` operate on a recursive-disasm stream from the detected entry, but that stream
+   **already seeds the RAM IRQ/BRK/NMI vectors ($0314/$0316/$0318) and the HW vectors** (bank-aware: KERNAL-ROM
+   targets are skipped when the ROM is banked in), so IRQ-driven game logic is reached. Code reachable only via
+   computed/indexed jumps is still missed — the standard static-analysis reachability limit, unchanged.
+
+### Hardening pass (2026-07-18 — GPT 5.6 Sol review follow-up)
+
+Six concrete review gaps fixed; full suite **284 passing** (was 247), `git diff --check` clean, `compileall`
+clean, `graph.build`/`main`/`tools.agent_runner` import, no snapshot/checkpoint artifact under the real
+`sessions/` tree.
+
+1. **Broken test assertion (H1).** `test_snapshot_then_diff_against_dump` asserted a truthy `Path`; it now
+   asserts the `.bin` exists at `_snapshot_dir(state)/…` with the right size, plus a new
+   `test_snapshot_writes_bin_to_derived_path` regression that fails if the file is missing.
+2. **Mechanical extraction for the remaining Phase 3 structured outputs (H2).** `_mechanical_extract` now also
+   handles: capstone `screen_text` → `text` labels (`screen_text_<addr>`); `vice.memory.monotonic_scan`
+   candidates → `ram_var` labels with kind from delta (Δ−1 → lives), confidence capped at 0.7;
+   `vice.memory.diff` → the **top ≤12 state-region** changed bytes as short-list `ram_var` labels (I/O
+   excluded, region-prioritised — never dumps thousands of bytes). These vice methods (+ snapshot as
+   no-fact) are excluded from `_llm_worthy_result`; `vice.trace` stays LLM-worthy. All names are
+   address-deterministic so re-runs are idempotent (label PK `(addr,name)`).
+3. **find_counters KB noise (H3).** `find_counters` now returns **one candidate per address** — highest-scoring
+   kind as primary, the rest folded into `alias_kinds` (merged into evidence). A single `DEC` no longer emits
+   both a lives and a timer first-class label; the capstone `kind=` filter matches primary *or* alias.
+   (Rollover `multibyte_counter` weighted above a bare `counter` so it wins primary.) Regression:
+   `test_find_counters_one_label_per_site`.
+4. **vice.trace correctness + hygiene (H4).** Success is now claimed only on a **confirmed hit** — either the
+   checkpoint's hit count (`vice.checkpoint.list`) or the resolved PC's instruction demonstrably writing the
+   watched address (`_disasm_writes_addr`); a bare PC read is no longer "success". The armed watchpoint is
+   **always deleted in a `try/finally`**, including on run failure. Tests: hit resolves writer + cleanup;
+   hit-via-checkpoint-list (indexed write); no-hit → `ok=False` + cleanup; run-raises → cleanup still runs.
+5. **registers.get un-ban tightened (H5) — chose option (c).** A planner-supplied `armed: true` no longer
+   bypasses the ban (it isn't trustworthy proof of a hit). `vice.registers.get` is **always** rejected as a
+   standalone step; registers at a hit are available only through `vice.trace`, which arms the checkpoint
+   in-process, verifies the hit, and reads registers via the internal `_vice_call` path. Prompt updated;
+   `test_registers_get_armed_flag_does_not_bypass_ban` locks it in.
+6. **Wiring/coverage holes (H6).** `step_is_concrete` parametrization extended to all Phase 3 modes
+   (capstone find_counters/idioms/screen_text/bank; code_kb writes_to/refs_to/hardware_refs; vice
+   snapshot/diff/monotonic_scan/trace) including the failure cases (snapshot without name, trace without
+   address, writes_to without addr). Added **code_kb_node integration tests** (dispatched through the node,
+   not raw SQL) for `writes_to`/`refs_to`/`hardware_refs chip=sid` incl. multi-source DISTINCT dedup, and a
+   `find_idioms` **jump_table** test.
+
+**Residual-nit cleanup (post-acceptance, non-blocking).** Two of the reviewer's three residual nits fixed
+(the third — no standalone "break then read regs" outside `vice.trace` — is intentional, option c):
+- Stale Phase 3 prose that still said registers are allowed with `armed:` now points to the option-(c)
+  final policy (this section), removing the contradiction with the prompt.
+- `_checkpoint_hit` hardened: it now returns False without a concrete `checkpoint_id`, and `vice.trace` only
+  consults the checkpoint list when it captured our id — so a hit on an unrelated breakpoint can't be
+  misattributed to our watchpoint when `checkpoint.add` returns no id (falls back to PC/disasm proof).
+  Regression: `test_trace_no_checkpoint_id_ignores_unrelated_hit`.
+
+**Still deferred (unchanged, out of scope):** 3.8; zero-page use-def → `data_structures` grouping;
+illegal-opcode decoder; multi-dump catalog (6.5); live-VICE CI. The computed/indexed-jump reachability limit
+also remains (RAM/HW vectors are seeded, so IRQ logic is covered — see limitation 4 above).
+
 ---
 
 ## Phase 4 — Correctness/robustness papercuts (cheap, bundle together)
 
-- [ ] **4.1 `detect_basic_sys` misses `SYS 2064` (space after SYS)** ✅
+> **STATUS: Phase 4 implemented (2026-07-18); 4.1–4.7 complete, 4.8 remains deliberately deferred.**
+> Full suite **308 passing**; Phase 4 has 17 focused cases plus 6 VICE-alias hardening regressions;
+> `compileall` and `git diff --check` clean;
+> configured planner/analyst/vision clients instantiate with the expected output budgets; graph and CLI entry-point
+> imports are clean. Awaiting independent model review.
+
+- [x] **4.1 `detect_basic_sys` misses `SYS 2064` (space after SYS)** ✅
   - `tools/c64_disasm.py:551-568`: digit loop breaks on the first non-digit, so a space/`(`/shifted-space after `$9E`
     yields `None`. Skip `$20`/`$28`/`$3A` (tolerate leading `+`) before collecting digits; consider scanning the BASIC
     line link-chain instead of a fixed `$0801-$0830` window. **Source:** F §1.8.
 
-- [ ] **4.2 `_capstone_linear` silently defaults `start` to `$0801`** ✅
+- [x] **4.2 `_capstone_linear` silently defaults `start` to `$0801`** ✅
   - `graph/nodes.py:1926` — same silent-default class deliberately fixed for VICE args. Make a missing `start` an error
     for consistency. **Source:** F §3.9.
 
-- [ ] **4.3 `kb mode='labels'` / digest matches names only, ignores addresses in the question**
+- [x] **4.3 `kb mode='labels'` / digest matches names only, ignores addresses in the question**
   - `relevant_labels` matches question terms against label *names*; a question naming `$C145` never matches by address.
     Extract `$XXXX` tokens from the question and add an `addr IN (...)` clause. **Source:** F §3.9.
 
-- [ ] **4.4 Vision call reuses the analyst JSON-only system prompt**
+- [x] **4.4 Vision call reuses the analyst JSON-only system prompt**
   - `_describe_screenshot` (`graph/nodes.py:2270-2278`) tells the model to emit analyst JSON while asking for prose. Use
     a minimal neutral system prompt for vision calls; store description + thumbnail path; stop burning three roles on
     silent vision failures (dedicated vision-capable role/flag). **Source:** F §3.8, Gr §3.4.
 
-- [ ] **4.5 `vice.memory.read` truncated to 4,000 chars loses data**
+- [x] **4.5 `vice.memory.read` truncated to 4,000 chars loses data**
   - `graph/nodes.py:2459` — for JSON byte arrays that's ~250 bytes of RAM. Format as compact hex-dump lines
     (16 bytes/line) *before* truncation, as `write_report` already does. **Source:** F §2.9.
 
-- [ ] **4.6 Expand Tavily `include_domains` + advanced depth for researcher**
+- [x] **4.6 Expand Tavily `include_domains` + advanced depth for researcher**
   - `graph/nodes.py:2196-2197` locked to 4 sites; add archive.org, forum64.de, C64 wiki (or make it a config knob);
     pass `search_depth="advanced"`. **Source:** F §3.9.
 
-- [ ] **4.7 Per-role `max_tokens` (planner/analyst) to avoid mid-JSON truncation**
+- [x] **4.7 Per-role `max_tokens` (planner/analyst) to avoid mid-JSON truncation**
   - `defaults.max_tokens: 4096` can truncate an 8–10 step plan mid-JSON, burning the backup chain. Wire the per-agent
     `max_tokens` (config already supports per-agent keys) through `get_llm`. **Source:** F §2.9.
 
@@ -772,6 +907,50 @@ exists anywhere under the repository's real `sessions/` tree.
   - Reducer is `add`; curator can't trim it. Replace with a drop-sentinel reducer or keep only
     `(step_id, ok, event_id)` tuples once persisted. **Source:** F §2.9. **My call:** Defer to Phase 1.7 (batching)
     where the state shape is already being reworked.
+
+### Phase 4 implementation notes (2026-07-18)
+
+1. **BASIC SYS parsing (4.1).** `detect_basic_sys` now follows the tokenized BASIC line-link chain (bounded to
+   256 lines) and accepts space, `(`, `:`, `+`, and shifted-space before decimal digits. A bounded legacy-window
+   fallback remains for corrupt/live-changing line links. Tests cover every separator and a `SYS` on a linked line
+   beyond the old `$0801-$0830` scan window.
+2. **Explicit Capstone origin (4.2).** Both dump-backed linear disassembly and no-dump/VICE fallback reject a missing
+   or blank `start` with `rejection=missing_arg`; invalid addresses receive `invalid_arg`. Neither path can silently
+   reach `$0801`. Tests exercise both dump-present and dump-absent cases and fail if VICE fallback is attempted.
+3. **Address-aware label retrieval (4.3).** A shared `$XXXX`/`0xXXXX` extractor feeds `KnowledgeStore.relevant_labels`,
+   question digests, and `kb mode=labels`; exact address matches are ORed with name terms. Regression coverage proves
+   that an opaque label at `$C145` is returned even when a higher-confidence unrelated label exists.
+4. **Dedicated screenshot vision path (4.4).** Screenshot calls now make exactly one `vision`-role request under a
+   neutral, prose-oriented system prompt. The returned image is persisted under the session's `screenshots/`
+   directory, and the tool result keeps its description, model/role/status, byte/hash metadata, and any save or
+   vision error. `screenshot_path` and `thumbnail_path` deliberately point to the same browser-usable source image;
+   this avoids adding a raster dependency solely to create a duplicate thumbnail. Even if vision fails, the image
+   path and explicit failure metadata survive. Tests lock in one-call behavior, prompt/message shape, persistence,
+   successful description metadata, and failure metadata.
+5. **Compact memory reads (4.5).** Structured VICE byte arrays are rendered as 16-byte `$ADDR: XX …` hex lines before
+   the result limit is applied. Oversized reads retain both head and tail plus an explicit middle-byte omission marker;
+   metadata records returned/omitted byte counts, base address, and format. A 4 KiB node-level regression verifies
+   that the result contains both `$2000` and `$2FF0`, not a truncated pretty-printed JSON array.
+6. **Configurable Tavily research (4.6).** Tavily settings live under `tools.tavily` in `config/llm.json`, with the
+   original sources plus `archive.org`, `forum64.de`, and `c64-wiki.com`, `search_depth=advanced`, and a configurable
+   result limit. Per-step arguments can override all three settings; limits remain bounded to 1–20. The planner
+   cheat-sheet documents the options, and a fake-client test verifies the values passed to Tavily.
+7. **Per-role output budgets (4.7).** `get_llm` now validates and honors `agents.<role>.max_tokens` before falling back
+   to the global default; the existing GPT-5 minimum-budget guard still applies afterward. Planner and analyst are
+   configured for 8192 tokens; the dedicated vision role uses 2048. Factory regression coverage and a real local
+   configuration-instantiation check confirm the effective values.
+
+### Hardening pass (2026-07-18)
+
+VICE methods are now canonicalized before policy checks and composite dispatch, closing the `ping`/register-alias
+bypass while preserving option (c): standalone register reads remain banned and `_vice_call` is never reached.
+Composite shorthands normalize explicitly. Added dump-present/absent `invalid_arg` coverage for Capstone linear mode,
+tightened hex extraction to 2–4 digits, and added a real-config/mocked-client budget smoke test. Item 4.8 remains deferred.
+
+**Verification:** `tests/test_phase4.py` contains 17 Phase 4 cases and `tests/test_vice_composites.py` adds 6 alias-ban
+regressions. The complete suite is **308 passing**; `compileall -q`
+passes for `graph`, `memory`, `tools`, `code_kb`, and `tests`; `graph.build`, `main`, and `tools.agent_runner` import;
+`git diff --check` reports no whitespace errors. No live Tavily, VICE, or paid vision endpoint is needed by the tests.
 
 ---
 

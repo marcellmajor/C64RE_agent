@@ -50,6 +50,7 @@ ANN_DISASM       = "disasm_window"     # one disassembly window's listing
 ANN_HYPOTHESIS   = "hypothesis"        # L1/L2 freeform hypothesis (idiom/purpose/motivation)
 ANN_GROUP        = "group"             # L2 cross-routine grouping
 ANN_CRITIQUE     = "critique"          # L3 flag on a prior annotation
+ANN_DATAREF      = "data_ref"          # LDA/STA/CMP memory-operand reference (tracker 3.4)
 
 
 # ---- DDL ------------------------------------------------------------------ #
@@ -149,6 +150,23 @@ CREATE TABLE IF NOT EXISTS code_class (
     annotation_id TEXT
 );
 
+-- Data-flow references (tracker 3.4): every LDA/STA/CMP/INC… memory
+-- operand — the counterpart to control-flow `code_xrefs`. Per-source so
+-- invalidation stays surgical (mirrors code_xrefs). `access` ∈ {r,w,rmw},
+-- `index_reg` ∈ {x,y,NULL}. `SELECT DISTINCT` for cross-source dedup.
+CREATE TABLE IF NOT EXISTS code_data_refs (
+    src_addr     INTEGER NOT NULL,
+    dst_addr     INTEGER NOT NULL,
+    access       TEXT NOT NULL,
+    index_reg    TEXT,
+    indirect     INTEGER DEFAULT 0,
+    source_file  TEXT,
+    annotation_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_datarefs_dst ON code_data_refs(dst_addr);
+CREATE INDEX IF NOT EXISTS idx_datarefs_src ON code_data_refs(src_addr);
+CREATE INDEX IF NOT EXISTS idx_datarefs_source ON code_data_refs(source_file);
+
 CREATE TABLE IF NOT EXISTS code_labels (
     addr         INTEGER NOT NULL,
     name         TEXT NOT NULL,
@@ -210,6 +228,7 @@ DROP TABLE IF EXISTS meta;
 DROP TABLE IF EXISTS hypotheses;
 DROP TABLE IF EXISTS instructions;
 DROP TABLE IF EXISTS asm_docs;
+DROP TABLE IF EXISTS code_data_refs;
 DROP TABLE IF EXISTS code_labels;
 DROP TABLE IF EXISTS code_class;
 DROP TABLE IF EXISTS code_smc_sites;

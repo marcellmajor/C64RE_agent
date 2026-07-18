@@ -33,9 +33,10 @@ ambiguity — are encoded explicitly:
 
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Any, Iterable
 
 from code_kb.asm_parser import (
     ParsedAsmFile,
@@ -47,6 +48,7 @@ from code_kb.asm_parser import (
 )
 from code_kb.schema import (
     ANN_CLASSIFY,
+    ANN_DATAREF,
     ANN_DISASM,
     ANN_INDIRECT,
     ANN_LABEL,
@@ -65,6 +67,50 @@ RETURN_MNEMONICS = frozenset({"rts", "rti"})
 HALT_MNEMONICS = frozenset({"brk"})
 STORE_MNEMONICS = frozenset({"sta", "stx", "sty", "stz"})
 
+# Data-reference classification (tracker 3.4).
+_LOAD_MNEMONICS = frozenset({
+    "lda", "ldx", "ldy", "cmp", "cpx", "cpy", "bit",
+    "and", "ora", "eor", "adc", "sbc",
+})
+_RMW_MNEMONICS = frozenset({"inc", "dec", "asl", "lsr", "rol", "ror"})
+
+_CANON_OP_RE = re.compile(
+    r"^(?P<indir>\()?\s*\$(?P<addr>[0-9A-Fa-f]{1,4})\s*"
+    r"(?:,\s*(?P<xin>[XYxy]))?\s*\)?"
+    r"(?:\s*,\s*(?P<yout>[XYxy]))?\s*$"
+)
+
+
+def _dataref_access(mnem: str) -> str | None:
+    if mnem in STORE_MNEMONICS:
+        return "w"
+    if mnem in _RMW_MNEMONICS:
+        return "rmw"
+    if mnem in _LOAD_MNEMONICS:
+        return "r"
+    return None
+
+
+def _to_canon_operand(op: str) -> str:
+    """Rewrite Capstone `0xNN` operands to canonical `$NN` (idempotent)."""
+    return re.sub(r"0x([0-9a-fA-F]+)", lambda m: "$" + m.group(1), op or "")
+
+
+def _classify_canon_operand(op: str) -> dict[str, Any] | None:
+    """Parse a canonical `$XXXX`-form asm operand into a memory ref.
+
+    Returns ``{addr, index, indirect}`` or None (immediate/accumulator).
+    """
+    s = (op or "").strip()
+    if not s or s.startswith("#") or s.lower() == "a":
+        return None
+    m = _CANON_OP_RE.match(s)
+    if not m:
+        return None
+    addr = int(m.group("addr"), 16)
+    index = (m.group("xin") or m.group("yout") or "").lower() or None
+    return {"addr": addr, "index": index, "indirect": bool(m.group("indir"))}
+
 
 # --------------------------------------------------------------------------- #
 # Helper structures
@@ -78,6 +124,7 @@ class Layer0Stats:
     xrefs: int = 0
     indirect_sites: int = 0
     smc_sites: int = 0
+    data_refs: int = 0
     labels: int = 0
     classified_bytes: int = 0
     sources: list[str] = None
@@ -92,6 +139,7 @@ class Layer0Stats:
         self.xrefs += other.xrefs
         self.indirect_sites += other.indirect_sites
         self.smc_sites += other.smc_sites
+        self.data_refs += other.data_refs
         self.labels += other.labels
         self.classified_bytes += other.classified_bytes
         self.sources.extend(other.sources or [])
@@ -393,6 +441,31 @@ def _build_from_parsed_asm_inner(
                 )
                 stats.smc_sites += 1
 
+        # Data references (tracker 3.4): every memory operand of a
+        # load/store/compare/RMW instruction — the data-flow index that
+        # answers "what writes $D012 / reads the lives byte?".
+        access = _dataref_access(ins.mnemonic)
+        if access is not None:
+            ref = _classify_canon_operand(ins.operand)
+            if ref is not None:
+                store.append_annotation(
+                    Annotation(
+                        layer=0, kind=ANN_DATAREF,
+                        start_addr=ins.addr, end_addr=ins.addr,
+                        producer="deterministic", confidence=1.0,
+                        payload={
+                            "src_addr": ins.addr,
+                            "dst_addr": ref["addr"],
+                            "access": access,
+                            "index": ref["index"],
+                            "indirect": ref["indirect"],
+                            "source_file": parsed.path,
+                        },
+                    ),
+                    source="layer0.asm",
+                )
+                stats.data_refs += 1
+
     # ---- 6. Per-byte classification — sparse, only for addrs we touched.
     # Run-length encode to keep the event log compact.
     sorted_code = sorted(code_addrs)
@@ -588,4 +661,26 @@ def build_from_disasm_window(
                     source="layer0.disasm",
                 )
                 stats.smc_sites += 1
+
+        # Data references (tracker 3.4). Operands here may be capstone
+        # `0x` form or canonical `$`; normalise then classify.
+        access = _dataref_access(mnem)
+        if access is not None:
+            ref = _classify_canon_operand(_to_canon_operand(op))
+            if ref is not None:
+                store.append_annotation(
+                    Annotation(
+                        layer=0, kind=ANN_DATAREF,
+                        start_addr=r["addr"], end_addr=r["addr"],
+                        producer="deterministic", confidence=1.0,
+                        payload={
+                            "src_addr": r["addr"], "dst_addr": ref["addr"],
+                            "access": access, "index": ref["index"],
+                            "indirect": ref["indirect"],
+                            "source_file": source_file,
+                        },
+                    ),
+                    source="layer0.disasm",
+                )
+                stats.data_refs += 1
     return stats

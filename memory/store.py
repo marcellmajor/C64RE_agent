@@ -55,6 +55,22 @@ TEXT_FILE_SUFFIXES = {".txt", ".md", ".markdown", ".text", ".rst", ".asc"}
 # get ingested but get truncated with a marker, keeping kb.json sane.
 TEXT_FILE_MAX_BYTES = 1 * 1024 * 1024
 
+_HEX_ADDRESS_RE = re.compile(
+    r"(?<![0-9A-Fa-f])(?:\$|0[xX])([0-9A-Fa-f]{2,4})(?![0-9A-Fa-f])",
+)
+
+
+def extract_hex_addresses(text: str, *, limit: int = 16) -> list[int]:
+    """Extract unique ``$XXXX``/``0xXXXX`` addresses in encounter order."""
+    out: list[int] = []
+    for match in _HEX_ADDRESS_RE.finditer(str(text or "")):
+        addr = int(match.group(1), 16)
+        if addr not in out:
+            out.append(addr)
+        if len(out) >= limit:
+            break
+    return out
+
 # Module-level cache so multiple nodes in the same process share a handle.
 _STORE_CACHE: dict[str, "KnowledgeStore"] = {}
 _CACHE_LOCK = threading.Lock()
@@ -1013,21 +1029,44 @@ class KnowledgeStore:
     def relevant_labels(
         self, question: str, limit: int = 40,
     ) -> list[dict[str, Any]]:
-        """Labels whose name or partial-asm context relates to the question."""
+        """Labels whose name or address relates to the question.
+
+        Address literals are first-class retrieval keys: a question such
+        as ``"what writes $C145?"`` must surface a label at $C145 even when
+        its name shares no words with the question (tracker 4.3).
+        """
         terms = self._question_terms(question)
-        if not terms:
+        addresses = extract_hex_addresses(question)
+        if not terms and not addresses:
             return self.query(
                 "SELECT addr, name, kind, confidence FROM labels"
                 " ORDER BY confidence DESC, addr LIMIT ?",
                 (limit,),
             )
 
-        clauses = " OR ".join(["lower(name) LIKE ?"] * len(terms))
-        params = [f"%{t}%" for t in terms] + [limit]
+        where: list[str] = []
+        params: list[Any] = []
+        if addresses:
+            where.append("addr IN (" + ",".join("?" for _ in addresses) + ")")
+            params.extend(addresses)
+        if terms:
+            where.extend(["lower(name) LIKE ?"] * len(terms))
+            params.extend(f"%{t}%" for t in terms)
+        order_sql = "confidence DESC, addr"
+        if addresses:
+            # Exact address evidence must not be pushed past `limit` by a
+            # large number of higher-confidence name matches.
+            order_sql = (
+                "CASE WHEN addr IN ("
+                + ",".join("?" for _ in addresses)
+                + ") THEN 0 ELSE 1 END, confidence DESC, addr"
+            )
+            params.extend(addresses)
+        params.append(limit)
         rows = self.query(
             f"SELECT addr, name, kind, confidence FROM labels"
-            f" WHERE {clauses}"
-            f" ORDER BY confidence DESC, addr LIMIT ?",
+            f" WHERE {' OR '.join(where)}"
+            f" ORDER BY {order_sql} LIMIT ?",
             tuple(params),
         )
         if rows:

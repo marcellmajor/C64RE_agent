@@ -143,7 +143,7 @@ def get_llm(role: str) -> ChatOpenAI:
 
     Roles are the keys under `agents:` in `config/llm.json` —
     e.g. `planner`, `executor`, `synthesizer`, `analyst`, `critic`,
-    `curator`, `researcher`, `coordinator`.
+    `curator`, `researcher`, `coordinator`, `vision`.
     """
     cfg = load_config()
     try:
@@ -157,13 +157,26 @@ def get_llm(role: str) -> ChatOpenAI:
     defaults = cfg.get("defaults", {})
 
     model_name = str(agent_cfg["model"])
-    max_tok = defaults.get("max_tokens", 4096)
+    # Output budgets are role-specific: the planner and analyst routinely
+    # produce substantially larger structured payloads than the other roles.
+    # Keep the global value as a fallback for old/custom configurations.
+    max_tok = agent_cfg.get("max_tokens", defaults.get("max_tokens", 4096))
+    try:
+        max_tok = int(max_tok)
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            f"agents.{role}.max_tokens must be an integer, got {max_tok!r}"
+        ) from e
+    if max_tok <= 0:
+        raise ValueError(
+            f"agents.{role}.max_tokens must be positive, got {max_tok!r}"
+        )
     # Reasoning-heavy OpenAI models can spend the whole completion budget on
     # internal reasoning if effort is unchecked, yielding empty visible `content`.
     # Extra headroom plus low reasoning effort avoids planner/analyst silent failure.
     if provider_name == "openai" and _is_openai_gpt5_reasoning_model(model_name):
         floor = int(os.environ.get("C64RE_GPT5_MIN_MAX_TOKENS", "8192"))
-        max_tok = max(int(max_tok or 0), floor)
+        max_tok = max(max_tok, floor)
 
     kwargs: dict[str, Any] = {
         "model": model_name,

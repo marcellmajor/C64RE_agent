@@ -94,13 +94,25 @@ Every step:
 Tool argument cheat-sheet:
   capstone:
     mode: linear | recursive | find_loops | find_entry | vectors | polymorphic
+          | find_counters | idioms | screen_text | bank
       linear     -> {start: "$XXXX", length: bytes, max_lines?}
       recursive  -> {entry:  "$XXXX", max_insns?, seed_vectors?,
                      seeds?: [{address,label}]}
       find_loops -> {top_n?}
       find_entry -> {hint?:  "$XXXX"}
-      vectors    -> {}
+      vectors    -> {}   (also reports the $0001 banking state)
       polymorphic-> {entry:  "$XXXX", max_insns?}   (self-mod / decryption)
+      find_counters -> {kind?: "lives|score|timer|counter|hud_digit|
+                        multibyte_counter", top_n?} : PREFER THIS when the
+                        question names an in-game quantity (lives, score,
+                        timer, level). Deterministic game-state variable
+                        heuristics — first-iteration answers.
+      idioms     -> {} : pre-tag rigid 6502 idioms (raster wait, delay,
+                        memcpy, jump table, KERNAL trampoline, SID tick).
+      screen_text-> {screen_base?: "$0400", color_base?: "$D800", min_run?}
+                        : decode screen RAM to strings — answers "what does
+                        the HUD/score display say?" without vision.
+      bank       -> {} : interpret $0001 (which ROMs/RAM/IO were mapped).
   vice: {method: "vice.disassemble" | "vice.memory.read"
                  | "vice.registers.get" | "vice.ping" | ...,
          address: "$XXXX", count: 1..100, size?: bytes, ...}
@@ -108,15 +120,36 @@ Tool argument cheat-sheet:
       vice.disassemble  -> address ($XXXX), count (1..100)
       vice.memory.read  -> address ($XXXX), size (bytes, 1..65535)
       vice.registers.get / vice.ping  -> (no required args)
+    COMPOSITE verbs (agent-side; prefer these for in-game quantities):
+      vice.memory.snapshot -> {name} : save the live 64 KB RAM image.
+      vice.memory.diff     -> {a, b?} : changed bytes classified by region,
+                        old→new. `a`/`b` are snapshot names; the reserved
+                        name "dump" = the ingested dump; omit `b` to diff
+                        against a fresh live read. PREFER snapshot+diff
+                        over static search when the question names an
+                        in-game quantity (lives/score/level).
+      vice.memory.monotonic_scan -> {snapshots: [names], delta?: -1} :
+                        addresses that changed by `delta` across EVERY
+                        snapshot — the lives-counter finder.
+      vice.trace -> {address: "$XXXX", frames?} : watchpoint on address →
+                        run → resolve the writing instruction + disasm it.
+                        One call answers "how is $XXXX updated?".
     BANNED steps (waste budget, produce no code facts — never emit these):
       vice.ping, vice.registers.get
+      registers.get is ALWAYS banned as a standalone step (an `armed`
+      flag will NOT bypass it). To read registers at a watchpoint hit,
+      emit `vice.trace {address}` — it arms the watchpoint, verifies the
+      hit, reads registers, and resolves the writing instruction.
     vice.display.screenshot is allowed when visual/spatial context aids the question.
     The framework no longer auto-defaults the address — calls without
     one are REJECTED with a clear error. The first hex token in any
     response is parity-checked against the requested address; if the
     server returned disassembly from somewhere else, the tool result is
     annotated with `WARNING: requested ... but response begins at ...`.
-  tavily: {q: "<query>"}     (only for context, not authoritative)
+  tavily: {q: "<query>", include_domains?: ["domain"],
+            search_depth?: "basic"|"advanced", max_results?: 1..20}
+           (only for context, not authoritative; configured defaults use
+            C64-specific archives/forums and advanced search depth)
   code_kb:
     A SECOND, layered knowledge store dedicated to code comprehension.
     Built at startup from `--asm-dir` and/or `--partial-asm`. Layer-0
@@ -132,6 +165,12 @@ Tool argument cheat-sheet:
       xrefs_to   -> {addr: "$XXXX", limit?} : who calls/jumps to addr
       xrefs_from -> {addr: "$XXXX", end?: "$YYYY", limit?} : where
                     addr (or routine range) jumps/calls/branches
+      writes_to  -> {addr: "$XXXX", limit?} : instructions that WRITE/RMW
+                    a memory location (data-flow — "who writes $D012?").
+      refs_to    -> {addr: "$XXXX", limit?} : all reads+writes of an addr.
+      hardware_refs -> {chip?: "vic|sid|cia|cia2", lo?, hi?} : every
+                    reference into a chip's register range (e.g. all SID
+                    writes) as one query instead of a Tavily-and-guess.
       smc      -> {limit?} : self-modifying-code suspects
       search   -> {q: "<keyword>"} : substring search the partial-asm
                   document text (find a label, a comment, a $XXXX hex)

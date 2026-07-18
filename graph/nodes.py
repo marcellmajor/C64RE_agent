@@ -11,6 +11,8 @@ touch sqlite/JSON directly.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import os
@@ -22,7 +24,7 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-from graph.llm import get_llm
+from graph.llm import get_llm, load_config
 from graph import usage as llm_usage
 from graph.plan_utils import (
     MAX_CONSECUTIVE_REVISES,
@@ -38,7 +40,7 @@ from graph.plan_utils import (
 )
 from graph.prompts import MASTER_PREAMBLE, system_message
 from graph.state import C64State
-from memory import KnowledgeStore, get_store
+from memory import KnowledgeStore, extract_hex_addresses, get_store
 from memory.schema import (
     EVT_ANALYSIS,
     EVT_CONSOLIDATED,
@@ -1625,16 +1627,30 @@ MAX_AUTO_ANNOTATE_PER_SYNTH = 2
 
 # Capstone modes whose structured `extra` payloads are extracted
 # mechanically — the LLM adds nothing to them.
-_MECHANICAL_CAPSTONE_MODES = {"find_entry", "entry", "vectors"}
+_MECHANICAL_CAPSTONE_MODES = {
+    "find_entry", "entry", "vectors",
+    "find_counters", "counters", "idioms",  # tracker 3.3 / 3.5
+    "screen_text", "screen", "bank", "banking",  # tracker 3.6 / 3.7
+}
+
+# VICE composite methods whose structured `extra` payloads are extracted
+# mechanically (tracker 3.1). `vice.trace` stays LLM-worthy — its body is
+# prose disassembly the analyst reasons over.
+_MECHANICAL_VICE_METHODS = {
+    "vice.memory.diff", "vice.memory.monotonic_scan",
+}
+# VICE results that carry no extractable facts at all (status only).
+_NOFACT_VICE_METHODS = {"vice.memory.snapshot"}
 
 
 def _llm_worthy_result(r: dict[str, Any]) -> bool:
     """Only free-text evidence needs the extraction LLM (tracker 1.2).
 
     Failed results carry no facts; `kb`/`code_kb` results are reads of
-    stores whose facts are already persisted; mechanical capstone modes
-    are handled deterministically. What remains — disassembly listings,
-    vice output, tavily snippets, screenshot descriptions — is prose.
+    stores whose facts are already persisted; mechanical capstone/vice
+    modes are handled deterministically. What remains — disassembly
+    listings, vice.trace output, tavily snippets, screenshot
+    descriptions — is prose.
     """
     if not r.get("ok"):
         return False
@@ -1646,6 +1662,10 @@ def _llm_worthy_result(r: dict[str, Any]) -> bool:
         and str(r.get("mode") or "").lower() in _MECHANICAL_CAPSTONE_MODES
     ):
         return False
+    if tool == "vice":
+        method = str(r.get("method") or "").lower()
+        if method in _MECHANICAL_VICE_METHODS or method in _NOFACT_VICE_METHODS:
+            return False
     return True
 
 
@@ -1659,7 +1679,12 @@ def _mechanical_extract(
     payloads carry ``provenance: "mechanical"``.
     """
     counts = {"labels": 0, "hypotheses": 0}
-    if not result.get("ok") or str(result.get("tool") or "").lower() != "capstone":
+    if not result.get("ok"):
+        return counts
+    tool = str(result.get("tool") or "").lower()
+    if tool == "vice":
+        return _mechanical_extract_vice(store, result, ev_id)
+    if tool != "capstone":
         return counts
     mode = str(result.get("mode") or "").lower()
 
@@ -1702,6 +1727,135 @@ def _mechanical_extract(
                 "provenance": "mechanical",
             })
             counts["hypotheses"] += 1
+
+    elif mode in ("find_counters", "counters"):
+        # Top game-state candidates → ONE ram_var label per address
+        # (tracker 3.3). Deterministic name keyed on (kind, addr) so
+        # re-runs on the same dump are idempotent (label PK (addr,name)).
+        for c in (result.get("candidates") or [])[:8]:
+            addr = _addr_to_int(c.get("address"))
+            if addr is None:
+                continue
+            aliases = c.get("alias_kinds") or []
+            ev = "; ".join(str(x) for x in (c.get("evidence") or [])[:3])
+            if aliases:
+                ev += f"  (also matched: {', '.join(aliases)})"
+            store.append_event(EVT_LABEL, "synthesizer_mechanical", {
+                "addr": addr,
+                "name": f"candidate_{c.get('kind', 'var')}_{addr:04x}",
+                "kind": "ram_var",
+                "confidence": min(0.75, 0.4 + float(c.get("score", 0)) / 60.0),
+                "evidence": ev,
+                "provenance": "mechanical",
+            })
+            counts["labels"] += 1
+
+    elif mode == "idioms":
+        for f in (result.get("idioms") or [])[:32]:
+            addr = _addr_to_int(f.get("address"))
+            if addr is None:
+                continue
+            store.append_event(EVT_HYPOTHESIS, "synthesizer_mechanical", {
+                "id": f"h_idiom_{addr:04x}_{f.get('idiom', 'x')}",
+                "text": (
+                    f"Idiom `{f.get('idiom')}` at ${addr:04X}: "
+                    f"{f.get('evidence')}"
+                ),
+                "status": "open",
+                "evidence": [ev_id],
+                "provenance": "mechanical",
+            })
+            counts["hypotheses"] += 1
+
+    elif mode in ("screen_text", "screen"):
+        # Printable screen runs → text labels (tracker 3.7). Name keyed
+        # on the address so a re-decode of the same screen is idempotent.
+        for run in (result.get("runs") or [])[:32]:
+            addr = _addr_to_int(run.get("addr") or run.get("addr_hex"))
+            text = str(run.get("text") or "").strip()
+            if addr is None or not text:
+                continue
+            store.append_event(EVT_LABEL, "synthesizer_mechanical", {
+                "addr": addr,
+                "name": f"screen_text_{addr:04x}",
+                "kind": "text",
+                "confidence": 0.7,
+                "evidence": (
+                    f"screen RAM row {run.get('row')} col {run.get('col')}: "
+                    f"{text!r}"
+                ),
+                "provenance": "mechanical",
+            })
+            counts["labels"] += 1
+
+    return counts
+
+
+# Region-priority for diff short-listing: game state lives in these,
+# most-likely first. I/O is already excluded upstream.
+_DIFF_REGION_PRIORITY = {
+    "zero_page": 0, "os_workspace": 1, "low_ram": 2, "upper_ram": 3,
+    "screen_ram": 4, "color_ram": 5,
+}
+
+
+def _mechanical_extract_vice(
+    store: KnowledgeStore, result: dict[str, Any], ev_id: str,
+) -> dict[str, int]:
+    """Deterministic extraction for VICE composite outputs (tracker 3.1)."""
+    counts = {"labels": 0, "hypotheses": 0}
+    method = str(result.get("method") or "").lower()
+
+    if method == "vice.memory.monotonic_scan":
+        delta = int(result.get("delta", -1))
+        kind = {-1: "lives", 1: "counter"}.get(delta, "delta_var")
+        for c in (result.get("candidates") or [])[:16]:
+            addr = _addr_to_int(c.get("addr") if "addr" in c else c.get("addr_hex"))
+            if addr is None:
+                continue
+            values = c.get("values") or []
+            store.append_event(EVT_LABEL, "synthesizer_mechanical", {
+                "addr": addr,
+                "name": f"candidate_{kind}_{addr:04x}",
+                "kind": "ram_var",
+                # Strong dynamic signal, but capped — it's still a
+                # candidate until confirmed against static evidence.
+                "confidence": 0.7,
+                "evidence": (
+                    f"monotonic Δ{delta:+d} across snapshots "
+                    f"[{', '.join(str(v) for v in values)}] "
+                    f"in {c.get('region')} (event {ev_id})"
+                ),
+                "provenance": "mechanical",
+            })
+            counts["labels"] += 1
+
+    elif method == "vice.memory.diff":
+        # Short-list only the top state-region changed bytes — never dump
+        # thousands of bytes into the KB.
+        changed = list(result.get("changed") or [])
+        changed.sort(key=lambda r: (
+            _DIFF_REGION_PRIORITY.get(r.get("region"), 99),
+            r.get("addr", 0),
+        ))
+        for c in changed[:12]:
+            addr = _addr_to_int(c.get("addr") if "addr" in c else c.get("addr_hex"))
+            region = str(c.get("region") or "")
+            if addr is None or region.startswith("io_"):
+                continue
+            store.append_event(EVT_LABEL, "synthesizer_mechanical", {
+                "addr": addr,
+                "name": f"changed_{addr:04x}",
+                "kind": "ram_var",
+                "confidence": 0.5,
+                "evidence": (
+                    f"changed {c.get('old')}→{c.get('new')} "
+                    f"(Δ{int(c.get('delta', 0)):+d}) in {region} "
+                    f"(diff {result.get('a')}→{result.get('b')})"
+                ),
+                "provenance": "mechanical",
+            })
+            counts["labels"] += 1
 
     return counts
 
@@ -2490,7 +2644,7 @@ def _hex_to_int(v: Any, default: int = 0) -> int:
 
 def _vice_normalize_method(raw_method: str) -> str:
     """Map common aliases to real vice-mcp tool names."""
-    m = (raw_method or "").strip()
+    m = (raw_method or "").strip().lower()
     aliases = {
         # ---- ping ----
         "ping": "vice.ping",
@@ -2502,6 +2656,18 @@ def _vice_normalize_method(raw_method: str) -> str:
         "memory.read": "vice.memory.read",
         "memory_read": "vice.memory.read",
         "vice.memory.read": "vice.memory.read",
+        # ---- agent-side memory composites ----
+        "snapshot": "vice.memory.snapshot",
+        "memory.snapshot": "vice.memory.snapshot",
+        "vice.memory.snapshot": "vice.memory.snapshot",
+        "diff": "vice.memory.diff",
+        "memory.diff": "vice.memory.diff",
+        "vice.memory.diff": "vice.memory.diff",
+        "monotonic_scan": "vice.memory.monotonic_scan",
+        "memory.monotonic_scan": "vice.memory.monotonic_scan",
+        "vice.memory.monotonic_scan": "vice.memory.monotonic_scan",
+        "trace": "vice.trace",
+        "vice.trace": "vice.trace",
         # ---- registers ----
         "registers": "vice.registers.get",
         "registers_get": "vice.registers.get",
@@ -2728,7 +2894,22 @@ def _normalize_seeds(seeds_raw: Any) -> list[tuple[int, str]]:
 def _capstone_linear(
     mem: bytes, args: dict[str, Any], step_id: str
 ) -> dict[str, Any]:
-    start = _hex_to_int(args.get("start", "0x0801"), 0x0801)
+    if args.get("start") is None or (
+        isinstance(args.get("start"), str) and not args["start"].strip()
+    ):
+        return _record_result(
+            "capstone", step_id, False,
+            "capstone mode='linear' requires an explicit `start` address "
+            "(for example \"$C000\"); no $0801 default was applied.",
+            extra={"mode": "linear", "rejection": "missing_arg"},
+        )
+    start = _hex_to_int(args.get("start"), -1)
+    if not 0 <= start <= 0xFFFF:
+        return _record_result(
+            "capstone", step_id, False,
+            f"invalid capstone linear start address: {args.get('start')!r}",
+            extra={"mode": "linear", "rejection": "invalid_arg"},
+        )
     length = int(args.get("length", 256))
     max_lines = int(args.get("max_lines", 64))
     try:
@@ -2833,9 +3014,33 @@ def _capstone_vectors(
     mem: bytes, args: dict[str, Any], step_id: str
 ) -> dict[str, Any]:
     info = c64_disasm.list_vectors(mem)
+    info["banking"] = c64_disasm.banking_state(mem)
     return _record_result(
         "capstone", step_id, True, json.dumps(info, indent=2),
         extra={"mode": "vectors", "info": info},
+    )
+
+
+def _capstone_bank(
+    mem: bytes, args: dict[str, Any], step_id: str
+) -> dict[str, Any]:
+    """Report the $0001 banking state captured in the dump (tracker 3.6)."""
+    bank = c64_disasm.banking_state(mem)
+    notes = []
+    if bank["ram_under_kernal"]:
+        notes.append("KERNAL ROM banked OUT → $E000-$FFFF is game RAM.")
+    else:
+        notes.append("KERNAL ROM banked IN → $E000-$FFFF is ROM.")
+    if not bank["basic_rom_visible"]:
+        notes.append("BASIC ROM banked out → $A000-$BFFF is RAM.")
+    if not bank["io_visible"]:
+        notes.append("I/O banked out → $D000-$DFFF is CHAR ROM, not VIC/SID/CIA.")
+    text = (
+        f"$0001 = {bank['port_hex']}\n" + "\n".join(f"- {n}" for n in notes)
+    )
+    return _record_result(
+        "capstone", step_id, True, text,
+        extra={"mode": "bank", "banking": bank},
     )
 
 
@@ -2875,6 +3080,101 @@ def _capstone_polymorphic(
     )
 
 
+def _recursive_insns_int_keyed(
+    mem: bytes, args: dict[str, Any], default_entry: int = 0x0801,
+) -> dict[int, dict[str, Any]]:
+    """Shared helper: recursive-disassemble from a resolved entry and
+    return the int-keyed insns dict the 3.3/3.5 analysers consume."""
+    entry = _hex_to_int(args.get("entry", args.get("start", default_entry)),
+                        default_entry)
+    if entry == 0x0801:
+        sys_target = c64_disasm.detect_basic_sys(mem)
+        if sys_target and 0x0800 < sys_target <= 0xCFFF:
+            entry = sys_target
+    max_insns = int(args.get("max_insns", 2000))
+    rec = c64_disasm.recursive_disasm(mem, entry, max_insns=max_insns)
+    return {int(k.lstrip("$"), 16): v for k, v in rec["insns"].items()}
+
+
+def _capstone_find_counters(
+    mem: bytes, args: dict[str, Any], step_id: str
+) -> dict[str, Any]:
+    """Game-state variable heuristics (tracker 3.3)."""
+    insns = _recursive_insns_int_keyed(mem, args)
+    kind_filter = str(args.get("kind") or "").strip().lower()
+    cands = c64_disasm.find_counters(insns)
+    if kind_filter:
+        wanted = {k.strip() for k in kind_filter.split("|") if k.strip()}
+        # Match the primary kind OR any alias so `kind='timer'` still
+        # finds a site whose primary is `lives` but also matched timer.
+        cands = [
+            c for c in cands
+            if c["kind"] in wanted or wanted & set(c.get("alias_kinds", []))
+        ]
+    top_n = int(args.get("top_n", 20))
+    cands = cands[:top_n]
+    if not cands:
+        text = "No game-state variable candidates found."
+    else:
+        text = "\n".join(
+            f"{c['address']}  {c['kind']:<18} score={c['score']}"
+            + (f" (also: {', '.join(c['alias_kinds'])})"
+               if c.get("alias_kinds") else "")
+            + f"  [{'; '.join(c['evidence'][:3])}]"
+            for c in cands
+        )
+    return _record_result(
+        "capstone", step_id, True, text,
+        extra={"mode": "find_counters", "candidates": cands},
+    )
+
+
+def _capstone_idioms(
+    mem: bytes, args: dict[str, Any], step_id: str
+) -> dict[str, Any]:
+    """Deterministic 6502 idiom pre-tagging (tracker 3.5)."""
+    insns = _recursive_insns_int_keyed(mem, args)
+    found = c64_disasm.find_idioms(insns)
+    if not found:
+        text = "No recognised idioms."
+    else:
+        text = "\n".join(
+            f"{f['address']}  {f['idiom']:<18} {f['evidence']}" for f in found
+        )
+    return _record_result(
+        "capstone", step_id, True, text,
+        extra={"mode": "idioms", "idioms": found},
+    )
+
+
+def _capstone_screen_text(
+    mem: bytes, args: dict[str, Any], step_id: str
+) -> dict[str, Any]:
+    """Decode screen + colour RAM to PETSCII strings (tracker 3.7)."""
+    screen_base = _hex_to_int(args.get("screen_base", "0x0400"), 0x0400)
+    color_base = _hex_to_int(args.get("color_base", "0xD800"), 0xD800)
+    min_run = int(args.get("min_run", 3))
+    res = c64_disasm.decode_screen_ram(
+        mem, screen_base=screen_base, color_base=color_base, min_run=min_run,
+    )
+    runs = res["runs"]
+    if not runs:
+        text = (
+            f"No printable text in screen RAM at {res['screen_base']} "
+            "(may be a bitmap/sprite screen, or a different base)."
+        )
+    else:
+        text = f"Screen text at {res['screen_base']}:\n" + "\n".join(
+            f"  {r['addr_hex']} (row {r['row']}, col {r['col']}): {r['text']!r}"
+            for r in runs
+        )
+    return _record_result(
+        "capstone", step_id, True, text,
+        extra={"mode": "screen_text", "screen_base": res["screen_base"],
+               "runs": runs},
+    )
+
+
 _CAPSTONE_MODES = {
     "linear": _capstone_linear,
     "recursive": _capstone_recursive,
@@ -2885,6 +3185,13 @@ _CAPSTONE_MODES = {
     "vectors": _capstone_vectors,
     "polymorphic": _capstone_polymorphic,
     "poly": _capstone_polymorphic,
+    "find_counters": _capstone_find_counters,
+    "counters": _capstone_find_counters,
+    "idioms": _capstone_idioms,
+    "screen_text": _capstone_screen_text,
+    "screen": _capstone_screen_text,
+    "bank": _capstone_bank,
+    "banking": _capstone_bank,
 }
 
 
@@ -2921,7 +3228,24 @@ def capstone_node(state: C64State) -> dict[str, Any]:
     store = get_store(state["kb_handle"])
     if not store.has_dump():
         if mode == "linear":
-            start = _hex_to_int(args.get("start", "0x0801"), 0x0801)
+            if args.get("start") is None or (
+                isinstance(args.get("start"), str)
+                and not args["start"].strip()
+            ):
+                return _record_result(
+                    "capstone", step_id, False,
+                    "capstone mode='linear' requires an explicit `start` "
+                    "address; VICE fallback was not attempted.",
+                    extra={"mode": "linear", "rejection": "missing_arg"},
+                )
+            start = _hex_to_int(args.get("start"), -1)
+            if not 0 <= start <= 0xFFFF:
+                return _record_result(
+                    "capstone", step_id, False,
+                    f"invalid capstone linear start address: "
+                    f"{args.get('start')!r}",
+                    extra={"mode": "linear", "rejection": "invalid_arg"},
+                )
             length = int(args.get("length", 256))
             return _vice_disassemble_fallback(
                 step_id, start, length, "no dump bytes available",
@@ -2998,10 +3322,39 @@ def tavily_node(state: C64State) -> dict[str, Any]:
                        "retryable": False},
             )
 
+        tool_cfg = (
+            (load_config().get("tools") or {}).get("tavily") or {}
+        )
+        configured_domains = args.get("include_domains") or tool_cfg.get(
+            "include_domains",
+        ) or [
+            "csdb.dk", "codebase64.org", "lemon64.com", "gamebase64.com",
+            "archive.org", "forum64.de", "c64-wiki.com",
+        ]
+        if isinstance(configured_domains, str):
+            configured_domains = configured_domains.split(",")
+        include_domains = [
+            str(d).strip() for d in configured_domains
+            if str(d).strip()
+        ]
+        search_depth = str(
+            args.get("search_depth") or tool_cfg.get("search_depth")
+            or "advanced"
+        ).strip().lower()
+        if search_depth not in {"basic", "advanced", "fast", "ultra-fast"}:
+            search_depth = "advanced"
+        max_results = int(
+            args.get("max_results") or tool_cfg.get("max_results") or 5,
+        )
+        max_results = max(1, min(20, max_results))
+
         client = TavilyClient(api_key=api_key)
-        resp = client.search(query=query, max_results=5,
-                             include_domains=["csdb.dk", "codebase64.org",
-                                              "lemon64.com", "gamebase64.com"])
+        resp = client.search(
+            query=query,
+            max_results=max_results,
+            include_domains=include_domains,
+            search_depth=search_depth,
+        )
         items = [
             {"title": r.get("title"), "url": r.get("url"),
              "snippet": (r.get("content") or "")[:2_000]}
@@ -3018,7 +3371,12 @@ def tavily_node(state: C64State) -> dict[str, Any]:
         text = "\n\n".join(text_parts) or "(no hits)"
         return _record_result(
             "tavily", step.get("id", "?"), True, text,
-            extra={"query": query, "results": items},
+            extra={
+                "query": query, "results": items,
+                "include_domains": include_domains,
+                "search_depth": search_depth,
+                "max_results": max_results,
+            },
         )
     except Exception as e:  # noqa: BLE001
         return _record_result(
@@ -3051,17 +3409,76 @@ def _vice_call(method: str, args: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _describe_screenshot(data_uri: str) -> str:
-    """Send a C64 screenshot to a vision-capable LLM and return a text description.
+_VISION_SYSTEM_PROMPT = (
+    "You are a neutral visual inspection component for a reverse-engineering "
+    "tool. Describe only visible image evidence in concise plain text. Do not "
+    "emit JSON, do not infer unseen memory values, and clearly mark uncertain "
+    "text or objects."
+)
+
+
+def _screenshot_data_uri(data: Any) -> str | None:
+    """Extract/reconstruct a screenshot data URI from a VICE payload."""
+    if isinstance(data, str) and data.startswith("data:image/"):
+        return data
+    if not isinstance(data, dict):
+        return None
+    if (
+        isinstance(data.get("data_uri"), str)
+        and data["data_uri"].startswith("data:image/")
+    ):
+        return data["data_uri"]
+    if isinstance(data.get("base64"), str):
+        fmt = str(data.get("format") or "png").strip().lower()
+        return f"data:image/{fmt};base64,{data['base64']}"
+    return None
+
+
+def _persist_screenshot(
+    state: C64State, step_id: str, data_uri: str,
+) -> tuple[str | None, dict[str, Any]]:
+    """Store the returned image under the run's session for later review."""
+    meta: dict[str, Any] = {}
+    try:
+        header, encoded = data_uri.split(",", 1)
+        if ";base64" not in header.lower():
+            raise ValueError("screenshot data URI is not base64 encoded")
+        image = base64.b64decode(encoded, validate=True)
+        if not image:
+            raise ValueError("screenshot image is empty")
+        if len(image) > 20 * 1024 * 1024:
+            raise ValueError("screenshot exceeds the 20 MiB safety limit")
+        session_dir = (
+            Path(state["kb_handle"]).parent
+            if state.get("kb_handle") else _session_dir(state.get("game", "unknown"))
+        )
+        out_dir = session_dir / "screenshots"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        safe_step = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(step_id))[:48] or "shot"
+        digest = hashlib.sha256(image).hexdigest()[:12]
+        suffix = ".jpg" if header.lower().startswith("data:image/jpeg") else ".png"
+        path = out_dir / f"{safe_step}-{digest}{suffix}"
+        if not path.exists():
+            path.write_bytes(image)
+        meta.update({"image_bytes": len(image), "image_sha256": digest})
+        return str(path), meta
+    except (ValueError, OSError, binascii.Error) as e:
+        meta["screenshot_save_error"] = f"{type(e).__name__}: {e}"
+        return None, meta
+
+
+def _describe_screenshot_result(
+    data_uri: str,
+) -> tuple[str, dict[str, Any]]:
+    """Describe one screenshot through the dedicated vision role.
 
     The description is stored as the tool result so the synthesizer can
     extract spatial/visual facts (sprites visible, score layout, colour
     RAM usage, etc.) without any downstream code needing multimodal support.
 
-    Tries the analyst role first (most likely to be a capable vision model
-    like Claude or GPT-4o), then falls back to the critic role.
-    Gracefully degrades to a plain placeholder when no vision LLM is
-    configured or the call errors.
+    Exactly one configured ``vision`` call is made. The former analyst →
+    critic → planner chain reused JSON-only role prompts, burned up to three
+    calls, and made prose output look contract-invalid (tracker 4.4).
     """
     prompt_text = (
         "You are looking at a screenshot of a Commodore 64 game running inside "
@@ -3074,47 +3491,146 @@ def _describe_screenshot(data_uri: str) -> str:
         "- Anything that looks like debug output or unusual artefacts\n"
         "Be precise and terse — this description goes into a reverse-engineering KB."
     )
-    for role in ("analyst", "critic", "planner"):
-        model_name = None
-        try:
-            llm = get_llm(role)
-            model_name = getattr(llm, "model_name", None) or getattr(llm, "model", None)
-            sys_prompt = system_message(role)
-            multimodal_msg = HumanMessage(content=[
-                {"type": "image_url", "image_url": {"url": data_uri}},
-                {"type": "text", "text": prompt_text},
-            ])
-            resp = llm.invoke([SystemMessage(sys_prompt), multimodal_msg])
-            in_tok, out_tok = llm_usage.extract_usage(resp)
-            description = _flatten_lc_ai_message_content(resp).strip()
-            # ok = usable output produced (review finding 5) — an empty
-            # description falls through to the next role and is a failure.
-            llm_usage.record({
-                "role": f"vision:{role}", "model": model_name,
-                "input_tokens": in_tok, "output_tokens": out_tok,
-                "cost_usd": llm_usage.estimate_cost_usd(
-                    model_name, in_tok, out_tok,
-                ),
-                "ok": bool(description), "transport_ok": True,
-                **({} if description else {"error": "empty description"}),
-            })
-            if description:
-                return f"[screenshot description via {role}]\n{description}"
-        except Exception as e:  # noqa: BLE001
-            llm_usage.record({
-                "role": f"vision:{role}", "model": model_name,
-                "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0,
-                "ok": False, "transport_ok": False,
-                "error": f"{type(e).__name__}: {e}"[:200],
-            })
-            print(
-                f"[vice/screenshot] vision call via {role} failed: "
-                f"{type(e).__name__}: {e}",
-                file=sys.stderr, flush=True,
-            )
-    # All vision attempts failed — fall back to a size descriptor.
+    role = "vision"
+    model_name = None
+    meta: dict[str, Any] = {"vision_role": role}
+    try:
+        llm = get_llm(role)
+        model_name = getattr(llm, "model_name", None) or getattr(llm, "model", None)
+        multimodal_msg = HumanMessage(content=[
+            {"type": "image_url", "image_url": {"url": data_uri}},
+            {"type": "text", "text": prompt_text},
+        ])
+        resp = llm.invoke([SystemMessage(_VISION_SYSTEM_PROMPT), multimodal_msg])
+        in_tok, out_tok = llm_usage.extract_usage(resp)
+        description = _flatten_lc_ai_message_content(resp).strip()
+        error = None if description else "empty description"
+        llm_usage.record({
+            "role": role, "model": model_name,
+            "input_tokens": in_tok, "output_tokens": out_tok,
+            "cost_usd": llm_usage.estimate_cost_usd(
+                model_name, in_tok, out_tok,
+            ),
+            "ok": bool(description), "transport_ok": True,
+            **({} if error is None else {"error": error}),
+        })
+        meta.update({
+            "vision_model": model_name,
+            "vision_ok": bool(description),
+            "vision_status": "ok" if description else "empty",
+            "description_chars": len(description),
+        })
+        if description:
+            return f"[screenshot description via {role}]\n{description}", meta
+        meta["vision_error"] = error
+    except Exception as e:  # noqa: BLE001
+        err = f"{type(e).__name__}: {e}"
+        llm_usage.record({
+            "role": role, "model": model_name,
+            "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0,
+            "ok": False, "transport_ok": False, "error": err[:200],
+        })
+        meta.update({
+            "vision_model": model_name, "vision_ok": False,
+            "vision_status": "error", "vision_error": err[:200],
+        })
+        print(
+            f"[vice/screenshot] dedicated vision call failed: {err}",
+            file=sys.stderr, flush=True,
+        )
+
     b64_len = len(data_uri) - (data_uri.index(",") + 1) if "," in data_uri else 0
-    return f"[screenshot: base64 PNG, {b64_len} chars — vision LLM unavailable]"
+    return (
+        f"[screenshot: base64 image, {b64_len} chars — vision description unavailable]",
+        meta,
+    )
+
+
+def _describe_screenshot(data_uri: str) -> str:
+    """Compatibility wrapper used by generic VICE response flattening."""
+    return _describe_screenshot_result(data_uri)[0]
+
+
+def _coerce_vice_byte(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if 0 <= value <= 0xFF else None
+    if isinstance(value, str):
+        s = value.strip()
+        try:
+            if s.startswith("$"):
+                n = int(s[1:], 16)
+            elif s.lower().startswith("0x"):
+                n = int(s, 16)
+            else:
+                n = int(s, 10)
+        except ValueError:
+            try:
+                n = int(s, 16)
+            except ValueError:
+                return None
+        return n if 0 <= n <= 0xFF else None
+    return None
+
+
+def _extract_vice_bytes(data: Any) -> tuple[list[int], Any | None]:
+    """Return (byte values, payload address) from common vice-mcp shapes."""
+    address = None
+    candidate = data
+    if isinstance(data, dict):
+        address = data.get("address") or data.get("start") or data.get("base")
+        for key in ("data", "bytes", "memory", "values"):
+            if isinstance(data.get(key), list):
+                candidate = data[key]
+                break
+    if isinstance(candidate, (bytes, bytearray)):
+        return list(candidate), address
+    if not isinstance(candidate, list):
+        return [], address
+    values: list[int] = []
+    for value in candidate:
+        byte = _coerce_vice_byte(value)
+        if byte is None:
+            return [], address
+        values.append(byte)
+    return values, address
+
+
+def _format_vice_memory_read(
+    data: Any, requested_addr: Any, *, max_chars: int = 4_000,
+) -> tuple[str, dict[str, Any]]:
+    """Compact a VICE byte array into 16-byte hex lines before truncation."""
+    values, payload_addr = _extract_vice_bytes(data)
+    if not values:
+        return _vice_text(data), {"memory_bytes_returned": 0}
+    addr_text = _coerce_vice_address(payload_addr or requested_addr) or "$0000"
+    base = int(addr_text[1:], 16)
+    lines = [
+        f"${(base + off) & 0xFFFF:04X}: "
+        + " ".join(f"{b:02X}" for b in values[off : off + 16])
+        for off in range(0, len(values), 16)
+    ]
+    full = "\n".join(lines)
+    omitted = 0
+    if len(full) > max_chars:
+        # Preserve both ends of a large read; middle omission is explicit.
+        line_budget = max(2, (max_chars - 100) // 56)
+        head_n = (line_budget + 1) // 2
+        tail_n = line_budget // 2
+        middle_end = len(lines) - tail_n
+        omitted = sum(
+            len(values[off : off + 16])
+            for off in range(head_n * 16, middle_end * 16, 16)
+        )
+        marker = f"... [{omitted} middle byte(s) omitted] ..."
+        full = "\n".join([*lines[:head_n], marker, *lines[-tail_n:]])
+    return full, {
+        "memory_bytes_returned": len(values),
+        "memory_bytes_omitted": omitted,
+        "memory_base": addr_text,
+        "memory_format": "hex16",
+    }
 
 
 def _vice_text(data: Any) -> str:
@@ -3126,12 +3642,8 @@ def _vice_text(data: Any) -> str:
         return data
     if isinstance(data, dict):
         # Screenshot response: {status, format, data_uri, base64, size}
-        if "data_uri" in data:
-            return _describe_screenshot(data["data_uri"])
-        if "base64" in data:
-            # Reconstruct a data-URI so the vision helper has a standard input.
-            fmt = (data.get("format") or "PNG").lower()
-            data_uri = f"data:image/{fmt};base64,{data['base64']}"
+        data_uri = _screenshot_data_uri(data)
+        if data_uri:
             return _describe_screenshot(data_uri)
         if "lines" in data and isinstance(data["lines"], list):
             return "\n".join(
@@ -3206,6 +3718,392 @@ def _vice_disassemble_fallback(
         )
 
 
+# --------------------------------------------------------------------------- #
+# VICE composites — memory diffing (3.1) + watchpoint trace (3.2)
+# --------------------------------------------------------------------------- #
+
+_VICE_COMPOSITE_METHODS = {
+    "snapshot", "memory.snapshot", "vice.memory.snapshot",
+    "diff", "memory.diff", "vice.memory.diff",
+    "monotonic_scan", "memory.monotonic_scan", "vice.memory.monotonic_scan",
+    "trace", "vice.trace",
+}
+
+
+def _snapshot_dir(state: C64State) -> Path | None:
+    """`sessions/<slug>/snapshots/` derived from the KB handle."""
+    handle = state.get("kb_handle")
+    if not handle:
+        return None
+    d = Path(handle).parent / "snapshots"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _load_named_snapshot(state: C64State, name: str) -> bytes | None:
+    """Load a snapshot by name. The reserved name ``dump`` returns the
+    ingested 64 KB dump (so you can diff live RAM against the dump with no
+    prior snapshot — the offline path, tracker 3.1)."""
+    if str(name).strip().lower() == "dump":
+        if state.get("kb_handle"):
+            try:
+                return get_store(state["kb_handle"]).full_dump()
+            except Exception:  # noqa: BLE001
+                return None
+        return None
+    d = _snapshot_dir(state)
+    if d is None:
+        return None
+    p = d / f"{_slug(str(name))}.bin"
+    return p.read_bytes() if p.exists() else None
+
+
+def _vice_read_full_ram(address: int = 0x0000, size: int = 0x10000) -> bytes:
+    """Read a RAM range from the live emulator into a bytes buffer."""
+    out = _vice_call(
+        "vice.memory.read",
+        {"address": f"${address:04X}", "size": size},
+    )
+    data = out.get("data")
+    # vice-mcp returns bytes / list[int] / {"data":[...]} shapes.
+    if isinstance(data, (bytes, bytearray)):
+        buf = bytes(data)
+    elif isinstance(data, list):
+        buf = bytes(int(x) & 0xFF for x in data)
+    elif isinstance(data, dict) and isinstance(data.get("data"), list):
+        buf = bytes(int(x) & 0xFF for x in data["data"])
+    else:
+        raise RuntimeError(
+            f"vice.memory.read returned an unparseable shape: {type(data)}"
+        )
+    # Zero-pad to a full 64 KB image so region classification lines up.
+    if address == 0 and len(buf) < 0x10000:
+        buf = buf + bytes(0x10000 - len(buf))
+    return buf
+
+
+def _vice_composite(
+    state: C64State, method: str, args: dict[str, Any], step_id: str,
+) -> dict[str, Any]:
+    """Agent-side VICE composites (tracker 3.1 / 3.2).
+
+    snapshot        : read live RAM, save under sessions/<slug>/snapshots/
+    diff            : diff two snapshots (names; ``dump`` = ingested dump),
+                      changed addresses classified by region, old→new
+    monotonic_scan  : intersect ≥2 snapshots by a known delta (−1 lives)
+    trace           : watchpoint on an address → run → read PC/registers →
+                      resolve the writing instruction → disasm around it
+    """
+    from tools import mem_diff
+
+    m = method.lower().rsplit(".", 1)[-1]  # normalise to the verb
+
+    if m == "snapshot":
+        name = str(args.get("name") or "snap").strip()
+        d = _snapshot_dir(state)
+        if d is None:
+            return _record_result(
+                "vice", step_id, False,
+                "snapshot requires a KB handle (no session dir).",
+                extra={"method": "vice.memory.snapshot", "retryable": False},
+            )
+        try:
+            buf = _vice_read_full_ram()
+        except Exception as e:  # noqa: BLE001
+            return _record_result(
+                "vice", step_id, False,
+                f"vice.memory.snapshot failed: {type(e).__name__}: {e}",
+                extra={"method": "vice.memory.snapshot"},
+            )
+        (d / f"{_slug(name)}.bin").write_bytes(buf)
+        return _record_result(
+            "vice", step_id, True,
+            f"Saved snapshot '{name}' ({len(buf)} bytes) → "
+            f"snapshots/{_slug(name)}.bin. Diff it against another "
+            "snapshot (or the reserved name 'dump') to find changed state.",
+            extra={"method": "vice.memory.snapshot", "snapshot": name,
+                   "size": len(buf)},
+        )
+
+    if m == "diff":
+        a_name = str(args.get("a") or "dump")
+        b_name = str(args.get("b") or "").strip()
+        a = _load_named_snapshot(state, a_name)
+        if b_name:
+            # Explicit 'b' — must exist; no silent live fallback.
+            b = _load_named_snapshot(state, b_name)
+        elif os.getenv("VICE_MCP_URL", "").strip():
+            # 'b' omitted → diff 'a' against a fresh live read.
+            try:
+                b = _vice_read_full_ram()
+                b_name = "live"
+            except Exception as e:  # noqa: BLE001
+                return _record_result(
+                    "vice", step_id, False,
+                    f"vice.memory.diff live read failed: {type(e).__name__}: {e}",
+                    extra={"method": "vice.memory.diff"},
+                )
+        else:
+            b = None
+        if a is None or b is None:
+            return _record_result(
+                "vice", step_id, False,
+                f"vice.memory.diff needs two snapshots; got a={a_name!r} "
+                f"(loaded={a is not None}), b={b_name or '(omitted)'!r} "
+                f"(loaded={b is not None}). Take snapshots first.",
+                extra={"method": "vice.memory.diff", "retryable": False},
+            )
+        rows = mem_diff.diff_snapshots(
+            a, b, exclude_io=bool(args.get("exclude_io", True)),
+        )
+        return _record_result(
+            "vice", step_id, True,
+            f"diff {a_name} → {b_name}:\n" + mem_diff.summarize_diff(rows),
+            extra={"method": "vice.memory.diff", "a": a_name, "b": b_name,
+                   "changed": rows[:256]},
+        )
+
+    if m == "monotonic_scan":
+        names = args.get("snapshots") or []
+        if isinstance(names, str):
+            names = [s.strip() for s in names.split(",") if s.strip()]
+        delta = int(args.get("delta", -1))
+        snaps = [_load_named_snapshot(state, n) for n in names]
+        if len(names) < 2 or any(s is None for s in snaps):
+            missing = [n for n, s in zip(names, snaps) if s is None]
+            return _record_result(
+                "vice", step_id, False,
+                "vice.memory.monotonic_scan needs ≥2 existing snapshots; "
+                f"missing/insufficient: {missing or names}.",
+                extra={"method": "vice.memory.monotonic_scan",
+                       "retryable": False},
+            )
+        hits = mem_diff.monotonic_scan(snaps, delta=delta)
+        if not hits:
+            text = (
+                f"No address changed by Δ{delta:+d} across all "
+                f"{len(names)} snapshots. Widen the delta or re-capture."
+            )
+        else:
+            text = (
+                f"{len(hits)} address(es) changed by Δ{delta:+d} across all "
+                f"{len(names)} snapshots (strong game-state candidates):\n"
+                + "\n".join(
+                    f"  {h['addr_hex']} ({h['region']}): "
+                    f"{' → '.join(str(v) for v in h['values'])}"
+                    for h in hits[:40]
+                )
+            )
+        return _record_result(
+            "vice", step_id, True, text,
+            extra={"method": "vice.memory.monotonic_scan", "delta": delta,
+                   "candidates": hits},
+        )
+
+    if m == "trace":
+        return _vice_trace(args, step_id)
+
+    return _record_result(
+        "vice", step_id, False,
+        f"unknown vice composite {method!r}",
+        extra={"method": method, "retryable": False},
+    )
+
+
+_TRACE_WRITE_MNEMONICS = frozenset({
+    "sta", "stx", "sty", "stz", "inc", "dec", "asl", "lsr", "rol", "ror",
+})
+
+
+def _extract_checkpoint_id(add_result: dict[str, Any]) -> Any:
+    """Best-effort checkpoint id from a `vice.checkpoint.add` result."""
+    data = add_result.get("data")
+    if isinstance(data, dict):
+        for k in ("checkpoint_id", "checkpointId", "number", "id"):
+            if data.get(k) is not None:
+                return data[k]
+    text = _vice_text(data)
+    m = re.search(r"(?:checkpoint|number|id)[^0-9]*([0-9]+)", text, re.I)
+    return int(m.group(1)) if m else None
+
+
+def _disasm_writes_addr(disasm_text: str, addr_int: int) -> bool:
+    """True iff a line disassembles to a write/RMW targeting *addr_int*."""
+    for line in (disasm_text or "").splitlines():
+        toks = line.lower().split()
+        if not any(t in _TRACE_WRITE_MNEMONICS for t in toks):
+            continue
+        for m in re.finditer(r"\$([0-9a-fA-F]{2,4})", line):
+            if int(m.group(1), 16) == addr_int:
+                return True
+    return False
+
+
+def _vice_trace(args: dict[str, Any], step_id: str) -> dict[str, Any]:
+    """Watchpoint → run → resolve-writer composite (tracker 3.2, hardened).
+
+    One tool call turns "candidate address" into "the routine that writes
+    it". Success is claimed ONLY when a hit is actually confirmed — via
+    the checkpoint's hit count, or by the resolved PC's instruction
+    demonstrably writing the watched address — never merely because a PC
+    was read. The armed watchpoint is always cleaned up (try/finally).
+    """
+    address = _extract_vice_address(args)
+    if address is None:
+        return _record_result(
+            "vice", step_id, False,
+            "vice.trace requires an `address` to watch.",
+            extra={"method": "vice.trace", "retryable": False},
+        )
+    addr_int = int(address.lstrip("$"), 16)
+    frames = int(args.get("frames", 2))
+    steps: list[str] = []
+    checkpoint_id: Any = None
+
+    # 1. Arm a write watchpoint.
+    try:
+        add_out = _vice_call("vice.checkpoint.add", {
+            "address": address, "stop_when_hit": True,
+            "load": False, "store": True, "exec": False,
+        })
+        checkpoint_id = _extract_checkpoint_id(add_out)
+        steps.append(
+            f"armed write watchpoint at {address}"
+            + (f" (id={checkpoint_id})" if checkpoint_id is not None else "")
+        )
+    except Exception as e:  # noqa: BLE001
+        return _record_result(
+            "vice", step_id, False,
+            f"vice.trace could not arm a watchpoint at {address}: "
+            f"{type(e).__name__}: {e}",
+            extra={"method": "vice.trace", "address": address},
+        )
+
+    try:
+        # 2. Run (bounded by frames).
+        try:
+            _vice_call("vice.execution.run", {"frames": frames})
+            steps.append(f"ran up to {frames} frame(s)")
+        except Exception as e:  # noqa: BLE001
+            steps.append(f"run failed ({type(e).__name__}) — checking state anyway")
+
+        # 3. Confirm a hit via the checkpoint list (hit_count > 0), if the
+        #    server exposes it. Only trusted when we captured OUR
+        #    checkpoint id — without one, a hit_count on some other
+        #    breakpoint could be misattributed to our watchpoint, so we
+        #    fall back to the PC/disasm proof below instead (review nit).
+        hit_confirmed = False
+        if checkpoint_id is not None:
+            try:
+                lst = _vice_call("vice.checkpoint.list", {})
+                hit_confirmed = _checkpoint_hit(lst.get("data"), checkpoint_id)
+                if hit_confirmed:
+                    steps.append(f"checkpoint id={checkpoint_id} reports a hit")
+            except Exception:  # noqa: BLE001
+                pass  # optional verb
+        else:
+            steps.append(
+                "no checkpoint id returned — relying on PC/disasm proof, "
+                "not the checkpoint list"
+            )
+
+        # 4. Read registers (allowed — a checkpoint is armed) + resolve PC.
+        pc = None
+        reg_text = ""
+        try:
+            regs = _vice_call("vice.registers.get", {})
+            reg_text = _vice_text(regs.get("data"))
+            m = re.search(r"\bPC[:=\s]*\$?([0-9A-Fa-f]{4})", reg_text)
+            if m:
+                pc = int(m.group(1), 16)
+            steps.append("read registers")
+        except Exception as e:  # noqa: BLE001
+            steps.append(f"registers.get failed ({type(e).__name__})")
+
+        # 5. Disasm around PC and check it actually writes the address.
+        writer_disasm = ""
+        writer_proven = False
+        if pc is not None:
+            win_start = max(0, pc - 16)
+            try:
+                out = _vice_call("vice.disassemble", {
+                    "address": f"${win_start:04X}", "count": 16,
+                })
+                writer_disasm = _vice_text(out.get("data"))
+                writer_proven = _disasm_writes_addr(writer_disasm, addr_int)
+                steps.append(
+                    f"disasm around ${pc:04X}"
+                    + (" confirms a write to the address"
+                       if writer_proven else " (no write to the address seen)")
+                )
+            except Exception as e:  # noqa: BLE001
+                steps.append(f"disasm around ${pc:04X} failed ({type(e).__name__})")
+
+        ok = bool(hit_confirmed or writer_proven)
+        body = [
+            f"vice.trace of write watchpoint on {address}:",
+            "steps: " + "; ".join(steps),
+        ]
+        if reg_text:
+            body.append("registers:\n" + reg_text[:1_000])
+        if writer_disasm:
+            body.append(
+                f"writing instruction context (±16 bytes around ${pc:04X}):\n"
+                + writer_disasm[:2_000]
+            )
+        if not ok:
+            body.append(
+                "No confirmed write to the address within the frame budget "
+                "(no hit reported and the PC's instruction does not write it). "
+                "The value may be updated elsewhere or not during this window."
+            )
+        return _record_result(
+            "vice", step_id, ok, "\n".join(body),
+            extra={"method": "vice.trace", "address": address,
+                   "writer_pc": f"${pc:04X}" if (ok and pc is not None) else None,
+                   "hit_confirmed": bool(hit_confirmed),
+                   "writer_proven": bool(writer_proven)},
+        )
+    finally:
+        # Always disarm the watchpoint we added, even on early returns.
+        try:
+            del_args = ({"id": checkpoint_id} if checkpoint_id is not None
+                        else {"address": address})
+            _vice_call("vice.checkpoint.delete", del_args)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _checkpoint_hit(data: Any, checkpoint_id: Any) -> bool:
+    """Parse a checkpoint-list payload for OUR checkpoint's hit count.
+
+    Requires a concrete `checkpoint_id` and an exact id match: without a
+    known id, a hit on some unrelated breakpoint could be misattributed
+    to our watchpoint (review nit), so the caller uses PC/disasm proof
+    instead. Belt-and-braces with the caller's own id guard.
+    """
+    if checkpoint_id is None:
+        return False
+    if isinstance(data, dict):
+        items = data.get("checkpoints") or data.get("list") or []
+    elif isinstance(data, list):
+        items = data
+    else:
+        items = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        cid = it.get("id") if it.get("id") is not None else it.get("number")
+        if cid != checkpoint_id:
+            continue
+        hits = it.get("hit_count", it.get("hits", it.get("hit", 0)))
+        if (isinstance(hits, bool) and hits) or (
+            isinstance(hits, (int, float)) and hits > 0
+        ):
+            return True
+    return False
+
+
 def vice_mcp_node(state: C64State) -> dict[str, Any]:
     """Direct vice-mcp call (when the planner explicitly picks `vice`).
 
@@ -3227,12 +4125,16 @@ def vice_mcp_node(state: C64State) -> dict[str, Any]:
     _logging.getLogger(__name__).debug(
         "vice_mcp_node raw step: %s", json.dumps(step, default=str)
     )
-    method = (
+    raw_method = (
         args.pop("method", None)
         or step.get("method")
         or step.get("action")
         or "vice.ping"
     )
+    # Canonicalise once, before policy checks or composite dispatch. Calling
+    # `_vice_call` later normalises again defensively, but policy must never
+    # inspect a raw alias (`ping`, `registers`, `get_registers`, …).
+    method = _vice_normalize_method(str(raw_method))
     # Absorb address / count / size at the step top level into args when
     # the LLM forgot to nest them (common with smaller models).
     for _top_key in ("address", "addr", "count", "size", "bank", "start"):
@@ -3247,13 +4149,31 @@ def vice_mcp_node(state: C64State) -> dict[str, Any]:
             extra={"method": method, "args": args, "retryable": False},
         )
 
+    # Agent-side composites (tracker 3.1 / 3.2): snapshot / diff /
+    # monotonic_scan / trace. Dispatch before the direct-call path.
+    if method in _VICE_COMPOSITE_METHODS:
+        return _vice_composite(state, method, args, step_id)
+
     # Reject low-value diagnostic calls that produce no code facts.
+    # `vice.registers.get` is ALWAYS banned as a standalone step
+    # (tracker 3.2 hardening — option (c)): a planner-supplied
+    # `armed: true` is not trustworthy proof a checkpoint actually
+    # hit, so it cannot bypass the ban. Registers ARE useful right
+    # after a watchpoint hit — but only through `vice.trace`, which
+    # arms the checkpoint in-process, reads registers via the internal
+    # `_vice_call` path (not this node), and verifies the hit.
     _BANNED_VICE_METHODS = {"vice.ping", "vice.registers.get"}
     if method in _BANNED_VICE_METHODS:
+        hint = (
+            " Use `vice.trace {address}` — it arms a watchpoint, reads "
+            "registers at the verified hit, and resolves the writer."
+            if method == "vice.registers.get" else ""
+        )
         return _record_result(
             "vice", step_id, False,
-            f"{method} produces no code facts — skipped (banned method). "
-            "Plan a vice.disassemble or vice.memory.read step instead.",
+            f"{method} produces no code facts — skipped (banned method).{hint} "
+            "Plan a vice.disassemble, vice.memory.read, or vice.trace step "
+            "instead.",
             extra={"method": method, "args": args, "rejection": "banned_method"},
         )
 
@@ -3274,13 +4194,44 @@ def vice_mcp_node(state: C64State) -> dict[str, Any]:
             extra={"method": method, "args": args},
         )
 
-    # Successful call — wrap the raw text with a deterministic header and
-    # an optional mismatch warning.
-    raw_text = _vice_text(out.get("data"))
+    # Successful call — normalise high-volume / multimodal payloads before
+    # wrapping them in the deterministic tool-result envelope.
+    data = out.get("data")
     final_args = out.get("args", args) or {}
     requested_addr = final_args.get("address") if isinstance(final_args, dict) else None
+    canonical_method = str(out.get("tool", method))
+    payload_meta: dict[str, Any] = {}
+    if canonical_method == "vice.memory.read":
+        raw_text, payload_meta = _format_vice_memory_read(
+            data, requested_addr, max_chars=4_000,
+        )
+    elif canonical_method == "vice.display.screenshot":
+        data_uri = _screenshot_data_uri(data)
+        if data_uri:
+            screenshot_path, save_meta = _persist_screenshot(
+                state, step_id, data_uri,
+            )
+            raw_text, vision_meta = _describe_screenshot_result(data_uri)
+            payload_meta.update(save_meta)
+            payload_meta.update(vision_meta)
+            if screenshot_path:
+                # The persisted source image is intentionally also the UI
+                # thumbnail target: generating a second raster would add an
+                # otherwise-unused Pillow dependency.
+                payload_meta["screenshot_path"] = screenshot_path
+                payload_meta["thumbnail_path"] = screenshot_path
+        else:
+            raw_text = _vice_text(data)
+            payload_meta.update({
+                "vision_role": "vision",
+                "vision_ok": False,
+                "vision_status": "missing_image",
+                "vision_error": "VICE response contained no image data URI",
+            })
+    else:
+        raw_text = _vice_text(data)
     header = (
-        f"[{out.get('tool', method)} "
+        f"[{canonical_method} "
         f"args={json.dumps(final_args, default=str)}]"
     )
     warning = _detect_vice_addr_mismatch(requested_addr, raw_text)
@@ -3292,9 +4243,10 @@ def vice_mcp_node(state: C64State) -> dict[str, Any]:
     text = "\n".join(pieces)
 
     extra: dict[str, Any] = {
-        "method": out.get("tool", method),
+        "method": canonical_method,
         "args": final_args,
         "url": out.get("url"),
+        **payload_meta,
     }
     if warning:
         extra["addr_mismatch_warning"] = warning
@@ -3517,11 +4469,50 @@ def kb_query_node(state: C64State) -> dict[str, Any]:
 
         if mode == "labels":
             like = args.get("like")
-            if like:
+            addresses: list[int] = []
+            for raw_addr in (
+                args.get("addr"), args.get("address"),
+                *(args.get("addresses") or []
+                  if isinstance(args.get("addresses"), list) else []),
+            ):
+                if raw_addr is None:
+                    continue
+                parsed = _hex_to_int(raw_addr, -1)
+                if 0 <= parsed <= 0xFFFF and parsed not in addresses:
+                    addresses.append(parsed)
+            addresses.extend(
+                a for a in extract_hex_addresses(str(like or ""))
+                if a not in addresses
+            )
+
+            where: list[str] = []
+            params: list[Any] = []
+            if addresses:
+                where.append(
+                    "addr IN (" + ",".join("?" for _ in addresses) + ")"
+                )
+                params.extend(addresses)
+            # An address-looking `like` is an address query, not a label-name
+            # substring (tracker 4.3).
+            if like and not extract_hex_addresses(str(like)):
+                where.append("name LIKE ?")
+                params.append(f"%{like}%")
+
+            if where:
+                order_sql = "confidence DESC, addr"
+                if addresses:
+                    order_sql = (
+                        "CASE WHEN addr IN ("
+                        + ",".join("?" for _ in addresses)
+                        + ") THEN 0 ELSE 1 END, confidence DESC, addr"
+                    )
+                    params.extend(addresses)
+                params.append(limit)
                 rows = store.query(
                     "SELECT addr, name, kind, confidence FROM labels"
-                    " WHERE name LIKE ? ORDER BY confidence DESC, addr LIMIT ?",
-                    (f"%{like}%", limit),
+                    f" WHERE {' OR '.join(where)}"
+                    f" ORDER BY {order_sql} LIMIT ?",
+                    tuple(params),
                 )
             else:
                 rows = store.query(
@@ -3535,7 +4526,11 @@ def kb_query_node(state: C64State) -> dict[str, Any]:
             text = json.dumps(rows, indent=2, default=str)
             return _record_result(
                 "kb", step_id, True, text,
-                extra={"mode": "labels", "row_count": len(rows)},
+                extra={
+                    "mode": "labels", "row_count": len(rows),
+                    **({"addresses": [f"${a:04X}" for a in addresses]}
+                       if addresses else {}),
+                },
             )
 
         if mode == "text":

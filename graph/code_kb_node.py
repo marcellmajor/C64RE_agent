@@ -77,6 +77,10 @@ CODE_KB_SCHEMA_HINT = (
     "             annotation_id)  -- one row per (edge, source)\n"
     "    kind ∈ {jsr, jmp, branch, jmp_indirect, fallthrough}\n"
     "  code_smc_sites(src_addr, dst_addr, mnemonic, operand, smc_kind)\n"
+    "  code_data_refs(src_addr, dst_addr, access, index_reg, indirect,\n"
+    "                 source_file, annotation_id)  -- data-flow index\n"
+    "    access ∈ {r, w, rmw}; one row per (ref, source) — SELECT DISTINCT.\n"
+    "    Prefer the modes writes_to / refs_to / hardware_refs over raw SQL.\n"
     "  code_class(addr PK, classification, confidence, evidence)\n"
     "    classification ∈ {code, data, ambiguous}\n"
     "  code_labels(addr, name, source_file, annotation_id)\n"
@@ -278,6 +282,83 @@ def _mode_smc(store, args, step_id):
     return _record_result(
         "code_kb", step_id, True, text,
         extra={"mode": "smc", "row_count": len(rows)},
+    )
+
+
+def _mode_writes_to(store, args, step_id):
+    """Instructions that WRITE (or RMW) a target address (tracker 3.4)."""
+    addr = _hex_to_int(args.get("addr") or args.get("dst") or 0, 0)
+    limit = int(args.get("limit", 100))
+    rows = store.query(
+        "SELECT DISTINCT src_addr, access, index_reg, indirect"
+        "  FROM code_data_refs WHERE dst_addr = ?"
+        "   AND access IN ('w', 'rmw') ORDER BY src_addr LIMIT ?",
+        (addr & 0xFFFF, limit),
+    )
+    for r in rows:
+        r["src_hex"] = f"${r['src_addr']:04X}"
+    text = json.dumps(rows, indent=2, default=str)
+    return _record_result(
+        "code_kb", step_id, True, text,
+        extra={"mode": "writes_to", "addr": f"${addr:04X}",
+               "row_count": len(rows)},
+    )
+
+
+def _mode_refs_to(store, args, step_id):
+    """All references (read/write/rmw) to a target address (tracker 3.4)."""
+    addr = _hex_to_int(args.get("addr") or args.get("dst") or 0, 0)
+    limit = int(args.get("limit", 200))
+    rows = store.query(
+        "SELECT DISTINCT src_addr, access, index_reg, indirect"
+        "  FROM code_data_refs WHERE dst_addr = ?"
+        " ORDER BY src_addr LIMIT ?",
+        (addr & 0xFFFF, limit),
+    )
+    for r in rows:
+        r["src_hex"] = f"${r['src_addr']:04X}"
+    text = json.dumps(rows, indent=2, default=str)
+    return _record_result(
+        "code_kb", step_id, True, text,
+        extra={"mode": "refs_to", "addr": f"${addr:04X}",
+               "row_count": len(rows)},
+    )
+
+
+def _mode_hardware_refs(store, args, step_id):
+    """References into a hardware chip's register range (tracker 3.4).
+
+    `chip` ∈ {vic|vic-ii, sid, cia|cia1, cia2}; or pass an explicit
+    `lo`/`hi` range.
+    """
+    chip = str(args.get("chip") or "").strip().lower()
+    ranges = {
+        "vic": (0xD000, 0xD3FF), "vic-ii": (0xD000, 0xD3FF),
+        "vicii": (0xD000, 0xD3FF),
+        "sid": (0xD400, 0xD7FF),
+        "cia": (0xDC00, 0xDCFF), "cia1": (0xDC00, 0xDCFF),
+        "cia2": (0xDD00, 0xDDFF),
+    }
+    if chip in ranges:
+        lo, hi = ranges[chip]
+    else:
+        lo = _hex_to_int(args.get("lo"), 0xD000)
+        hi = _hex_to_int(args.get("hi"), 0xDFFF)
+    limit = int(args.get("limit", 300))
+    rows = store.query(
+        "SELECT DISTINCT src_addr, dst_addr, access, index_reg"
+        "  FROM code_data_refs WHERE dst_addr BETWEEN ? AND ?"
+        " ORDER BY dst_addr, src_addr LIMIT ?",
+        (lo, hi, limit),
+    )
+    for r in rows:
+        r["src_hex"] = f"${r['src_addr']:04X}"
+        r["dst_hex"] = f"${r['dst_addr']:04X}"
+    text = json.dumps(rows, indent=2, default=str)
+    return _record_result(
+        "code_kb", step_id, True, text,
+        extra={"mode": "hardware_refs", "chip": chip or f"${lo:04X}-${hi:04X}",
+               "row_count": len(rows)},
     )
 
 
@@ -682,18 +763,21 @@ def _invoke_layer1(
 
 
 _MODE_HANDLERS = {
-    "stats":      _mode_stats,
-    "schema":     _mode_schema,
-    "hardware":   _mode_hardware,
-    "routines":   _mode_routines,
-    "routine":    _mode_routine,
-    "xrefs_to":   _mode_xrefs_to,
-    "xrefs_from": _mode_xrefs_from,
-    "smc":        _mode_smc,
-    "search":     _mode_search,
-    "disasm":     _mode_disasm,
-    "export":     _mode_export,
-    "sql":        _mode_sql,
+    "stats":         _mode_stats,
+    "schema":        _mode_schema,
+    "hardware":      _mode_hardware,
+    "routines":      _mode_routines,
+    "routine":       _mode_routine,
+    "xrefs_to":      _mode_xrefs_to,
+    "xrefs_from":    _mode_xrefs_from,
+    "smc":           _mode_smc,
+    "writes_to":     _mode_writes_to,
+    "refs_to":       _mode_refs_to,
+    "hardware_refs": _mode_hardware_refs,
+    "search":        _mode_search,
+    "disasm":        _mode_disasm,
+    "export":        _mode_export,
+    "sql":           _mode_sql,
 }
 
 

@@ -9,6 +9,10 @@ and exposed as composable helpers the agent can pick from per planner step:
   - find_entry           : BASIC SYS bootstrap detection / entry validation
   - list_vectors         : HW + RAM vectors
   - detect_polymorphic   : self-modifying-code suspect scan
+  - find_counters        : game-state variable heuristics (tracker 3.3)
+  - find_idioms          : deterministic 6502 idiom pre-tagging (tracker 3.5)
+  - extract_data_refs    : LDA/STA/CMP memory-operand index (tracker 3.4)
+  - decode_screen_ram    : screen+colour RAM → PETSCII strings (tracker 3.7)
 
 All helpers operate on a 64 KB (or smaller, zero-padded) memory image.
 None of them mutate state; they return JSON-friendly dicts/strings.
@@ -104,6 +108,37 @@ def _make_cs() -> "capstone.Cs":
     cs = capstone.Cs(capstone.CS_ARCH_MOS65XX, capstone.CS_MODE_MOS65XX_6502)
     cs.detail = False
     return cs
+
+
+# --------------------------------------------------------------------------- #
+# Bank awareness — tracker 3.6
+# --------------------------------------------------------------------------- #
+
+def banking_state(mem: bytes) -> dict[str, Any]:
+    """Interpret the $0001 processor port captured in a RAM dump.
+
+    The input is a RAM dump, and many games run code in RAM *under* the
+    KERNAL/BASIC ROMs. The dumped $0001 tells us which banks were mapped
+    at dump time (bit0 LORAM → BASIC, bit1 HIRAM → KERNAL, bit2 CHAREN →
+    I/O vs char ROM). When a ROM is banked OUT, the corresponding address
+    range is live RAM code — so it must NOT be penalised as "ROM" by the
+    loop heuristic, and its HW vectors point at real game code.
+    """
+    port = mem[0x0001] if len(mem) > 1 else 0x37
+    loram = bool(port & 0x01)   # 1 = BASIC ROM visible at $A000-$BFFF
+    hiram = bool(port & 0x02)   # 1 = KERNAL ROM visible at $E000-$FFFF
+    charen = bool(port & 0x04)  # 1 = I/O visible at $D000-$DFFF
+    return {
+        "port": port,
+        "port_hex": f"${port:02X}",
+        "basic_rom_visible": loram,
+        "kernal_rom_visible": hiram,
+        "io_visible": charen,
+        # RAM-under-ROM: the ROM is banked out, so this range is game RAM.
+        "ram_under_kernal": not hiram,
+        "ram_under_basic": not loram and hiram,  # BASIC out only meaningful w/ kernal in
+        "char_rom_visible": not charen,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -209,11 +244,23 @@ def recursive_disasm(
                 enqueue(addr, label)
 
     if seed_vectors:
+        # Bank awareness (tracker 3.6): when the KERNAL ROM is banked in,
+        # HW-vector targets in $E000+ are KERNAL routines — seeding them
+        # burns the limited max_insns budget disassembling ROM. Skip them
+        # unless the dump's $0001 shows RAM under the KERNAL.
+        kernal_ram = banking_state(mem)["ram_under_kernal"]
         for vec_addr, name in HW_VECTORS.items():
             tgt = read_word(mem, vec_addr)
-            if tgt and in_bounds(mem, tgt):
-                ensure_label(tgt, name)
-                enqueue(tgt, f"HW {name} @ ${vec_addr:04X}")
+            if not tgt or not in_bounds(mem, tgt):
+                continue
+            if tgt >= 0xE000 and not kernal_ram:
+                remarks[tgt].append(
+                    f"HW {name} @ ${vec_addr:04X} → ${tgt:04X} in banked-in "
+                    "KERNAL ROM; not seeded (bank-aware)"
+                )
+                continue
+            ensure_label(tgt, name)
+            enqueue(tgt, f"HW {name} @ ${vec_addr:04X}")
         for vec_addr, name in C64_RAM_VECTORS.items():
             tgt = read_word(mem, vec_addr)
             if tgt and in_bounds(mem, tgt) and tgt > 0x0400:
@@ -410,7 +457,8 @@ def _quick_disasm_stream(mem: bytes, start: int,
     return out
 
 
-def _score_loop(mem: bytes, top: int, end: int, insns: list[dict]
+def _score_loop(mem: bytes, top: int, end: int, insns: list[dict],
+                ram_under_kernal: bool = False
                 ) -> tuple[float, list[str]]:
     score = 0.0
     reasons: list[str] = []
@@ -464,13 +512,28 @@ def _score_loop(mem: bytes, top: int, end: int, insns: list[dict]
     if 0x0800 <= top <= 0xCFFF:
         score += 10.0
     elif top >= 0xE000:
-        score -= 30.0
+        # Only penalise the KERNAL range when the KERNAL ROM was actually
+        # banked in at dump time; under RAM-under-ROM the range is real
+        # game code and the old flat −30 systematically hid it (3.6).
+        if ram_under_kernal:
+            score += 5.0
+            reasons.append("code in RAM under KERNAL ($E000+)")
+        else:
+            score -= 30.0
 
     return score, reasons
 
 
 def find_loops(mem: bytes, top_n: int = 8) -> list[dict[str, Any]]:
-    """Return up to top_n game-loop candidates, ranked by score desc."""
+    """Return up to top_n game-loop candidates, ranked by score desc.
+
+    Bank-aware (tracker 3.6): when $0001 shows the KERNAL ROM banked out,
+    the $E000-$FFFF range is scanned as game RAM instead of being
+    penalised as ROM.
+    """
+    bank = banking_state(mem)
+    ram_under_kernal = bank["ram_under_kernal"]
+    scan_hi = 0xFFF0 if ram_under_kernal else 0xCFFF
     candidates: dict[int, tuple[float, list[str]]] = {}
 
     def add(addr: int, score: float, reasons: list[str]) -> None:
@@ -482,9 +545,10 @@ def find_loops(mem: bytes, top_n: int = 8) -> list[dict[str, Any]]:
 
     # Heuristic 1: $0314 RAM IRQ vector
     irq = read_word(mem, 0x0314)
-    if irq and 0x0800 <= irq <= 0xCFFF:
+    if irq and 0x0800 <= irq <= scan_hi:
         ins = _quick_disasm_stream(mem, irq, 256)
-        s, r = _score_loop(mem, irq, ins[-1]["addr"] if ins else irq, ins)
+        s, r = _score_loop(mem, irq, ins[-1]["addr"] if ins else irq, ins,
+                           ram_under_kernal)
         s += 15.0
         r.insert(0, "RAM IRQ vector $0314")
         add(irq, s, r)
@@ -492,7 +556,7 @@ def find_loops(mem: bytes, top_n: int = 8) -> list[dict[str, Any]]:
     # Heuristic 2: backward JMP scan
     seen: set[int] = set()
     addr = 0x0800
-    while addr < 0xCFFF:
+    while addr < scan_hi:
         chunk = mem[addr : addr + 3]
         decoded = list(cs.disasm(chunk, addr))
         if not decoded:
@@ -505,7 +569,7 @@ def find_loops(mem: bytes, top_n: int = 8) -> list[dict[str, Any]]:
                 seen.add(tgt)
                 if 8 <= addr - tgt <= 0x2000:
                     block = _quick_disasm_stream(mem, tgt, 512)
-                    s, r = _score_loop(mem, tgt, addr, block)
+                    s, r = _score_loop(mem, tgt, addr, block, ram_under_kernal)
                     if s > 0:
                         add(tgt, s, r)
         addr += len(decoded[0].bytes)
@@ -528,7 +592,7 @@ def find_loops(mem: bytes, top_n: int = 8) -> list[dict[str, Any]]:
             tgt = parse_direct_target(ins.op_str)
             if mnem == "jmp" and tgt and tgt < chain and tgt not in seen:
                 block = _quick_disasm_stream(mem, tgt, 512)
-                s, r = _score_loop(mem, tgt, chain, block)
+                s, r = _score_loop(mem, tgt, chain, block, ram_under_kernal)
                 s += 20.0
                 r.insert(0, "first backward JMP in BASIC SYS init chain")
                 add(tgt, s, r)
@@ -549,22 +613,64 @@ def find_loops(mem: bytes, top_n: int = 8) -> list[dict[str, Any]]:
 # --------------------------------------------------------------------------- #
 
 def detect_basic_sys(mem: bytes) -> Optional[int]:
-    """Return the SYS target address from a BASIC stub at $0801, if present."""
-    try:
-        region = mem[0x0801:0x0830]
-        idx = region.index(0x9E)
-        digits = bytearray()
-        for b in region[idx + 1 :]:
-            if 0x30 <= b <= 0x39:
-                digits.append(b)
-            elif b == 0x00:
-                break
-            else:
-                break
-        if digits:
-            return int(digits.decode())
-    except (ValueError, IndexError):
-        pass
+    """Return the decimal ``SYS`` target from a tokenized BASIC stub.
+
+    Commodore BASIC stores ``SYS`` as token ``$9E`` followed by PETSCII
+    text.  Real loaders commonly spell it ``SYS 2064``, ``SYS(2064)``,
+    ``SYS:2064`` or ``SYS +2064``; the old parser required the first byte
+    after ``$9E`` to be a digit and silently missed all of those forms.
+
+    Follow the BASIC line-link chain when it is intact, with a small fixed
+    window fallback for damaged/snapshot-in-progress stubs.  Only harmless
+    leading separators are skipped; once decimal digits start, the first
+    non-digit terminates the address.
+    """
+
+    def _target_after_token(body: bytes) -> Optional[int]:
+        separators = {0x20, 0x28, 0x2B, 0x3A, 0xA0}  # space,(,+,:,shift-space
+        start = 0
+        while True:
+            try:
+                idx = body.index(0x9E, start)
+            except ValueError:
+                return None
+            pos = idx + 1
+            while pos < len(body) and body[pos] in separators:
+                pos += 1
+            digits = bytearray()
+            while pos < len(body) and 0x30 <= body[pos] <= 0x39:
+                digits.append(body[pos])
+                pos += 1
+            if digits:
+                target = int(digits.decode("ascii"))
+                return target if 0 <= target <= 0xFFFF else None
+            start = idx + 1
+
+    line = 0x0801
+    visited: set[int] = set()
+    for _ in range(256):
+        if line in visited or line < 0 or line + 4 > len(mem):
+            break
+        visited.add(line)
+        next_line = read_word(mem, line)
+        try:
+            end = mem.index(0x00, line + 4, min(len(mem), line + 260))
+        except ValueError:
+            break
+        target = _target_after_token(mem[line + 4 : end])
+        if target is not None:
+            return target
+        if next_line == 0:
+            return None
+        if next_line <= line or next_line >= len(mem):
+            break
+        line = next_line
+
+    # Corrupt line links are common in live snapshots captured while a
+    # loader is modifying the BASIC area. Preserve the old bounded scan,
+    # now with the separator-tolerant parser.
+    if len(mem) > 0x0801:
+        return _target_after_token(mem[0x0801 : min(len(mem), 0x0830)])
     return None
 
 
@@ -664,3 +770,502 @@ def detect_polymorphic(insns: dict[int, dict[str, Any]]) -> list[dict[str, Any]]
                 "note": "indexed store into program RAM — possible decrypt loop",
             })
     return findings
+
+
+# --------------------------------------------------------------------------- #
+# Operand classification (shared by data-refs, counters, idioms) — tracker 3.4
+# --------------------------------------------------------------------------- #
+
+# Mnemonic → memory-access class. RMW instructions read-modify-write their
+# operand; loads/compares read; stores write.
+_LOAD_MNEMONICS = frozenset({
+    "lda", "ldx", "ldy", "cmp", "cpx", "cpy", "bit",
+    "and", "ora", "eor", "adc", "sbc",
+})
+_RMW_MNEMONICS = frozenset({"inc", "dec", "asl", "lsr", "rol", "ror"})
+# Reuse STORE_MNEMONICS for writes.
+
+_OPERAND_RE = re.compile(
+    r"^(?P<indir>\()?"
+    r"(?:#)?(?P<imm>#)?"          # placeholder — immediates handled below
+    r"0x(?P<addr>[0-9a-fA-F]{1,4})"
+    r"(?P<indir_close>\))?"
+    r"(?:\s*,\s*(?P<index>[xyXY]))?"
+    r"(?P<post_close>\))?"
+    r"(?:\s*,\s*(?P<post_index>[xyXY]))?"
+    r"\s*$"
+)
+_IMMEDIATE_RE = re.compile(r"^#0x[0-9a-fA-F]{1,2}\s*$")
+
+
+def classify_operand(op_str: str) -> dict[str, Any] | None:
+    """Parse a Capstone MOS65XX operand into memory-reference facts.
+
+    Returns ``{addr, index, indirect}`` for memory operands, or ``None``
+    for immediates / accumulator / unparseable operands. ``index`` is
+    ``"x"``/``"y"``/``None``; ``indirect`` is True for ``(zp),y`` /
+    ``(zp,x)`` / ``(abs)`` forms.
+    """
+    s = (op_str or "").strip()
+    if not s or s.lower() == "a":
+        return None
+    if _IMMEDIATE_RE.match(s):
+        return None
+
+    indirect = s.startswith("(")
+    # Normalise: strip one layer of parens for the address extraction.
+    core = s
+    m = re.match(
+        r"^\(?\s*0x(?P<addr>[0-9a-fA-F]{1,4})\s*"
+        r"(?:,\s*(?P<xin>[xyXY]))?\s*\)?"
+        r"(?:\s*,\s*(?P<yout>[xyXY]))?\s*$",
+        core,
+    )
+    if not m:
+        return None
+    addr = int(m.group("addr"), 16)
+    index = (m.group("xin") or m.group("yout") or "").lower() or None
+    return {"addr": addr, "index": index, "indirect": indirect}
+
+
+def _access_kind(mnem: str) -> str | None:
+    m = mnem.lower()
+    if m in STORE_MNEMONICS:
+        return "w"
+    if m in _RMW_MNEMONICS:
+        return "rmw"
+    if m in _LOAD_MNEMONICS:
+        return "r"
+    return None
+
+
+def _insn_stream(insns: dict[int, dict[str, Any]]) -> list[dict[str, Any]]:
+    """Normalise a recursive_disasm `insns` dict into a sorted list.
+
+    Accepts int-keyed or ``$XXXX``-keyed dicts; each value carries
+    ``mnemonic`` and ``op_str``.
+    """
+    out: list[dict[str, Any]] = []
+    for k, v in insns.items():
+        addr = k if isinstance(k, int) else int(str(k).lstrip("$"), 16)
+        out.append({
+            "addr": addr,
+            "mnemonic": str(v.get("mnemonic") or "").lower(),
+            "op_str": str(v.get("op_str") or ""),
+        })
+    out.sort(key=lambda r: r["addr"])
+    return out
+
+
+def extract_data_refs(
+    insns: dict[int, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Every memory-operand reference in a disassembled stream (tracker 3.4).
+
+    Returns rows ``{src, dst, access, index, indirect}`` — the data-flow
+    counterpart to the control-flow xref graph. ``access`` ∈ {r, w, rmw}.
+    """
+    refs: list[dict[str, Any]] = []
+    for ins in _insn_stream(insns):
+        access = _access_kind(ins["mnemonic"])
+        if access is None:
+            continue
+        parsed = classify_operand(ins["op_str"])
+        if parsed is None:
+            continue
+        refs.append({
+            "src": ins["addr"],
+            "dst": parsed["addr"],
+            "access": access,
+            "index": parsed["index"],
+            "indirect": parsed["indirect"],
+        })
+    return refs
+
+
+# --------------------------------------------------------------------------- #
+# Game-state variable heuristics — tracker 3.3
+# --------------------------------------------------------------------------- #
+
+_SCREEN_RAM = range(0x0400, 0x07E8)
+
+
+def find_counters(
+    insns: dict[int, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Heuristically locate game-state variables in a disassembled stream.
+
+    `find_loops` finds control flow; nothing found *state*. 6502 game-state
+    idioms are regular and cheap to scan (tracker 3.3):
+
+    - ``DEC abs`` into RAM (< $D000, >= $0002) → lives/timer (DEC weighted
+      higher for "lives"); ``INC abs`` → counter/timer.
+    - ``SED … ADC/SBC … CLD`` clusters → BCD score arithmetic; the
+      addresses stored between SED and CLD are score bytes.
+    - stores into screen RAM ($0400–$07E7) preceded by ``ORA/ADC #$30`` →
+      HUD digit rendering.
+    - ``CMP #$0A`` shortly after ``INC abs`` → decimal rollover, marks
+      multi-byte counters.
+
+    Returns ONE candidate per address: ``{addr, address, kind, score,
+    alias_kinds, evidence, sites}`` where ``kind`` is the highest-scoring
+    interpretation for that address and ``alias_kinds`` lists the other
+    interpretations the same site matched (so a single ``DEC`` no longer
+    produces two competing first-class candidates — tracker 3.3
+    hardening). ``kind`` ∈ {lives, timer, counter, score, hud_digit,
+    multibyte_counter}.
+    """
+    stream = _insn_stream(insns)
+    by_addr: dict[tuple[int, str], dict[str, Any]] = {}
+
+    def bump(addr: int, kind: str, score: float, evidence: str,
+             site: int) -> None:
+        key = (addr, kind)
+        row = by_addr.get(key)
+        if row is None:
+            row = {"addr": addr, "kind": kind, "score": 0.0,
+                   "evidence": [], "sites": []}
+            by_addr[key] = row
+        row["score"] += score
+        if evidence not in row["evidence"]:
+            row["evidence"].append(evidence)
+        if site not in row["sites"]:
+            row["sites"].append(site)
+
+    # --- DEC/INC absolute RAM counters ---
+    for ins in stream:
+        mnem = ins["mnemonic"]
+        if mnem not in ("dec", "inc"):
+            continue
+        parsed = classify_operand(ins["op_str"])
+        if parsed is None or parsed["indirect"]:
+            continue
+        addr = parsed["addr"]
+        if not (0x0002 <= addr < 0xD000):
+            continue
+        if mnem == "dec":
+            bump(addr, "lives", 12.0,
+                 f"DEC ${addr:04X} at ${ins['addr']:04X}", ins["addr"])
+            bump(addr, "timer", 4.0,
+                 f"DEC ${addr:04X} at ${ins['addr']:04X}", ins["addr"])
+        else:
+            bump(addr, "counter", 8.0,
+                 f"INC ${addr:04X} at ${ins['addr']:04X}", ins["addr"])
+            bump(addr, "timer", 4.0,
+                 f"INC ${addr:04X} at ${ins['addr']:04X}", ins["addr"])
+
+    # --- SED … CLD BCD-score clusters ---
+    in_bcd = False
+    bcd_start = 0
+    for ins in stream:
+        if ins["mnemonic"] == "sed":
+            in_bcd = True
+            bcd_start = ins["addr"]
+            continue
+        if ins["mnemonic"] == "cld":
+            in_bcd = False
+            continue
+        if in_bcd and ins["mnemonic"] in STORE_MNEMONICS:
+            parsed = classify_operand(ins["op_str"])
+            if parsed and not parsed["indirect"] and 0x0002 <= parsed["addr"] < 0xD000:
+                bump(parsed["addr"], "score", 18.0,
+                     f"store inside SED…CLD (from ${bcd_start:04X})",
+                     ins["addr"])
+
+    # --- HUD digit rendering: ORA/ADC #$30 then STA screen RAM ---
+    for i, ins in enumerate(stream):
+        if ins["mnemonic"] not in ("ora", "adc"):
+            continue
+        if not _IMMEDIATE_RE.match(ins["op_str"].strip()):
+            continue
+        if "0x30" not in ins["op_str"]:
+            continue
+        # Look ahead a few instructions for a store into screen RAM.
+        for nxt in stream[i + 1:i + 6]:
+            if nxt["mnemonic"] in STORE_MNEMONICS:
+                parsed = classify_operand(nxt["op_str"])
+                if parsed and parsed["addr"] in _SCREEN_RAM:
+                    bump(parsed["addr"], "hud_digit", 10.0,
+                         f"#$30 digit at ${ins['addr']:04X} → "
+                         f"STA ${parsed['addr']:04X}", nxt["addr"])
+                    break
+
+    # --- CMP #$0A soon after INC abs: decimal-rollover multibyte counter ---
+    last_inc: tuple[int, int] | None = None  # (addr_var, site)
+    for ins in stream:
+        if ins["mnemonic"] == "inc":
+            parsed = classify_operand(ins["op_str"])
+            if parsed and not parsed["indirect"]:
+                last_inc = (parsed["addr"], ins["addr"])
+            continue
+        if (
+            ins["mnemonic"] == "cmp"
+            and last_inc is not None
+            and "0x0a" in ins["op_str"].lower()
+            and ins["addr"] - last_inc[1] <= 8
+        ):
+            # Weighted above a bare INC counter (8.0) so the more
+            # specific rollover interpretation wins the primary kind.
+            bump(last_inc[0], "multibyte_counter", 14.0,
+                 f"INC ${last_inc[0]:04X} then CMP #$0A at ${ins['addr']:04X}",
+                 ins["addr"])
+            last_inc = None
+
+    # Collapse to ONE candidate per address: keep the highest-scoring
+    # kind as primary, fold the rest into `alias_kinds` (their evidence
+    # merged in). Prevents e.g. a single DEC emitting both a lives and a
+    # timer candidate as equal first-class rows (tracker 3.3 hardening).
+    per_addr: dict[int, dict[str, Any]] = {}
+    for row in by_addr.values():
+        addr = row["addr"]
+        cur = per_addr.get(addr)
+        if cur is None or row["score"] > cur["score"]:
+            if cur is not None:
+                row.setdefault("alias_kinds", [])
+                row["alias_kinds"] = sorted(
+                    set(row.get("alias_kinds", []))
+                    | {cur["kind"], *cur.get("alias_kinds", [])}
+                )
+                for ev in cur["evidence"]:
+                    if ev not in row["evidence"]:
+                        row["evidence"].append(ev)
+            per_addr[addr] = row
+        else:
+            cur.setdefault("alias_kinds", [])
+            if row["kind"] not in cur["alias_kinds"]:
+                cur["alias_kinds"].append(row["kind"])
+                cur["alias_kinds"].sort()
+            for ev in row["evidence"]:
+                if ev not in cur["evidence"]:
+                    cur["evidence"].append(ev)
+
+    out = sorted(per_addr.values(), key=lambda r: -r["score"])
+    for r in out:
+        r["score"] = round(r["score"], 1)
+        r["address"] = f"${r['addr']:04X}"
+        r.setdefault("alias_kinds", [])
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Deterministic 6502 idiom pre-tagging — tracker 3.5
+# --------------------------------------------------------------------------- #
+
+def find_idioms(
+    insns: dict[int, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Table-driven recognition of rigid 6502 idioms (tracker 3.5).
+
+    Most idioms have byte/structure signatures a matcher can pre-tag with
+    high precision, so Layer-1 confirms rather than discovers. Recognises:
+    raster wait, busy-wait delay, memcpy, jump-table dispatch, KERNAL
+    trampoline, SID music tick. Returns ``{addr, idiom, evidence}`` rows.
+    """
+    stream = _insn_stream(insns)
+    n = len(stream)
+    found: list[dict[str, Any]] = []
+
+    def at(i: int) -> dict[str, Any] | None:
+        return stream[i] if 0 <= i < n else None
+
+    for i, ins in enumerate(stream):
+        mnem = ins["mnemonic"]
+        op = ins["op_str"].lower()
+
+        # KERNAL trampoline: JMP $FFxx (or JSR into KERNAL jump table).
+        if mnem in ("jmp", "jsr"):
+            tgt = parse_direct_target(ins["op_str"])
+            if tgt is not None and 0xFF00 <= tgt <= 0xFFFF:
+                found.append({
+                    "addr": ins["addr"], "idiom": "kernal_trampoline",
+                    "evidence": f"{mnem.upper()} ${tgt:04X}",
+                })
+
+        # Raster wait: LDA $D011/$D012 ; CMP #imm ; BNE/BCC back.
+        if mnem == "lda":
+            parsed = classify_operand(ins["op_str"])
+            if parsed and parsed["addr"] in _RASTER_ADDRS:
+                nxt, nxt2 = at(i + 1), at(i + 2)
+                if (nxt and nxt["mnemonic"] in ("cmp", "and", "bit")
+                        and nxt2 and nxt2["mnemonic"] in
+                        ("bne", "bcc", "bcs", "beq")):
+                    found.append({
+                        "addr": ins["addr"], "idiom": "raster_wait",
+                        "evidence": (
+                            f"LDA ${parsed['addr']:04X} ; "
+                            f"{nxt['mnemonic'].upper()} ; "
+                            f"{nxt2['mnemonic'].upper()}"
+                        ),
+                    })
+
+        # Busy-wait delay: DEX/DEY ; BNE (self-loop).
+        if mnem in ("dex", "dey"):
+            nxt = at(i + 1)
+            if nxt and nxt["mnemonic"] == "bne":
+                tgt = parse_direct_target(nxt["op_str"])
+                if tgt is not None and tgt <= ins["addr"]:
+                    found.append({
+                        "addr": ins["addr"], "idiom": "delay_loop",
+                        "evidence": f"{mnem.upper()} ; BNE ${tgt:04X}",
+                    })
+
+        # memcpy: LDA abs,X ; STA abs,X ; (INX/DEX) ; BNE.
+        if mnem == "lda":
+            p0 = classify_operand(ins["op_str"])
+            nxt = at(i + 1)
+            if p0 and p0["index"] == "x" and nxt and nxt["mnemonic"] == "sta":
+                p1 = classify_operand(nxt["op_str"])
+                nxt2, nxt3 = at(i + 2), at(i + 3)
+                if (p1 and p1["index"] == "x"
+                        and nxt2 and nxt2["mnemonic"] in ("inx", "dex")
+                        and nxt3 and nxt3["mnemonic"] == "bne"):
+                    found.append({
+                        "addr": ins["addr"], "idiom": "memcpy",
+                        "evidence": (
+                            f"LDA ${p0['addr']:04X},X ; "
+                            f"STA ${p1['addr']:04X},X ; "
+                            f"{nxt2['mnemonic'].upper()} ; BNE"
+                        ),
+                    })
+
+        # Jump-table dispatch: ASL ; TAX ; ... ; JMP ($XXXX).
+        if mnem == "asl":
+            nxt = at(i + 1)
+            if nxt and nxt["mnemonic"] in ("tax", "tay"):
+                for j in range(i + 2, min(i + 8, n)):
+                    cand = stream[j]
+                    if cand["mnemonic"] == "jmp" and cand["op_str"].strip().startswith("("):
+                        found.append({
+                            "addr": ins["addr"], "idiom": "jump_table",
+                            "evidence": (
+                                f"ASL ; {nxt['mnemonic'].upper()} ; "
+                                f"JMP {to_c64(cand['op_str'])}"
+                            ),
+                        })
+                        break
+
+    # SID music tick: >=3 stores into $D400-$D418 within a short window.
+    sid_stores = [
+        ins for ins in stream
+        if ins["mnemonic"] in STORE_MNEMONICS
+        and (lambda p: p and 0xD400 <= p["addr"] <= 0xD418)(
+            classify_operand(ins["op_str"]))
+    ]
+    if len(sid_stores) >= 3:
+        # Cluster by proximity (<= 64 bytes apart).
+        cluster: list[dict[str, Any]] = []
+        for ins in sid_stores:
+            if cluster and ins["addr"] - cluster[-1]["addr"] > 64:
+                if len(cluster) >= 3:
+                    found.append({
+                        "addr": cluster[0]["addr"], "idiom": "sid_tick",
+                        "evidence": f"{len(cluster)} SID register stores",
+                    })
+                cluster = []
+            cluster.append(ins)
+        if len(cluster) >= 3:
+            found.append({
+                "addr": cluster[0]["addr"], "idiom": "sid_tick",
+                "evidence": f"{len(cluster)} SID register stores",
+            })
+
+    found.sort(key=lambda r: r["addr"])
+    for r in found:
+        r["address"] = f"${r['addr']:04X}"
+    return found
+
+
+# --------------------------------------------------------------------------- #
+# Screen / colour RAM PETSCII decode — tracker 3.7
+# --------------------------------------------------------------------------- #
+
+def _screen_code_to_ascii(code: int) -> str | None:
+    """C64 screen code → ASCII (printable subset), or None.
+
+    Screen code $00 is the ``@`` glyph, but it is also the value of
+    uninitialised/zeroed RAM, so a raw dump's blank screen would decode
+    to ``@@@@…`` noise. We treat $00 as padding (None); the rare literal
+    ``@`` in HUD text is an acceptable loss versus false-positive runs.
+    """
+    c = code & 0x7F  # ignore the reverse-video bit
+    if c == 0x00:
+        return None                   # padding (see docstring)
+    if 0x01 <= c <= 0x1A:
+        return chr(c + 0x40)          # A–Z
+    if 0x1B <= c <= 0x1F:
+        return chr(c + 0x40)          # [ \ ] ^ _
+    if 0x20 <= c <= 0x3F:
+        return chr(c)                 # space ! " … 0–9 : ; < = > ?
+    return None                       # graphics / non-printable
+
+
+def decode_screen_ram(
+    mem: bytes,
+    screen_base: int = 0x0400,
+    color_base: int = 0xD800,
+    *,
+    cols: int = 40,
+    rows: int = 25,
+    min_run: int = 3,
+) -> dict[str, Any]:
+    """Decode screen RAM to PETSCII strings (tracker 3.7).
+
+    Often answers "what does the HUD say / where is the score text?"
+    without vision or full RE. Returns per-row decoded text plus a list
+    of printable runs ``{addr, row, col, text}`` at least ``min_run``
+    chars long. ``color_base`` is accepted for API symmetry (colour RAM
+    doesn't change the glyphs, only their colour).
+    """
+    size = cols * rows
+    if screen_base + size > len(mem):
+        screen_data = bytes(mem[screen_base:len(mem)])
+    else:
+        screen_data = bytes(mem[screen_base:screen_base + size])
+
+    row_texts: list[str] = []
+    runs: list[dict[str, Any]] = []
+    for r in range(rows):
+        line_chars: list[str] = []
+        run_start_col: int | None = None
+        run_chars: list[str] = []
+
+        def flush_run(end_col: int) -> None:
+            nonlocal run_start_col, run_chars
+            if run_start_col is not None and len(run_chars) >= min_run:
+                text = "".join(run_chars).rstrip()
+                if len(text) >= min_run and text.strip():
+                    addr = screen_base + r * cols + run_start_col
+                    runs.append({
+                        "addr": addr, "addr_hex": f"${addr:04X}",
+                        "row": r, "col": run_start_col, "text": text,
+                    })
+            run_start_col = None
+            run_chars = []
+
+        for c in range(cols):
+            idx = r * cols + c
+            if idx >= len(screen_data):
+                break
+            ch = _screen_code_to_ascii(screen_data[idx])
+            if ch is None or ch == " ":
+                line_chars.append(" ")
+                # A single space breaks a run only if it's trailing; keep
+                # internal spaces so "HI SCORE" stays one run.
+                if ch == " " and run_start_col is not None:
+                    run_chars.append(" ")
+                else:
+                    flush_run(c)
+            else:
+                line_chars.append(ch)
+                if run_start_col is None:
+                    run_start_col = c
+                run_chars.append(ch)
+        flush_run(cols)
+        row_texts.append("".join(line_chars).rstrip())
+
+    return {
+        "screen_base": f"${screen_base:04X}",
+        "color_base": f"${color_base:04X}",
+        "rows": row_texts,
+        "runs": runs,
+    }

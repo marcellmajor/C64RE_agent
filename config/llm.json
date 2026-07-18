@@ -31,7 +31,8 @@
     "planner": {
       "provider": "anthropic",
       "model": "claude-opus-4-8",
-      "temperature": 0.2
+      "temperature": 0.2,
+      "max_tokens": 8192
     },
     "executor": {
       "provider": "openai",
@@ -47,7 +48,8 @@
     "analyst": {
       "provider": "gemini",
       "model": "gemini-pro-latest",
-      "temperature": 0.2
+      "temperature": 0.2,
+      "max_tokens": 8192
     },
     "critic": {
       "provider": "gemini",
@@ -65,6 +67,27 @@
       "model": "grok-4.5",
       "temperature": 0.3,
       "reasoning_effort": "medium"
+    },
+    "vision": {
+      "provider": "gemini",
+      "model": "gemini-pro-latest",
+      "temperature": 0.1,
+      "max_tokens": 2048
+    }
+  },
+  "tools": {
+    "tavily": {
+      "include_domains": [
+        "csdb.dk",
+        "codebase64.org",
+        "lemon64.com",
+        "gamebase64.com",
+        "archive.org",
+        "forum64.de",
+        "c64-wiki.com"
+      ],
+      "search_depth": "advanced",
+      "max_results": 5
     }
   },
   "defaults": {

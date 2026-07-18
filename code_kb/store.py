@@ -31,6 +31,7 @@ from typing import Any, Iterable
 from code_kb.schema import (
     ANN_ASM_DOC,
     ANN_CLASSIFY,
+    ANN_DATAREF,
     ANN_DISASM,
     ANN_GROUP,
     ANN_HYPOTHESIS,
@@ -475,6 +476,9 @@ class CodeKnowledgeStore:
         labels = self._db.execute(
             "SELECT COUNT(*) AS n FROM code_labels"
         ).fetchone()["n"]
+        data_refs = self._db.execute(
+            "SELECT COUNT(*) AS n FROM code_data_refs"
+        ).fetchone()["n"]
         return {
             "events_total": int(events_total),
             "annotations_by_layer": {int(k): int(v) for k, v in by_layer.items()},
@@ -482,6 +486,7 @@ class CodeKnowledgeStore:
             "routines": int(routines),
             "xrefs": int(xrefs),
             "smc_sites": int(smcs),
+            "data_refs": int(data_refs),
             "instructions": int(insns),
             "asm_docs": int(asm_docs_total),
             "labels": int(labels),
@@ -645,7 +650,7 @@ class CodeKnowledgeStore:
         assert self._db is not None
         for table in ("code_routines", "code_labels", "instructions",
                       "hypotheses", "code_xrefs", "code_smc_sites",
-                      "code_class"):
+                      "code_class", "code_data_refs"):
             self._db.execute(f"DELETE FROM {table}")  # noqa: S608 — fixed tuple
         rows = self._db.execute(
             "SELECT id, layer, kind, start_addr, end_addr, producer,"
@@ -770,6 +775,33 @@ class CodeKnowledgeStore:
                         source_file,
                         ann_id,
                     ),
+                )
+
+        elif kind == ANN_DATAREF:
+            # Per-(ref, source) dedup, NULL-safe — mirrors xref/SMC so
+            # invalidating one source keeps another's data refs (3.4).
+            dst = payload_inner.get("dst_addr")
+            if isinstance(dst, int):
+                dr = (
+                    int(payload_inner.get("src_addr") or start_addr) & 0xFFFF,
+                    int(dst) & 0xFFFF,
+                    str(payload_inner.get("access") or "r"),
+                    payload_inner.get("index"),
+                    1 if payload_inner.get("indirect") else 0,
+                    source_file,
+                    ann_id,
+                )
+                self._db.execute(
+                    "INSERT INTO code_data_refs"
+                    " (src_addr, dst_addr, access, index_reg, indirect,"
+                    "  source_file, annotation_id)"
+                    " SELECT ?, ?, ?, ?, ?, ?, ?"
+                    " WHERE NOT EXISTS ("
+                    "   SELECT 1 FROM code_data_refs"
+                    "   WHERE src_addr = ? AND dst_addr = ? AND access = ?"
+                    "     AND index_reg IS ? AND source_file IS ?"
+                    " )",
+                    dr + (dr[0], dr[1], dr[2], dr[3], source_file),
                 )
 
         elif kind == ANN_LABEL:
