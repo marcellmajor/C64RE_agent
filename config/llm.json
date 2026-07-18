@@ -22,12 +22,6 @@
     }
   },
   "agents": {
-    "coordinator": {
-      "provider": "grok",
-      "model": "grok-4.5",
-      "temperature": 0.1,
-      "reasoning_effort": "low"
-    },
     "planner": {
       "provider": "anthropic",
       "model": "claude-opus-4-8",
@@ -49,30 +43,28 @@
       "provider": "gemini",
       "model": "gemini-pro-latest",
       "temperature": 0.2,
-      "max_tokens": 8192
+      "max_tokens": 8192,
+      "reasoning_effort": "low"
     },
     "critic": {
       "provider": "gemini",
       "model": "gemini-pro-latest",
-      "temperature": 0.1
+      "temperature": 0.1,
+      "max_tokens": 8192,
+      "reasoning_effort": "low"
     },
     "curator": {
       "provider": "grok",
       "model": "grok-4.5",
       "temperature": 0.2,
-      "reasoning_effort": "none"
-    },
-    "researcher": {
-      "provider": "grok",
-      "model": "grok-4.5",
-      "temperature": 0.3,
-      "reasoning_effort": "medium"
+      "reasoning_effort": "low"
     },
     "vision": {
       "provider": "gemini",
       "model": "gemini-pro-latest",
       "temperature": 0.1,
-      "max_tokens": 2048
+      "max_tokens": 2048,
+      "reasoning_effort": "low"
     }
   },
   "tools": {
@@ -90,9 +82,28 @@
       "max_results": 5
     }
   },
+  "pricing": {
+    "claude-opus-4-8": {
+      "input_per_mtok": 5.0,
+      "output_per_mtok": 25.0
+    },
+    "gpt-5.5": {
+      "input_per_mtok": 10.0,
+      "output_per_mtok": 45.0
+    },
+    "grok-4.5": {
+      "input_per_mtok": 4.0,
+      "output_per_mtok": 12.0
+    },
+    "gemini-pro-latest": {
+      "input_per_mtok": 4.0,
+      "output_per_mtok": 18.0
+    }
+  },
   "defaults": {
     "max_tokens": 4096,
     "timeout_s": 120,
-    "retries": 3
+    "retries": 3,
+    "structured_output": false
   }
 }

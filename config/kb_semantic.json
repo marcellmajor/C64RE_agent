@@ -1,6 +1,6 @@
 {
   "enabled": false,
-  "comment": "Set enabled=true once OPENAI_API_KEY (or embedding_api_key_provider) resolves. index_event_kinds controls which KB event kinds produce embedding rows; omit tool_result unless you accept extra noise/cost.",
+  "comment": "Set enabled=true once the selected embedding provider resolves. Vectors persist in sessions/<game>/kb/vectors.sqlite and only content/model cache misses are embedded. index_event_kinds controls which KB event kinds produce rows; omit tool_result unless you accept extra noise/cost.",
 
   "use_llm_provider": "executor",
   "embedding_model": "text-embedding-3-small",

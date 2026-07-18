@@ -472,6 +472,11 @@ def _score_loop(mem: bytes, top: int, end: int, insns: list[dict],
     if span > 0x2000:
         score -= 20.0
 
+    jsr_targets = {
+        int(i["target"])
+        for i in inside
+        if i["mnemonic"] == "jsr" and i.get("target") is not None
+    }
     jsr_n = sum(1 for i in inside if i["mnemonic"] == "jsr")
     if jsr_n >= 8:
         score += 40.0; reasons.append(f"{jsr_n} JSR calls (game-loop signal)")
@@ -479,6 +484,12 @@ def _score_loop(mem: bytes, top: int, end: int, insns: list[dict],
         score += 20.0; reasons.append(f"{jsr_n} JSR calls")
     elif jsr_n >= 2:
         score += 8.0; reasons.append(f"{jsr_n} JSR calls")
+    if len(jsr_targets) >= 4:
+        score += 12.0
+        reasons.append(f"{len(jsr_targets)} distinct subroutines")
+    elif len(jsr_targets) >= 2:
+        score += 5.0
+        reasons.append(f"{len(jsr_targets)} distinct subroutines")
 
     raster = joy = vic = sid = False
     for i in inside:
@@ -508,6 +519,20 @@ def _score_loop(mem: bytes, top: int, end: int, insns: list[dict],
             if top <= i["target"] < i["addr"]:
                 score += 10.0
                 reasons.append(f"backward JMP to ${i['target']:04X}")
+        elif (
+            i["mnemonic"] in BRANCH_MNEMONICS
+            and i["target"] is not None
+            and i["target"] == top
+        ):
+            score += 12.0
+            reasons.append(
+                f"closes loop with {i['mnemonic'].upper()} ${top:04X}",
+            )
+            break
+
+    if span <= 0x20 and not (jsr_n or raster or joy or vic or sid):
+        score -= 15.0
+        reasons.append("tight loop without calls or C64 I/O (delay/polling penalty)")
 
     if 0x0800 <= top <= 0xCFFF:
         score += 10.0
@@ -524,6 +549,55 @@ def _score_loop(mem: bytes, top: int, end: int, insns: list[dict],
     return score, reasons
 
 
+def _loop_metrics(
+    top: int, end: int, insns: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Explain a candidate with deterministic, machine-readable signals."""
+    inside = [instruction for instruction in insns if top <= instruction["addr"] <= end]
+    jsr_targets = sorted({
+        int(instruction["target"]) & 0xFFFF
+        for instruction in inside
+        if instruction["mnemonic"] == "jsr"
+        and instruction.get("target") is not None
+    })
+    touched: set[str] = set()
+    for instruction in inside:
+        target = instruction.get("target")
+        if target is None:
+            match = re.match(r"^(0x[0-9a-fA-F]{1,4})", instruction["op_str"])
+            if match:
+                target = int(match.group(1), 16)
+        if target in _RASTER_ADDRS:
+            touched.add("raster")
+        if target in _JOY_ADDRS:
+            touched.add("input")
+        if target in _VIC_RANGE:
+            touched.add("vic")
+        if target in _SID_RANGE:
+            touched.add("sid")
+    returns = sorted({
+        instruction["mnemonic"].upper()
+        for instruction in inside
+        if instruction["mnemonic"] in RETURN_MNEMONICS
+    })
+    return {
+        "span_bytes": max(0, end - top + 1),
+        "instruction_count": len(inside),
+        "jsr_count": sum(1 for i in inside if i["mnemonic"] == "jsr"),
+        "distinct_jsr_targets": [f"${target:04X}" for target in jsr_targets],
+        "c64_io_signals": sorted(touched),
+        "returns": returns,
+    }
+
+
+def _loop_candidate_type(default: str, metrics: dict[str, Any]) -> str:
+    if default == "irq_handler" or "RTI" in metrics.get("returns", []):
+        return "irq_handler"
+    if metrics.get("jsr_count") or metrics.get("c64_io_signals"):
+        return "main_loop"
+    return default
+
+
 def find_loops(mem: bytes, top_n: int = 8) -> list[dict[str, Any]]:
     """Return up to top_n game-loop candidates, ranked by score desc.
 
@@ -534,12 +608,31 @@ def find_loops(mem: bytes, top_n: int = 8) -> list[dict[str, Any]]:
     bank = banking_state(mem)
     ram_under_kernal = bank["ram_under_kernal"]
     scan_hi = 0xFFF0 if ram_under_kernal else 0xCFFF
-    candidates: dict[int, tuple[float, list[str]]] = {}
+    candidates: dict[int, dict[str, Any]] = {}
 
-    def add(addr: int, score: float, reasons: list[str]) -> None:
+    def add(
+        addr: int,
+        score: float,
+        reasons: list[str],
+        *,
+        end: int,
+        insns: list[dict[str, Any]],
+        source: str,
+        candidate_type: str,
+    ) -> None:
         prev = candidates.get(addr)
-        if prev is None or score > prev[0]:
-            candidates[addr] = (score, reasons)
+        metrics = _loop_metrics(addr, end, insns)
+        row = {
+            "address": f"${addr:04X}",
+            "end": f"${end:04X}",
+            "score": round(score, 1),
+            "reasons": reasons,
+            "source": source,
+            "candidate_type": _loop_candidate_type(candidate_type, metrics),
+            "metrics": metrics,
+        }
+        if prev is None or score > float(prev["score"]):
+            candidates[addr] = row
 
     cs = _make_cs()
 
@@ -551,7 +644,13 @@ def find_loops(mem: bytes, top_n: int = 8) -> list[dict[str, Any]]:
                            ram_under_kernal)
         s += 15.0
         r.insert(0, "RAM IRQ vector $0314")
-        add(irq, s, r)
+        add(
+            irq, s, r,
+            end=ins[-1]["addr"] if ins else irq,
+            insns=ins,
+            source="ram_irq_vector",
+            candidate_type="irq_handler",
+        )
 
     # Heuristic 2: backward JMP scan
     seen: set[int] = set()
@@ -563,15 +662,25 @@ def find_loops(mem: bytes, top_n: int = 8) -> list[dict[str, Any]]:
             addr += 1
             continue
         ins = decoded[0]
-        if ins.mnemonic == "jmp":
+        mnemonic = ins.mnemonic.lower()
+        if mnemonic == "jmp" or mnemonic in BRANCH_MNEMONICS:
             tgt = parse_direct_target(ins.op_str)
             if tgt and 0x0800 <= tgt < addr and tgt not in seen:
                 seen.add(tgt)
-                if 8 <= addr - tgt <= 0x2000:
+                max_span = 0x2000 if mnemonic == "jmp" else 0x0100
+                if 8 <= addr - tgt <= max_span:
                     block = _quick_disasm_stream(mem, tgt, 512)
                     s, r = _score_loop(mem, tgt, addr, block, ram_under_kernal)
                     if s > 0:
-                        add(tgt, s, r)
+                        add(
+                            tgt, s, r,
+                            end=addr,
+                            insns=block,
+                            source=("backward_jmp" if mnemonic == "jmp"
+                                    else "backward_branch"),
+                            candidate_type=("tight_loop" if mnemonic == "jmp"
+                                            else "branch_loop"),
+                        )
         addr += len(decoded[0].bytes)
 
     # Heuristic 3: BASIC SYS bootstrap
@@ -595,15 +704,19 @@ def find_loops(mem: bytes, top_n: int = 8) -> list[dict[str, Any]]:
                 s, r = _score_loop(mem, tgt, chain, block, ram_under_kernal)
                 s += 20.0
                 r.insert(0, "first backward JMP in BASIC SYS init chain")
-                add(tgt, s, r)
+                add(
+                    tgt, s, r,
+                    end=chain,
+                    insns=block,
+                    source="basic_sys_init_chain",
+                    candidate_type="main_loop",
+                )
                 break
             chain += len(ins.bytes)
 
     ranked = sorted(
-        ({"address": f"${a:04X}", "score": round(s, 1), "reasons": rs}
-         for a, (s, rs) in candidates.items()),
-        key=lambda c: c["score"],
-        reverse=True,
+        candidates.values(),
+        key=lambda candidate: (-candidate["score"], candidate["address"]),
     )
     return ranked[:top_n]
 

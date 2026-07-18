@@ -36,6 +36,7 @@ from code_kb.store import Annotation, CodeKnowledgeStore, get_code_store
 from code_kb.disasm import disasm_capstone, disasm_vice
 from code_kb.exporters import export_commented_asm, export_vice_symbols
 from code_kb.call_graph import local_dot, routines_dot
+from code_kb.pseudocode import render_mechanical_pseudocode, translate_instruction
 from code_kb.scoping import (
     Scoping,
     candidate_dumps,
@@ -63,7 +64,9 @@ __all__ = [
     "game_tokens",
     "get_code_store",
     "local_dot",
+    "render_mechanical_pseudocode",
     "render_user_prompt",
     "routines_dot",
     "select_asm_files",
+    "translate_instruction",
 ]

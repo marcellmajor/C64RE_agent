@@ -6,10 +6,183 @@ LangGraph merges parallel/looped updates without clobbering history.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from operator import add
 from typing import Annotated, Any, TypedDict
 
 from langgraph.graph.message import add_messages
+
+
+# Tool outputs can be tens of kilobytes each. They are durably persisted in
+# the evidence KB by the synthesizer, so retaining an unlimited second copy in
+# every LangGraph checkpoint is both wasteful and eventually dangerous. Keep
+# enough BULKY state rows for the largest possible current plan (12 steps × two
+# attempts) plus a generous recent-history margin. Older rows remain as a
+# compact, unbounded status ledger so success/failure identity cannot roll out
+# from under dependency and retry decisions; persisted evidence stays
+# queryable from the KB by event id.
+TOOL_RESULTS_STATE_LIMIT = 96
+_TOOL_RESULTS_OP = "__c64re_tool_results_op__"
+_RESULT_ID_KEY = "_state_result_id"
+_EVENT_ID_KEY = "_event_id"
+_STATUS_ONLY_KEY = "_status_only"
+_STATUS_LEDGER_KEYS = frozenset({
+    _RESULT_ID_KEY,
+    _EVENT_ID_KEY,
+    _STATUS_ONLY_KEY,
+    "step_id",
+    "tool",
+    "ok",
+    "retryable",
+    "rejection",
+    "mode",
+    "method",
+})
+
+
+def _result_id_base(result: dict[str, Any]) -> str:
+    stable = {
+        key: value for key, value in result.items()
+        if key not in {_RESULT_ID_KEY, _EVENT_ID_KEY}
+    }
+    try:
+        raw = json.dumps(
+            stable, sort_keys=True, separators=(",", ":"), default=str,
+        )
+    except Exception:  # noqa: BLE001
+        raw = repr(stable)
+    return "tr_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
+
+
+def identify_tool_results(
+    results: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Return copies with deterministic, occurrence-safe state identities.
+
+    Tool retries can legitimately produce byte-for-byte identical results;
+    suffixing later occurrences keeps both attempts in the status ledger.
+    Existing ids survive checkpoint replay unchanged.
+    """
+    identified: list[dict[str, Any]] = []
+    used: set[str] = set()
+    for original in results or []:
+        result = dict(original)
+        candidate = str(result.get(_RESULT_ID_KEY) or _result_id_base(result))
+        result_id = candidate
+        suffix = 2
+        while result_id in used:
+            result_id = f"{candidate}_{suffix}"
+            suffix += 1
+        result[_RESULT_ID_KEY] = result_id
+        used.add(result_id)
+        identified.append(result)
+    return identified
+
+
+def compact_tool_results_update(
+    event_ids: dict[str, str],
+) -> dict[str, Any]:
+    """Build the reducer command used after results reach the evidence KB."""
+    return {_TOOL_RESULTS_OP: "compact", "event_ids": dict(event_ids)}
+
+
+def _compact_result(result: dict[str, Any], event_id: str) -> dict[str, Any]:
+    """Keep the execution ledger while dropping persisted bulky payloads."""
+    compact: dict[str, Any] = {
+        _RESULT_ID_KEY: result[_RESULT_ID_KEY],
+        _EVENT_ID_KEY: event_id,
+        "step_id": result.get("step_id"),
+        "tool": result.get("tool"),
+        "ok": bool(result.get("ok")),
+    }
+    for key in ("retryable", "rejection", "mode", "method"):
+        if key in result:
+            compact[key] = result[key]
+    if not result.get("ok"):
+        # The executor needs the last error to repair a retry. A bounded
+        # preview is sufficient; the complete result remains in the KB.
+        data = str(result.get("data", ""))
+        compact["data"] = data[:1_000] + ("…" if len(data) > 1_000 else "")
+    return compact
+
+
+def _status_only_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Drop payload fields but retain the durable execution identity."""
+    compact: dict[str, Any] = {
+        _RESULT_ID_KEY: result[_RESULT_ID_KEY],
+        _EVENT_ID_KEY: result.get(_EVENT_ID_KEY),
+        _STATUS_ONLY_KEY: True,
+        "step_id": result.get("step_id"),
+        "tool": result.get("tool"),
+        "ok": bool(result.get("ok")),
+        "retryable": result.get("retryable"),
+        "rejection": result.get("rejection"),
+    }
+    for key in ("mode", "method"):
+        if key in result:
+            compact[key] = result[key]
+    return compact
+
+
+def _has_bulky_payload(result: dict[str, Any]) -> bool:
+    return any(key not in _STATUS_LEDGER_KEYS for key in result)
+
+
+def reduce_tool_results(
+    current: list[dict[str, Any]] | None,
+    update: list[dict[str, Any]] | dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Append results while hard-bounding payloads, never status identity."""
+    rows = identify_tool_results(current)
+    if isinstance(update, dict) and update.get(_TOOL_RESULTS_OP) == "compact":
+        event_ids = {
+            str(key): str(value)
+            for key, value in (update.get("event_ids") or {}).items()
+            if value
+        }
+        rows = [
+            _compact_result(row, event_ids[row[_RESULT_ID_KEY]])
+            if row[_RESULT_ID_KEY] in event_ids
+            else row
+            for row in rows
+        ]
+    elif update:
+        incoming = update if isinstance(update, list) else [update]
+        rows = identify_tool_results([*rows, *incoming])
+    bulky = [index for index, row in enumerate(rows) if _has_bulky_payload(row)]
+    evict_payloads = set(bulky[:-TOOL_RESULTS_STATE_LIMIT])
+    return [
+        _status_only_result(row) if index in evict_payloads else row
+        for index, row in enumerate(rows)
+    ]
+
+
+def merge_tool_call_stats(
+    current: dict[str, dict[str, int]] | None,
+    update: dict[str, dict[str, int]] | None,
+) -> dict[str, dict[str, int]]:
+    """Add per-tool call/failure deltas without retaining their payloads."""
+    merged = {
+        str(tool): {
+            "calls": int(values.get("calls", 0)),
+            "failures": int(values.get("failures", 0)),
+        }
+        for tool, values in (current or {}).items()
+    }
+    for tool, values in (update or {}).items():
+        row = merged.setdefault(str(tool), {"calls": 0, "failures": 0})
+        row["calls"] += int(values.get("calls", 0))
+        row["failures"] += int(values.get("failures", 0))
+    return merged
+
+
+def tool_call_total(state: dict[str, Any]) -> int:
+    """Return the durable total, with legacy-state fallback."""
+    stats = state.get("tool_call_stats") or {}
+    if stats:
+        return sum(int(row.get("calls", 0)) for row in stats.values())
+    return len(state.get("tool_results") or [])
 
 
 class C64State(TypedDict, total=False):
@@ -49,7 +222,16 @@ class C64State(TypedDict, total=False):
     code_kb_handle: str | None
     plan: list[dict[str, Any]]
     current_step_id: str | None
-    tool_results: Annotated[list[dict[str, Any]], add]
+    # Two or more fresh read-only steps selected for native LangGraph Send
+    # fan-out. Each branch receives one `current_step_id`; VICE/mutating and
+    # enrichment/retry paths continue to use the scalar serial field only.
+    current_step_ids: list[str]
+    tool_results: Annotated[list[dict[str, Any]], reduce_tool_results]
+    # Exact counters survive raw-result eviction and keep reports/evaluations
+    # truthful even after the bounded state window rolls over.
+    tool_call_stats: Annotated[
+        dict[str, dict[str, int]], merge_tool_call_stats,
+    ]
 
     # --- analysis ---
     candidate_answer: dict[str, Any] | None
@@ -59,6 +241,10 @@ class C64State(TypedDict, total=False):
     # Question-relevant KB digest, refreshed by the synthesizer / curator
     # so the analyst and critic see the same evidence sheet.
     kb_digest: str
+    # Deterministic excerpts from the explicitly selected partial-assembly
+    # documents. Kept separately so parent-KB digest refreshes cannot erase
+    # the strongest static evidence before the analyst/critic run.
+    code_kb_digest: str
 
     # Snapshot of the *distinct substantive fact* count (bookkeeping
     # kinds excluded; failed tool attempts excluded; identity is stable
@@ -78,11 +264,12 @@ class C64State(TypedDict, total=False):
     # `plan_utils.normalize_truncated_state`.
     termination_reason: str | None
 
-    # Index into `tool_results` up to which the synthesizer has already
-    # considered results for LLM extraction. Results past this index are
-    # accumulated and extracted in one batched LLM call when the plan
-    # drains or the batch fills (tracker 1.2). `tool_results` only grows
-    # (its reducer is `add`), so an index high-water mark is stable.
+    # Stable identities of the bounded result window already considered for
+    # LLM extraction. Unlike the legacy numeric cursor, ids remain correct
+    # when the reducer evicts old rows from the front (tracker 4.8).
+    synth_processed_result_ids: list[str]
+    # Legacy migration/debug cursor. New code uses ids above; retaining this
+    # scalar lets old durable checkpoints migrate their already-seen prefix.
     synth_processed_count: int
 
     # --- control ---
@@ -96,6 +283,10 @@ class C64State(TypedDict, total=False):
     # Nodes return per-drain deltas; stays 0.0 when config/llm.json has
     # no "pricing" section (tokens are still tracked in `llm_usage`).
     budget_used: Annotated[float, add]
+    # Set when no role in an invocation chain can be called safely within
+    # the remaining worst-case reservation. The critic router terminates the
+    # run even though actual spend is still below the nominal USD cap.
+    budget_reservation_exhausted: bool
     # Accumulated total tokens (input+output) across all LLM calls —
     # the always-available budget fallback (`routers.token_budget()`)
     # so unpriced models still hit a runtime cap. Deliberately a

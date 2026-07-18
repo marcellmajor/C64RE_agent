@@ -82,6 +82,11 @@ def drain() -> list[dict[str, Any]]:
     return out
 
 
+def pending_cost_usd() -> float:
+    """Cost already incurred in the current, not-yet-drained node context."""
+    return sum(float(entry.get("cost_usd") or 0.0) for entry in _PENDING_VAR.get())
+
+
 def reset() -> None:
     """Explicitly clear this context's pending entries.
 

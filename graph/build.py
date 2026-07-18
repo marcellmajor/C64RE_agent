@@ -29,9 +29,9 @@ from graph.nodes import (
     write_report,
 )
 from graph.routers import (
+    dispatch_tools,
     post_curator_router,
     post_synth_router,
-    route_tool,
     verdict_router,
 )
 from graph.state import C64State
@@ -67,7 +67,7 @@ def build_graph() -> StateGraph:
     # bounded by MAX_ITERS; a completed plan routes to "synthesizer".
     builder.add_conditional_edges(
         "executor",
-        route_tool,
+        dispatch_tools,
         {
             "vice": "vice",
             "capstone": "capstone",

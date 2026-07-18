@@ -134,6 +134,15 @@ Tool argument cheat-sheet:
       vice.trace -> {address: "$XXXX", frames?} : watchpoint on address →
                         run → resolve the writing instruction + disasm it.
                         One call answers "how is $XXXX updated?".
+      vice.poke_verify -> {address: "$XXXX", value: 0..255,
+                        expect: "visible change", frames?: 0..60, bank?} : explicit
+                        single-byte visual experiment. Captures before/after,
+                        verifies same-bank write read-back, restores a full
+                        VICE snapshot in finally (byte fallback), and requires
+                        human mutation approval. Use only for a strong,
+                        dump-backed HUD hypothesis. `frames>0` requests an
+                        execution resume, but current vice-mcp does not bound
+                        that verb by frames; prefer 0 on a running session.
     BANNED steps (waste budget, produce no code facts — never emit these):
       vice.ping, vice.registers.get
       registers.get is ALWAYS banned as a standalone step (an `armed`
@@ -162,6 +171,16 @@ Tool argument cheat-sheet:
       routines -> {limit?, offset?, like?} : list code routines
       routine  -> {start: "$XXXX"} : full per-routine window incl.
                   callers, callees, SMC sites, hardware refs
+      pseudocode -> {start: "$XXXX"} : conservative one-instruction-to-one-line
+                  Layer-0 transliteration. Addresses stay attached; treat it
+                  as a reading aid, not inferred high-level source.
+      layer2   -> {limit?, role?, backup_roles?} : explicitly run a bounded
+                  global behaviour-grouping pass over verified routines.
+      groups   -> {limit?} : list stored Layer-2 groups (read-only).
+      layer3   -> {limit?, role?, backup_roles?} : explicitly run an
+                  adversarial pass over Layer-1/2 annotations; Layer 0 is
+                  immutable and unknown annotation ids are rejected.
+      critiques -> {limit?} : list stored Layer-3 critiques (read-only).
       xrefs_to   -> {addr: "$XXXX", limit?} : who calls/jumps to addr
       xrefs_from -> {addr: "$XXXX", end?: "$YYYY", limit?} : where
                     addr (or routine range) jumps/calls/branches
@@ -451,9 +470,8 @@ ROLE_BLOCKS: dict[str, str] = {
 def system_message(role: str) -> str:
     """Return master preamble + role-specific block.
 
-    Falls back to the master preamble alone for unknown roles
-    (e.g. ``coordinator``, ``researcher``) so they still operate within
-    the C64-RE contract.
+    Falls back to the master preamble alone for roles with a dedicated
+    non-text contract (currently the multimodal ``vision`` path).
     """
     block = ROLE_BLOCKS.get(role, "")
     return MASTER_PREAMBLE + block

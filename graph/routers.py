@@ -14,6 +14,7 @@ from __future__ import annotations
 from typing import Literal
 
 import os
+from langgraph.types import Send
 
 from graph.plan_utils import MAX_ITERS, pending_steps
 from graph.state import C64State
@@ -34,11 +35,31 @@ UNCOMPACTED_TOKEN_THRESHOLD = 40_000
 # finding 3): `budget_used` is estimated USD and only accrues when
 # config/llm.json has a "pricing" section; `tokens_used` always accrues,
 # so unpriced/unknown models still hit a runtime cap.
-BUDGET_CAP = 5.0  # USD (estimated; requires a pricing table to accrue)
+DEFAULT_BUDGET_CAP = 5.0  # USD
 
 # Fallback token cap: ~MAX_ITERS iterations of a busy plan at ~20k
 # tokens per LLM call stay well under this; a runaway loop does not.
 DEFAULT_TOKEN_BUDGET = 3_000_000
+
+
+def budget_cap() -> float:
+    """Resolve the estimated-USD cap: env → config default → constant."""
+    env = os.getenv("C64RE_USD_BUDGET", "").strip()
+    if env:
+        try:
+            value = float(env)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    try:
+        from graph.llm import load_config
+        value = (load_config().get("defaults") or {}).get("usd_budget")
+        if value is not None and float(value) > 0:
+            return float(value)
+    except (TypeError, ValueError, Exception):  # noqa: BLE001
+        pass
+    return DEFAULT_BUDGET_CAP
 
 
 def token_budget() -> int:
@@ -134,6 +155,44 @@ def route_tool(
     return "kb"
 
 
+def dispatch_tools(
+    state: C64State,
+) -> list[Send] | Literal[
+    "vice", "capstone", "tavily", "kb", "code_kb", "synthesizer", "planner",
+]:
+    """Route one serial step or fan out a selected read-only batch.
+
+    The executor is the policy owner: it populates ``current_step_ids`` only
+    for fresh, concrete, dependency-ready, read-only work. Each Send branch
+    receives the full state with one scalar step id, so existing tool nodes do
+    not need a parallel-only contract. Their reducer-backed deltas merge before
+    the shared synthesizer runs once.
+    """
+    step_ids = [str(step_id) for step_id in state.get("current_step_ids") or []]
+    if not step_ids:
+        return route_tool(state)
+
+    plan_by_id = {
+        str(step.get("id")): step for step in (state.get("plan") or [])
+    }
+    sends: list[Send] = []
+    for step_id in step_ids:
+        step = plan_by_id.get(step_id)
+        if step is None:
+            continue
+        tool = str(step.get("tool") or "kb")
+        if tool not in {"vice", "capstone", "tavily", "kb", "code_kb"}:
+            tool = "kb"
+        branch_state = dict(state)
+        branch_state["current_step_id"] = step_id
+        branch_state["current_step_ids"] = []
+        sends.append(Send(tool, branch_state))
+
+    # Defensive fallback for a stale/malformed batch state. Normal executor
+    # output always resolves at least two ids.
+    return sends or route_tool({**state, "current_step_ids": []})
+
+
 def post_synth_router(
     state: C64State,
 ) -> Literal["curate", "executor", "analyst"]:
@@ -152,7 +211,9 @@ def post_curator_router(state: C64State) -> Literal["executor", "analyst"]:
 def verdict_router(
     state: C64State,
 ) -> Literal["accept", "revise", "replan", "budget_exceeded"]:
-    if state.get("budget_used", 0.0) >= BUDGET_CAP:
+    if state.get("budget_reservation_exhausted"):
+        return "budget_exceeded"
+    if state.get("budget_used", 0.0) >= budget_cap():
         return "budget_exceeded"
     if int(state.get("tokens_used", 0) or 0) >= token_budget():
         return "budget_exceeded"

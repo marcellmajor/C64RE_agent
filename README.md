@@ -11,7 +11,7 @@ Built with [LangGraph](https://github.com/langchain-ai/langgraph) and [LangChain
 Given a game name, a research question, and a 64 KB memory dump (plus optional disassembly files and human notes), the agent:
 
 1. **Plans** a sequence of investigative steps ordered from cheapest to most expensive.
-2. **Executes** each step by calling tools: static disassembly (Capstone), live emulator introspection (VICE MCP), and web search (Tavily).
+2. **Executes** each step by calling tools: static disassembly (Capstone), live emulator introspection (VICE MCP), and web search (Tavily). Up to four dependency-ready, read-only calls may fan out concurrently; mutations, retries, and LLM-backed Code-KB writes stay serial.
 3. **Synthesises** raw tool output into a typed knowledge base — labelled addresses, named routines, cross-references, hypotheses.
 4. **Analyses** the accumulated KB to produce a candidate answer with evidence and a confidence score.
 5. **Critiques** the answer adversarially; if unsatisfied, replans and loops (up to 12 iterations by default).
@@ -47,24 +47,23 @@ load_inputs
 
 | Agent | Role |
 |---|---|
-| **Coordinator** | Orchestrates the workflow, routes tasks, and manages overall progress |
 | **Planner** | Decomposes the question into an ordered list of tool-call steps with hypotheses |
 | **Executor** | Picks the next runnable step (respecting `depends_on`), enriches null arg placeholders from the live KB |
 | **Synthesizer** | Extracts structured facts (labels, routines, data structures, hypotheses) from raw tool results and writes them to the KB |
 | **Analyst** | Answers the question using only KB-backed evidence; emits confidence score and open questions |
 | **Critic** | Adversarially reviews the answer; decides `accept` / `revise` / `replan` |
 | **Curator** | Compacts the KB when it grows beyond the token budget of the cheapest model |
-| **Researcher** | Performs targeted web searches and extracts relevant external knowledge |
+| **Vision** | Describes an explicitly requested VICE screenshot for downstream evidence extraction |
 
 ### Tools
 
 | Tool | What it does |
 |---|---|
 | **Capstone** | Static 6502/6510 disassembly — linear, recursive, loop-finding, entry-point detection, polymorphic/SMC scan |
-| **VICE MCP** | Live emulator introspection via MCP — `disassemble`, `memory.read`, `registers.get`, `display.screenshot` |
+| **VICE MCP** | Live emulator introspection via MCP — disassembly/read, snapshots and diffs, watchpoint traces, screenshots, and approval-gated visual poke verification |
 | **Tavily** | Web search scoped to retrocomputing sources (CSDb, Codebase64, Lemon64, GameBase64) |
 | **KB** | SQL and text queries against the accumulated knowledge base |
-| **Code KB** | Layered code-comprehension store built from parsed asm files — routines, xrefs, instruction index, semantic search |
+| **Code KB** | Layered code-comprehension store built from parsed asm files — routines, xrefs, address-preserving pseudocode, semantic search, evidence-gated Layer-2 groups, and append-only Layer-3 critiques |
 
 ### Knowledge stores
 
@@ -88,6 +87,16 @@ pip install -e ".[ui]"           # includes Streamlit; omit [ui] for CLI-only
 # 3. Copy and fill in API keys
 cp .env.example .env             # edit .env with your keys
 ```
+
+The package also builds as a standard wheel (`uv build --wheel`) and installs a
+`c64re` command. By default, writable data is relative to the directory where
+the command is launched. Set `C64RE_WORKSPACE_DIR` to relocate all default
+workspace data, `C64RE_SESSIONS_DIR` to relocate only durable sessions, or
+`C64RE_CONFIG_DIR` to use an external `llm.json`/`kb_semantic.json` directory.
+Set these overrides before starting/importing the CLI, Streamlit UI, graph, or
+semantic configuration modules. Those application modules deliberately
+snapshot paths at import so a running process cannot silently switch its
+configuration or writable session root; restart after changing an override.
 
 ### `.env` keys
 
@@ -117,19 +126,36 @@ Edit `config/llm.json` to choose which model each sub-agent uses. Any sub-agent 
 ```json
 {
   "agents": {
-    "coordinator": { "provider": "grok",      "model": "grok-4.3",         "temperature": 0.1, "reasoning_effort": "low" },
-    "planner":     { "provider": "anthropic", "model": "claude-opus-4-7",  "temperature": 0.2 },
-    "executor":    { "provider": "openai",    "model": "gpt-5.3-codex",    "temperature": 0.0 },
-    "synthesizer": { "provider": "grok",      "model": "grok-4.3",         "temperature": 0.3, "reasoning_effort": "low" },
-    "analyst":     { "provider": "gemini",    "model": "gemini-pro-latest", "temperature": 0.2 },
-    "critic":      { "provider": "gemini",    "model": "gemini-pro-latest", "temperature": 0.1 },
-    "curator":     { "provider": "grok",      "model": "grok-4.3",         "temperature": 0.2, "reasoning_effort": "none" },
-    "researcher":  { "provider": "grok",      "model": "grok-4.3",         "temperature": 0.3, "reasoning_effort": "medium" }
+    "planner":     { "provider": "anthropic", "model": "claude-opus-4-8",  "temperature": 0.2, "max_tokens": 8192 },
+    "executor":    { "provider": "openai",    "model": "gpt-5.5",          "temperature": 0.0 },
+    "synthesizer": { "provider": "grok",      "model": "grok-4.5",         "temperature": 0.3, "reasoning_effort": "low" },
+    "analyst":     { "provider": "gemini",    "model": "gemini-pro-latest", "temperature": 0.2, "max_tokens": 8192, "reasoning_effort": "low" },
+    "critic":      { "provider": "gemini",    "model": "gemini-pro-latest", "temperature": 0.1, "max_tokens": 8192, "reasoning_effort": "low" },
+    "curator":     { "provider": "grok",      "model": "grok-4.5",         "temperature": 0.2, "reasoning_effort": "low" },
+    "vision":      { "provider": "gemini",    "model": "gemini-pro-latest", "temperature": 0.1, "max_tokens": 2048, "reasoning_effort": "low" }
   }
 }
 ```
 
 Ollama (local) is also supported — set `"provider": "ollama"` and point `base_url` at `http://localhost:11434/v1`.
+
+Native provider JSON-schema output is available as a compatibility-gated option. Set
+`C64RE_STRUCTURED_OUTPUT=1`, `defaults.structured_output`, or an
+`agents.<role>.structured_output` override to try it. It is disabled by
+default until the paid golden suite has baselined every configured provider;
+provider rejection automatically retries that role through the ordinary JSON
+contract before using a backup provider.
+
+### Semantic KB search
+
+`config/kb_semantic.json` controls optional embedding search. When enabled,
+vectors are persisted in `sessions/<game>/kb/vectors.sqlite`, keyed by the
+provider/model/dimension and exact content hash. Startup and incremental
+indexing embed only cache misses, so reopening an unchanged session incurs no
+embedding calls. The supported default is OpenAI `text-embedding-3-small`
+through the configured `executor` provider. Automatic indexing remains
+disabled until `enabled` is explicitly set to `true`, so opening a session
+cannot silently incur embedding spend.
 
 ---
 
@@ -143,6 +169,9 @@ python main.py \
   --question "Where is the player score stored and how is it updated?" \
   --dump memdump_dir/wizofwor.dump
 ```
+
+An installed wheel exposes the equivalent `c64re` command with the same
+arguments.
 
 **All options:**
 
@@ -178,6 +207,17 @@ uv run langgraph dev
 
 Opens LangGraph Studio in the browser for step-by-step graph inspection, node-by-node state viewing, and full LangSmith tracing.
 
+### Trusted research inputs
+
+Files passed through `--text-dir`, `--partial-asm`, or `--asm-dir` are stored
+in the local session KB and relevant excerpts may be sent to the configured
+LLM providers. Only ingest material you trust and are permitted to share.
+API-key, bearer-token, password, and similar credential shapes are redacted
+from generated digests, search/SQL previews, and tool output, but this is a
+best-effort safeguard rather than a substitute for keeping secrets out of
+research notes. Original local evidence remains unchanged in the append-only
+KB and should be protected as sensitive session data.
+
 ### Streamlit Web GUI
 
 ```bash
@@ -195,6 +235,7 @@ The web UI provides:
 - **Routines panel** — top routines ranked by cross-reference count, with one-click jump to their disassembly
 - **VICE symbol export** — download verified, high-confidence Code-KB names as a `.labels` monitor command file
 - **Knowledge accumulation** — every turn enriches the same file-backed KB; close and reopen the browser and your session is intact
+- **Human ratings** — mark archived answers helpful/not helpful with an optional note; revisions stay local until explicitly exported
 
 ---
 
@@ -214,16 +255,22 @@ graph/
 memory/
   store.py          KnowledgeStore — general KB (SQLite + JSONL event log)
   evidence.py       Shared evidence-reference resolver for reports, CLI, and UI
+  semantic_cache.py Persistent content-addressed embedding cache
+  redaction.py      Best-effort secret redaction at prompt/preview boundaries
 code_kb/
   store.py          CodeKnowledgeStore — layered code-comprehension KB
   layer0.py         Ground-truth layer: parsed asm / dump bytes
   layer1.py         LLM annotation layer: routines, labels, xrefs
+  pseudocode.py     Conservative address-preserving 6502 transliteration
   call_graph.py     DOT call-graph builder for the web GUI
 tools/
   vice_mcp.py       MCP client for VICE emulator
   c64_disasm.py     Capstone 6502/6510 disassembly wrapper
   agent_runner.py   Headless runner used by the Streamlit UI
   research_notebook.py  Turn archive, report-version, and dump-catalog services
+evals/
+  runner.py         Opt-in live golden runner and offline evaluator
+  ratings.py        Explicit local-rating preview / LangSmith dataset export
 asm_dir/            Partial disassembly files (game disassemblies go here)
 memdump_dir/        Memory dumps (.dump files go here)
 text_dir/           Human-written notes and research documents
@@ -241,6 +288,15 @@ app.py              Streamlit web GUI
 - Streamlit + Graphviz for the web GUI (`pip install -e ".[ui]"`)
 - VICE with the [vice-mcp](https://github.com/vice-emu/vice-mcp) plugin for live emulator features (optional)
 
+Mutating VICE work is deny-by-default. The `vice.poke_verify` experiment is
+limited to one byte, requires an explicit expected visible change, captures
+before/after screenshots, and uses the selected bank consistently for the
+original read, candidate write, verification read, and byte restore. It saves
+then reloads a complete emulator snapshot in `finally`; older servers fall
+back to restoring the original byte in that same bank. Treat optional execution resume as
+experimental because the current VICE MCP run verb is not frame-bounded. Use
+a disposable session and review the generated plan before approval.
+
 ---
 
 ## Evaluation
@@ -254,9 +310,12 @@ rejects exact-address assembly bytes that disagree with the selected dump:
 pytest -q
 ```
 
-The live suite has not yet been baselined; the dump-anchor tests are currently
-the required offline gate. The 15-question end-to-end golden suite is opt-in.
-It runs the real graph,
+A budget-limited live hardening baseline exercised 11 of the 15 cases on
+2026-07-18. After grounding and evaluator-contract fixes, all 11 produced the
+required addresses at or above their confidence floor; four cases remain
+unbaselined (`vultures_lives_initial`, `vultures_lives_decrement`,
+`wor_sprite_enable`, and `wor_screen_ram`). The dump-anchor tests therefore
+remain the required offline gate. The end-to-end golden suite is opt-in. It runs the real graph,
 stores its temporary KBs under `evals/.sessions/`, and writes per-case quality,
 token, cost, tool-call, and wall-time metrics under `evals/results/`. VICE and
 Tavily are disabled by default so the checked-in dumps/asm remain the stable
@@ -269,3 +328,32 @@ C64RE_RUN_GOLDEN=1 python -m evals.runner
 Use `--case <id>` to run a subset. Live evaluation requires the configured LLM
 credentials; it does not run as part of ordinary `pytest`. Pass
 `--allow-external-tools` only when emulator/web variability is intentional.
+`C64RE_USD_BUDGET` sets the estimated per-run graph guardrail and
+`C64RE_MAX_OUTPUT_TOKENS` caps each completion. Each primary/backup call now
+reserves a conservative worst-case input/output estimate before contacting a
+provider. The runner's `--max-cost-usd` adds a cumulative batch ceiling and
+`--min-case-budget-usd` prevents starting a case without useful headroom.
+These are conservative application-side controls, not a transactional limit
+inside a provider's billing system.
+
+Future validation still includes the four named live cases above and a paired
+structured-output A/B: plain JSON as the control versus
+`C64RE_STRUCTURED_OUTPUT_ROLES=analyst,critic` as the treatment. Use fresh
+session roots, identical model/config versions, VICE/Tavily disabled, and
+compare quality, contract/fallback failures, tokens, estimated cost, calls, and
+wall time before changing the default. A separate semantic-search A/B should
+compare disabled, cold-cache, and warm-cache `text-embedding-3-small` runs
+before automatic embedding is enabled. The detailed future-validation ledger
+is maintained in `improvements_tracker.md`.
+
+Human ratings are recorded locally by the Streamlit UI. Preview the joined
+turn/rating examples without network access, or explicitly synchronize them to
+a LangSmith dataset:
+
+```bash
+python -m evals.ratings --session-dir sessions/wizard_of_wor --local-only
+python -m evals.ratings --session-dir sessions/wizard_of_wor \
+  --dataset c64re-human-ratings
+```
+
+There is no automatic LangSmith dataset write when a user clicks a rating.

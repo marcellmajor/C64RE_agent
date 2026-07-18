@@ -29,14 +29,17 @@ from pathlib import Path
 
 import streamlit as st
 
-# Make sibling packages importable when streamlit launches us from
-# anywhere; without this the app blows up if the user runs `streamlit
-# run app.py` from a parent directory.
-_HERE = Path(__file__).resolve().parent
-if str(_HERE) not in sys.path:
-    sys.path.insert(0, str(_HERE))
+# Make sibling packages importable when Streamlit launches this source file
+# directly. Installed wheels already expose them through site-packages.
+_CODE_ROOT = Path(__file__).resolve().parent
+if str(_CODE_ROOT) not in sys.path:
+    sys.path.insert(0, str(_CODE_ROOT))
 
-_UI_PREFS_PATH = _HERE / "sessions" / ".ui_prefs.json"
+from c64re_agent.paths import sessions_dir, workspace_root  # noqa: E402
+
+_HERE = workspace_root()
+_SESSIONS_DIR = sessions_dir()
+_UI_PREFS_PATH = _SESSIONS_DIR / ".ui_prefs.json"
 
 from tools.agent_runner import (  # noqa: E402
     annotate_routine,
@@ -60,8 +63,10 @@ from tools.agent_runner import (  # noqa: E402
 from tools.research_notebook import (  # noqa: E402
     diff_dump_states,
     freeze_dump_state,
+    latest_turn_ratings,
     load_dump_catalog,
     load_turns,
+    record_turn_rating,
 )
 
 
@@ -74,7 +79,7 @@ def _slugify_game_name(game: str) -> str:
 
 
 def _known_game_slugs() -> list[str]:
-    sessions = _HERE / "sessions"
+    sessions = _SESSIONS_DIR
     if not sessions.exists():
         return []
     return sorted(
@@ -272,13 +277,16 @@ with st.sidebar:
         from graph.plan_utils import resolve_session_slug as _resolve_turn_slug
 
         _turn_session = (
-            _HERE / "sessions"
+            _SESSIONS_DIR
             / _resolve_turn_slug(
-                st.session_state.game or "unknown", _HERE / "sessions",
+                st.session_state.game or "unknown", _SESSIONS_DIR,
             )
         )
-        st.session_state.history = [
-            {
+        _turn_ratings = latest_turn_ratings(_turn_session)
+        st.session_state.history = []
+        for row in load_turns(_turn_session):
+            _rating = _turn_ratings.get(str(row.get("run_id") or ""), {})
+            st.session_state.history.append({
                 "question": row.get("question") or "",
                 "answer": row.get("answer") or "",
                 "confidence": row.get("confidence"),
@@ -290,9 +298,10 @@ with st.sidebar:
                 "addresses": row.get("addresses") or [],
                 "elapsed_s": row.get("elapsed_s") or 0.0,
                 "thread_id": row.get("run_id") or "",
-            }
-            for row in load_turns(_turn_session)
-        ]
+                "run_id": row.get("run_id") or "",
+                "rating": _rating.get("rating"),
+                "rating_comment": _rating.get("comment") or "",
+            })
 
     # ---------- Memory dump picker ---------- #
     st.text_input(
@@ -357,8 +366,8 @@ with st.sidebar:
         from graph.plan_utils import resolve_session_slug as _resolve_slug
 
         _catalog_session = (
-            _HERE / "sessions"
-            / _resolve_slug(st.session_state.game or "unknown", _HERE / "sessions")
+            _SESSIONS_DIR
+            / _resolve_slug(st.session_state.game or "unknown", _SESSIONS_DIR)
         )
         st.text_input(
             "State name", key="catalog_state_name",
@@ -710,6 +719,49 @@ def _render_turn(turn: dict) -> None:
                 f"`${a:04X}`" for a in turn["addresses"][:24]
             )
             st.caption(f"Cited addresses: {addr_chips}")
+        run_id = str(turn.get("run_id") or "").strip()
+        if run_id:
+            current_rating = turn.get("rating")
+            status = {
+                "helpful": "Current rating: 👍 helpful",
+                "not_helpful": "Current rating: 👎 not helpful",
+            }.get(current_rating, "Not rated yet")
+            with st.expander(f"Human rating · {status}", expanded=False):
+                note_key = f"rating_note_{run_id}"
+                if note_key not in st.session_state:
+                    st.session_state[note_key] = str(
+                        turn.get("rating_comment") or "",
+                    )
+                st.text_input(
+                    "Optional note",
+                    key=note_key,
+                    max_chars=2_000,
+                )
+                helpful_col, unhelpful_col = st.columns(2)
+                choices = (
+                    (helpful_col, "👍 Helpful", "helpful"),
+                    (unhelpful_col, "👎 Not helpful", "not_helpful"),
+                )
+                for column, label, value in choices:
+                    if column.button(
+                        label,
+                        key=f"rate_{value}_{run_id}",
+                        use_container_width=True,
+                    ):
+                        from graph.plan_utils import resolve_session_slug
+
+                        session_dir = _SESSIONS_DIR / resolve_session_slug(
+                            st.session_state.game or "unknown", _SESSIONS_DIR,
+                        )
+                        rating_row, _changed = record_turn_rating(
+                            session_dir,
+                            run_id=run_id,
+                            rating=value,
+                            comment=st.session_state[note_key],
+                        )
+                        turn["rating"] = rating_row["rating"]
+                        turn["rating_comment"] = rating_row.get("comment") or ""
+                        st.toast("Rating saved locally.")
 
 
 for turn in st.session_state.history:
@@ -817,6 +869,9 @@ def _store_turn_result(result: TurnResult) -> None:
         "addresses": result.addresses,
         "elapsed_s": result.elapsed_s,
         "thread_id": result.thread_id,
+        "run_id": result.run_id,
+        "rating": None,
+        "rating_comment": "",
     })
 
 
@@ -1268,7 +1323,7 @@ with tab_kb:
                 )
         from graph.plan_utils import resolve_session_slug
 
-        sessions = Path("sessions")
+        sessions = _SESSIONS_DIR
         slug = resolve_session_slug(st.session_state.game, sessions)
         report_path = sessions / slug / "report.md"
         if report_path.exists():

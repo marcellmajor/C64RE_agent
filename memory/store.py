@@ -46,8 +46,10 @@ from memory.semantic_documents import (
     semantic_hit_preview_text,
     snippet_for_semantic,
 )
-from memory.semantic_embed import EmbeddingServiceError, embed_texts_batched
+from memory.semantic_cache import embed_texts_cached
+from memory.semantic_embed import EmbeddingServiceError
 from memory.semantic_index import SemanticVectorIndex
+from memory.redaction import redact_text, redact_value
 
 # Files we accept as "user knowledge" inside `--text-dir`.
 TEXT_FILE_SUFFIXES = {".txt", ".md", ".markdown", ".text", ".rst", ".asc"}
@@ -145,6 +147,7 @@ class KnowledgeStore:
         # In-memory embedding index — rebuilt after SQLite replay when enabled.
         self._semantic_index: SemanticVectorIndex | None = None
         self._semantic_embed_ok: bool = False
+        self._semantic_cache_path: Path = root / "vectors.sqlite"
         # Memoization (tracker 1.5): digest keyed on
         # (question, events_total, max_chars); partial-asm head keyed on
         # max_lines; question-embedding vectors keyed on query text.
@@ -454,7 +457,7 @@ class KnowledgeStore:
             return
 
         try:
-            vecs = embed_texts_batched(cfg, texts)
+            vecs = embed_texts_cached(cfg, texts, self._semantic_cache_path)
             self._semantic_index.add_rows(ids, metas, vecs)
             self._semantic_embed_ok = True
         except EmbeddingServiceError as exc:
@@ -485,7 +488,7 @@ class KnowledgeStore:
             n_rm = self._semantic_index.remove_predicate(pred)
             if not texts:
                 return
-            vecs = embed_texts_batched(cfg, texts)
+            vecs = embed_texts_cached(cfg, texts, self._semantic_cache_path)
             self._semantic_index.add_rows(ids, metas, vecs)
             _ = n_rm  # reserved for diagnostics
         except EmbeddingServiceError as exc:
@@ -800,6 +803,15 @@ class KnowledgeStore:
         ).fetchone()
         return row is not None
 
+    def tool_result_event_id(self, payload: dict[str, Any]) -> str | None:
+        """Return the durable event id for a previously recorded result."""
+        assert self._db is not None
+        row = self._db.execute(
+            "SELECT event_id FROM tool_result_keys WHERE key = ?",
+            (_tool_result_key(payload),),
+        ).fetchone()
+        return str(row["event_id"]) if row else None
+
     def ingest_dump(self, path: Path) -> str | None:
         """Idempotent on CONTENT, not just path (tracker 2.2).
 
@@ -999,7 +1011,7 @@ class KnowledgeStore:
                 "path": r["path"],
                 "size": r.get("size"),
                 "match_at": idx,
-                "snippet": snippet,
+                "snippet": redact_text(snippet),
             })
         return out
 
@@ -1348,11 +1360,11 @@ class KnowledgeStore:
                 "tool":     payload.get("tool"),
                 "step_id":  payload.get("step_id"),
                 "ok":       payload.get("ok"),
-                "extra":    {
+                "extra":    redact_value({
                     k: v for k, v in payload.items()
                     if k not in {"data", "tool", "step_id", "ok"}
-                },
-                "data":     data_str,
+                }),
+                "data":     redact_text(data_str),
             })
         return out
 
@@ -1404,6 +1416,7 @@ class KnowledgeStore:
                 head += f"\n... [{len(lines) - max_lines} more lines]"
             break
 
+        head = redact_text(head)
         self._partial_asm_cache = (max_lines, head)
         return head
 
@@ -1638,7 +1651,7 @@ class KnowledgeStore:
             if ex_lines:
                 sections.append("## Recent tool results\n" + "\n\n".join(ex_lines))
 
-        digest = "\n\n".join(sections).strip()
+        digest = redact_text("\n\n".join(sections).strip())
 
         # Safety cap — should rarely trigger now that recent results are
         # budget-gated, but keeps behaviour deterministic.

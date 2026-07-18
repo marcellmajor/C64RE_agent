@@ -52,12 +52,12 @@ ones in the legend above.
 | 1.4 | Track real per-role token, cost, LLM-call, tool-call, and VICE-call usage against the run budget. | [x] Done |
 | 1.5 | Reuse and memoize KB digests, partial-asm metadata, and question embeddings instead of rebuilding them per node. | [x] Done |
 | 1.6 | Replace repeated full event-log scans with indexed lookups and replay high-water marks. | [x] Done |
-| 1.7 | Run independent read-only plan steps in parallel with LangGraph fan-out after batching and retry semantics stabilize. | [-] Deferred |
+| 1.7 | Run independent read-only plan steps in parallel with LangGraph fan-out after batching and retry semantics stabilize. | [x] Done |
 | 2.1 | Compact only new, uncompacted events and expose consolidated observations in question digests. | [x] Done |
 | 2.2 | Detect changed dump and assembly inputs by content metadata and invalidate stale derived analysis. | [x] Done |
 | 2.3 | Store routine confidence and prevent lower-confidence replay events from overwriting stronger facts. | [x] Done |
 | 2.4 | Implement durable CLI checkpoint resume with `SqliteSaver`, or correct the resume claim if KB-only persistence is retained. | [x] Done |
-| 2.5 | Persist semantic vectors and embed only cache misses once semantic search is enabled by default. | [-] Deferred |
+| 2.5 | Persist semantic vectors and embed only cache misses once semantic search is enabled by default. | [x] Cache/provider complete; activation remains explicit |
 | 3.1 | Add named memory snapshots, diffs, and monotonic scans for locating changing game-state variables. | [x] Done |
 | 3.2 | Add a safe VICE watchpoint/trace workflow and allow register reads when a checkpoint is armed. | [x] Done |
 | 3.3 | Add deterministic 6502 counter heuristics for lives, score, timers, HUD digits, and similar state. | [x] Done |
@@ -65,7 +65,7 @@ ones in the legend above.
 | 3.5 | Pre-tag common C64/6502 code idioms before Layer-1 LLM annotation. | [x] Done |
 | 3.6 | Make disassembly bank-aware, avoid false ROM assumptions, and improve illegal-opcode handling. | [x] Done |
 | 3.7 | Decode PETSCII, screen RAM, and color RAM into searchable KB text. | [x] Done |
-| 3.8 | Explore refined loop scoring, pseudocode decompilation, and multimodal poke-and-peek after prerequisite work. | [-] Deferred |
+| 3.8 | Explore refined loop scoring, pseudocode decompilation, and multimodal poke-and-peek after prerequisite work. | [x] Done; live baseline passed |
 | 4.1 | Make BASIC `SYS` detection tolerate spaces and common separators before the entry-point digits. | [x] Done |
 | 4.2 | Require an explicit Capstone linear-disassembly start address instead of silently using `$0801`. | [x] Done |
 | 4.3 | Match hexadecimal addresses from the question when retrieving relevant KB labels. | [x] Done |
@@ -73,12 +73,12 @@ ones in the legend above.
 | 4.5 | Encode VICE memory reads as compact hex dumps before truncation so most returned bytes are not lost. | [x] Done |
 | 4.6 | Broaden configurable Tavily research domains and support advanced search depth. | [x] Done |
 | 4.7 | Honor per-role output-token limits so planner and analyst JSON is not truncated mid-response. | [x] Done |
-| 4.8 | Bound or compact `tool_results` in graph state after persisted results no longer need full payloads. | [-] Deferred |
+| 4.8 | Bound or compact `tool_results` in graph state after persisted results no longer need full payloads. | [x] Done |
 | 5.1 | Add a golden-question regression suite that checks expected evidence, confidence, cost, and runtime. | [x] Done |
 | 5.2 | Add deterministic unit tests and compact synthetic dump fixtures for core parsing, routing, and disassembly behavior. | [x] Done |
 | 5.3 | Add a per-role calls, tokens, failures, and fallback-activation table to generated reports. | [x] Done (delivered with 1.4) |
 | 5.4 | Persist one queryable run-summary event containing outcome, iterations, confidence, and cost. | [x] Done |
-| 5.5 | Add human ratings and LangSmith datasets after the product/UI work is ready to collect them. | [-] Deferred |
+| 5.5 | Add human ratings and LangSmith datasets after the product/UI work is ready to collect them. | [x] Done |
 | 6.1 | Add human approval/edit interrupts for plans and mutating VICE operations, plus UI cancellation. | [x] Done |
 | 6.2 | Turn sessions into a multi-turn research notebook with archived turns, versioned reports, and prior-answer context. | [x] Done |
 | 6.3 | Track hypotheses through open, supported, and refuted lifecycle states as evidence changes. | [x] Done |
@@ -86,10 +86,10 @@ ones in the legend above.
 | 6.5 | Catalog named dumps from multiple game states so offline snapshot comparisons are reproducible. | [x] Done |
 | 6.6 | Export high-confidence labels as VICE-compatible symbol maps. | [x] Done |
 | 6.7 | Allow synthesizer-discovered Layer-1 facts into Code KB with a verified window or explicit unverified provenance. | [x] Done |
-| 6.8 | Revisit DAG planning, deeper Code-KB layers, and cross-provider structured output after loop stabilization. | [-] Deferred |
-| 7.1 | Package all runtime Python modules and configuration data instead of shipping only `graph/`. | [ ] Not started |
-| 7.2 | Remove unused coordinator/researcher role configuration or wire those roles into real graph paths. | [ ] Not started |
-| 7.3 | Redact secret-like values from digests and SQL previews and document trusted note inputs. | [ ] Not started |
+| 6.8 | Revisit DAG planning, deeper Code-KB layers, and cross-provider structured output after loop stabilization. | [x] Done opt-in; analyst/critic live-canary passed |
+| 7.1 | Package all runtime Python modules and configuration data instead of shipping only `graph/`. | [x] Done |
+| 7.2 | Remove unused coordinator/researcher role configuration or wire those roles into real graph paths. | [x] Done |
+| 7.3 | Redact secret-like values from digests and SQL previews and document trusted note inputs. | [x] Done |
 
 ---
 
@@ -324,14 +324,14 @@ that actually completes.
   - **Effort:** ~1 day · **Impact:** Medium · **Source:** F §2.5, G #9
   - **My call:** Do after 1.5; defer the checkpoint-snapshot half if time-boxed.
 
-- [-] **1.7 Parallel fan-out (LangGraph `Send`) for independent read-only steps**
+- [x] **1.7 Parallel fan-out (LangGraph `Send`) for independent read-only steps**
   - **Source:** F §2.8, G #2 · **Effort:** ~1 day+
-  - **My call:** Defer. Real wall-clock win, but it interacts with the batch-synthesis and failed-step-retry changes;
-    land those first, then revisit so we don't design the batching twice.
+  - **My call:** Originally deferred until batching/retries stabilized; completed in the deferred-work pass after 4.8.
 
 ### Phase 1 implementation notes (2026-07-17; hardening round + final hardening pass applied — for reviewer)
 
-> **STATUS: Phase 1 implemented (1.1–1.6; 1.7 stays deferred), hardened per the GPT 5.6 Sol review
+> **STATUS: Phase 1 implemented and hardened; 1.7 was subsequently completed in the deferred-work pass. The original
+> 1.1–1.6 hardening baseline below is preserved for reviewer history. Hardened per the GPT 5.6 Sol review
 > (6 findings — "Hardening-round changes" below), and re-hardened per the final review's 3 reproduced
 > probes ("Final hardening pass" below — all three probes are now permanent passing tests).
 > Full suite: 182 tests passing; `compileall` clean; `git diff --check` clean; graph compiles; both
@@ -362,7 +362,7 @@ Per item:
   payloads carry `provenance: "mechanical"`) → stage 2 **batched LLM extraction**: LLM-worthy results (free text
   only — failed results and `kb`/`code_kb` reads are never LLM'd; `vectors`/`find_entry` are mechanical-only;
   `find_loops` is hybrid because it embeds an auto-disassembly listing) accumulate across steps via a
-  `synth_processed_count` index high-water in state and flush in ONE call when the plan drains (analyst next)
+  stable processed-result identities in state and flush in ONE call when the plan drains (analyst next)
   or the batch fills (`SYNTH_BATCH_MAX_RESULTS=4` / `SYNTH_BATCH_MAX_CHARS=20k`). LLM-extracted payloads carry
   `provenance: "llm"`. On a pure defer the digest rebuild is also skipped.
 - **1.3** — The per-routine auto-`_mode_annotate` calls are queued as candidates, ranked by
@@ -459,6 +459,13 @@ digest/partial-asm memoization).
    modes arg-free; unknown modes → enrich. Positive AND negative alias cases per mode are in the test table;
    retries still always use executor enrichment.
 
+**Deferred-work completion (1.7):** the executor now selects up to four fresh, concrete, dependency-ready read-only
+steps and the conditional router dispatches them with native LangGraph `Send`. Static Capstone, parent-KB queries,
+Tavily, and an explicit allow-list of query-only Code-KB modes may overlap. VICE, retries, unresolved arguments, and
+Code-KB disassembly/annotation/export stay serial. Reducer-backed results/counters merge before exactly one shared
+synthesizer pass. Tests prove the compiled graph's branches overlap through a barrier, the synthesizer sees one merged
+batch, policy exclusions hold, fan-out is bounded, and real concurrent Capstone/parent-KB reads share a store safely.
+
 **Known limitations / deliberate choices for review:**
 1. On a deferred batch the executor sees a digest that is at most one batch stale (fresh facts still reach the
    analyst — a flush always precedes it).
@@ -514,13 +521,15 @@ digest/partial-asm memoization).
   - **Effort:** ~2–4h · **Impact:** Medium · **Source:** F §1.9
   - **My call:** Do the SqliteSaver route — it composes with the multi-turn archive (6.2).
 
-- [-] **2.5 Persist the semantic vector index (embed only cache misses)**
+- [x] **2.5 Persist the semantic vector index (embed only cache misses)**
   - **Source:** F §2.7, G #10 · **Effort:** ~1 day
   - **My call:** Defer until semantic search is actually enabled by default (it's `enabled:false` today). Track behind 2.1.
 
 ### Phase 2 implementation notes (2026-07-17; hardening-round fixes applied 2026-07-18 — for reviewer)
 
-> **STATUS: Phase 2 implemented (2.1–2.4; 2.5 stays deferred), hardened per the GPT 5.6 Sol review's two
+> **STATUS: Phase 2 implemented and hardened. The 2.5 persistent cache is complete and the supported embedding
+> model is OpenAI `text-embedding-3-small` through the executor provider. Automatic indexing remains explicit
+> (`enabled=false`) so opening a session cannot silently spend money. Hardened per the GPT 5.6 Sol review's two
 > reproduced defects, and finished per the follow-up review's three source-invalidation defects (see
 > "Hardening-round changes" below — including the final-round provenance/re-materialization design and the
 > append-order `seq` ordering fix). Full suite: 214 tests passing; `git diff --check` clean; `compileall`
@@ -570,6 +579,14 @@ Per item (final behavior):
   (documented in the flag's help):** re-invocation restarts the graph from the planner *on top of* the
   checkpointed state — mid-node resume (input=None continuation) is left to the 6.2 notebook work. The
   Streamlit runner intentionally keeps MemorySaver + fresh thread ids until 6.2.
+
+- **2.5 (deferred-work implementation).** Semantic embeddings are cached in
+  `sessions/<game>/kb/vectors.sqlite` as float32 rows keyed by provider, embedding model, requested dimension, and
+  exact content hash. Bootstrap and incremental indexing hydrate cached rows and send only unique misses to the
+  embedding provider; reopening the same store makes no embedding call. Model/dimension changes invalidate by key,
+  corrupt-size rows degrade to cache misses, and focused tests cover process reopen and numeric round trips. The
+  bundled config uses `text-embedding-3-small` through the OpenAI executor provider. It remains `enabled=false`
+  until the operator explicitly opts into automatic embedding spend.
 
 **Hardening-round changes (GPT 5.6 Sol review of Phase 2 — both reproduced defects fixed, 2026-07-18):**
 1. **Timestamp cursors eliminated from compaction bookkeeping.** The first pass used
@@ -729,14 +746,16 @@ exists anywhere under the repository's real `sessions/` tree.
   - **Effort:** ~half day · **Impact:** Medium (unique C64 value) · **Source:** Gr §3.1
   - **My call:** Do — cheap, offline, complements 3.1.
 
-- [-] **3.8 Loop-scoring refinements / pseudocode decompilation / multimodal poke-and-peek**
+- [x] **3.8 Loop-scoring refinements / pseudocode decompilation / multimodal poke-and-peek**
   - **Source:** F §3.6, Ge §2.2, Ge §2.1
   - **My call:** Defer. Loop-scoring refinements are nice-to-have polish; pseudocode decompilation and poke-and-peek are
     larger bets that depend on 3.1/3.2 landing first and (for poke-and-peek) on `vice.memory.write` + HITL gating (6.1).
 
 ### Phase 3 implementation notes (2026-07-18 — for reviewer)
 
-> **STATUS: Phase 3 implemented (3.1–3.7; 3.8 stays deferred). Full suite: 247 tests passing (33 new);
+> **STATUS: Phase 3 implemented and hardened. Item 3.8 was completed later and its approval-gated visual experiment
+> passed a disposable live VICE baseline. Original Phase 3 baseline:
+> 247 tests passing (33 new);
 > `git diff --check` clean; `compileall` clean; graph + both runners import; no snapshot/checkpoint artifact
 > under the repository's real `sessions/` tree. Awaiting GPT 5.6 Sol review before Phase 4.**
 
@@ -859,7 +878,27 @@ clean, `graph.build`/`main`/`tools.agent_runner` import, no snapshot/checkpoint 
   misattributed to our watchpoint when `checkpoint.add` returns no id (falls back to PC/disasm proof).
   Regression: `test_trace_no_checkpoint_id_ignores_unrelated_hit`.
 
-**Still deferred (unchanged, out of scope):** 3.8; zero-page use-def → `data_structures` grouping;
+**Deferred-work implementation (3.8, offline portions).** Loop candidates now reward distinct JSR targets and
+backward-branch closure, penalize delay/poll loops, expose scoring metrics, and distinguish main loops, IRQ handlers,
+branch loops, and tight loops instead of labelling every recurring region a main loop. Code-KB gained a conservative
+`pseudocode` mode that requires a verified Layer-0 routine and emits one address-preserving line per instruction;
+unsupported instructions remain explicit assembly and no control structures or variable meanings are invented.
+The approval-gated `vice.poke_verify` composite requires an evidence-backed address, one candidate byte, and an
+explicit visible expectation. It saves a full emulator snapshot, reads the original byte from an optional named bank,
+captures a baseline, writes and verifies the candidate by same-bank read-back, captures the after image, and reloads
+the snapshot in `finally` before comparison. Older servers fall back to byte restoration; restore failure is critical
+and non-retryable. Byte-identical PNGs mechanically contradict the visual hypothesis without spending a vision call.
+`frames>0` remains an explicit execution-resume request, not a true frame bound on the current server.
+
+**Live baseline (2026-07-18).** The installed server registers underscore MCP names and requires
+`vice_memory_write {address,data:[...]}`; the transport now maps documented dotted names at its boundary, requests
+array reads, and decodes the returned two-digit strings as hexadecimal. Against a loaded Artillery Duel session,
+`$D020: $FE → $F2` produced distinct before/after PNGs and the configured vision role marked the expected
+light-blue→red border change **supported**. Same-bank read-back succeeded, full-snapshot restoration succeeded, and a
+post-restore read returned `$FE`. The first pre-experiment game snapshot was reloaded and VICE was left paused so warp
+mode would not immediately run the game back to BASIC. No Tavily or golden-suite call was involved.
+
+**Still gated / optional:** zero-page use-def → `data_structures` grouping;
 illegal-opcode decoder; multi-dump catalog (6.5); live-VICE CI. The computed/indexed-jump reachability limit
 also remains (RAM/HW vectors are seeded, so IRQ logic is covered — see limitation 4 above).
 
@@ -867,7 +906,7 @@ also remains (RAM/HW vectors are seeded, so IRQ logic is covered — see limitat
 
 ## Phase 4 — Correctness/robustness papercuts (cheap, bundle together)
 
-> **STATUS: Phase 4 implemented (2026-07-18); 4.1–4.7 complete, 4.8 remains deliberately deferred.**
+> **STATUS: Phase 4 implemented and hardened (2026-07-18); 4.1–4.8 complete.**
 > Full suite **308 passing**; Phase 4 has 17 focused cases plus 6 VICE-alias hardening regressions;
 > `compileall` and `git diff --check` clean;
 > configured planner/analyst/vision clients instantiate with the expected output budgets; graph and CLI entry-point
@@ -903,7 +942,7 @@ also remains (RAM/HW vectors are seeded, so IRQ logic is covered — see limitat
   - `defaults.max_tokens: 4096` can truncate an 8–10 step plan mid-JSON, burning the backup chain. Wire the per-agent
     `max_tokens` (config already supports per-agent keys) through `get_llm`. **Source:** F §2.9.
 
-- [-] **4.8 `tool_results` grows unbounded in state**
+- [x] **4.8 `tool_results` grows unbounded in state**
   - Reducer is `add`; curator can't trim it. Replace with a drop-sentinel reducer or keep only
     `(step_id, ok, event_id)` tuples once persisted. **Source:** F §2.9. **My call:** Defer to Phase 1.7 (batching)
     where the state shape is already being reworked.
@@ -939,13 +978,19 @@ also remains (RAM/HW vectors are seeded, so IRQ logic is covered — see limitat
    to the global default; the existing GPT-5 minimum-budget guard still applies afterward. Planner and analyst are
    configured for 8192 tokens; the dedicated vision role uses 2048. Factory regression coverage and a real local
    configuration-instantiation check confirm the effective values.
+8. **Bounded tool-result state (4.8, completed with the deferred-work pass).** The state reducer now assigns stable,
+   occurrence-safe result identities, compacts LLM-considered results to status/provenance rows after their raw payload
+   reaches the evidence KB, and retains a hard 96-row recent window. Failed rows keep a bounded repair preview, exact
+   per-tool counters survive eviction, reports rehydrate recent raw payloads by event id, and the synthesizer tracks
+   processed identities instead of an unsafe list offset. Legacy numeric cursors migrate on first synthesis.
 
 ### Hardening pass (2026-07-18)
 
 VICE methods are now canonicalized before policy checks and composite dispatch, closing the `ping`/register-alias
 bypass while preserving option (c): standalone register reads remain banned and `_vice_call` is never reached.
 Composite shorthands normalize explicitly. Added dump-present/absent `invalid_arg` coverage for Capstone linear mode,
-tightened hex extraction to 2–4 digits, and added a real-config/mocked-client budget smoke test. Item 4.8 remains deferred.
+tightened hex extraction to 2–4 digits, and added a real-config/mocked-client budget smoke test. Item 4.8 was completed
+later in the deferred-work pass described above.
 
 **Verification:** `tests/test_phase4.py` contains 17 Phase 4 cases and `tests/test_vice_composites.py` adds 6 alias-ban
 regressions. The complete suite is **308 passing**; `compileall -q`
@@ -956,9 +1001,9 @@ passes for `graph`, `memory`, `tools`, `code_kb`, and `tests`; `graph.build`, `m
 
 ## Phase 5 — Observability & evaluation (do alongside Phases 1–3)
 
-> **STATUS: Phase 5 implemented (2026-07-18); 5.1–5.4 complete, 5.5 remains deliberately deferred.**
+> **STATUS: Phase 5 implemented (2026-07-18); 5.1–5.5 complete.**
 > Offline suite **345 passing, 15 skipped** (the 15 paid/live golden graph cases are opt-in); `compileall` and
-> `git diff --check` clean. No Phase 6 work started.
+> `git diff --check` clean at the original Phase 5 boundary. Phase 6 and the later 5.5 work are documented below.
 
 - [x] **5.1 Golden-question regression suite** (`evals/golden.jsonl`)
   - ~10–20 `(game, question, expected_addresses, expected_keywords)` rows for manually verified facts (5 dumps + asm
@@ -978,7 +1023,7 @@ passes for `graph`, `memory`, `tools`, `code_kb`, and `tests`; `graph.build`, `m
 - [x] **5.4 `run_summary` event per completed run** (question, verdict, confidence, iterations, cost)
   - Makes cross-run behavior queryable and feedable to the planner ("previous runs already established…"). **Source:** F §4.
 
-- [-] **5.5 Human ratings + LangSmith datasets** — **Source:** Gr §4.3. **My call:** Defer until UI work (Phase 6).
+- [x] **5.5 Human ratings + LangSmith datasets** — **Source:** Gr §4.3. Implemented after the Phase 6 notebook/UI.
 
 ### Phase 5 implementation notes (2026-07-18)
 
@@ -1004,6 +1049,12 @@ passes for `graph`, `memory`, `tools`, `code_kb`, and `tests`; `graph.build`, `m
    substantive evidence for the dead-end detector. Replay, digest visibility, metrics, and idempotence use real stores.
 4. **Existing cost table retained (5.3).** The per-role report table delivered with 1.4 remains the human-readable
    view; run summaries and golden JSONL provide the cross-run/machine-readable layer.
+5. **Human ratings and explicit dataset export (5.5, deferred-work implementation).** Every archived Streamlit turn
+   can be rated `helpful` or `not_helpful` with an optional note. Rating revisions append locally to
+   `ratings.jsonl`, identical submissions are idempotent, and the latest revision joins to the archived question,
+   answer, evidence, and run metadata. `python -m evals.ratings --session-dir ... --dataset ...` explicitly creates
+   or updates deterministic LangSmith examples; the UI never performs an implicit network write. `--local-only`
+   previews the joined examples offline. LangSmith behavior is covered with a mocked client; no dataset was uploaded.
 
 ### Hardening pass (2026-07-18)
 
@@ -1012,12 +1063,73 @@ references, and rejects exact-address asm/dump byte conflicts without an LLM cal
 snippets replace or supplement incomplete listings; keyword checks use whole-token patterns, with explicit
 entity/animation-state context and `limit`/`limited` morphology, and negative evaluator paths are locked down. The
 paid/live suite has not yet been baselined and was not run during hardening; this offline dump gate is the current
-baseline. At the Phase 5 boundary, item 5.5 remained deferred and no Phase 6 work had started.
+baseline. Item 5.5 was completed later, after the Phase 6 notebook supplied stable turn identifiers and UI surfaces.
 
 **Verification boundary:** default `pytest -q` is **345 passing, 15 skipped**; skips are only the explicitly gated
 live golden cases. Manifest validation, all evaluator arithmetic, run-summary persistence/replay/digest integration,
 and deterministic fixtures run offline on every test invocation. `compileall -q`, entry-point imports, CLI evaluator
-help, and `git diff --check` are clean. Item 5.5 remains deferred as specified.
+help, and `git diff --check` are clean. The later 5.5 tests remain entirely offline.
+
+### Paid golden baseline follow-up (2026-07-18, capped at $1)
+
+A representative three-case live baseline was run against the default provider mix with native structured output
+left off and VICE/Tavily disabled. It consumed **142,973 tokens**, **22 LLM calls**, and a deliberately conservative
+**$0.7935 estimated cost** (the pricing table uses the highest applicable published context tier where a provider has
+tiered rates). Results were **1/3 passing**:
+
+- `wor_border_background` passed at confidence 1.0, finding `$D020` and `$D021` ($0.2995 estimated).
+- `bubble_lives_storage` failed: `$045A` missing and confidence 0.45 ($0.3132 estimated).
+- `vultures_lives_storage` failed: `$008B` missing and confidence 0.30 ($0.1809 estimated).
+
+The run exposed two rollout constraints. First, Gemini plain-JSON responses repeatedly exhausted a small completion
+allowance on reasoning or returned truncated/non-contract JSON, activating expensive backup chains; 2,048 output
+tokens helped but did not eliminate critic failures. Second, the graph's USD cap is checked at verdict boundaries,
+so a final node's fallback chain can overshoot a per-run cap before routing stops. `C64RE_USD_BUDGET` now makes that
+boundary configurable and `C64RE_MAX_OUTPUT_TOKENS` provides an authoritative evaluation-time completion ceiling,
+but the USD value is a guardrail rather than a transactional billing limit. A future hard-cap implementation should
+reserve worst-case call cost before each primary/backup invocation. The remaining 12 live cases were not run under
+this budget; the offline 15-case dump-anchor gate remains complete.
+
+### Paid golden hardening follow-up (2026-07-18, additional $6 authorization)
+
+The first baseline's failures led to three concrete fixes before broader paid
+testing: explicitly selected ASM is now included in the planner/analyst digest
+(including compact instruction-only excerpts with no lexical keyword match),
+every evaluation case uses a fresh session root, and each provider call must
+pass a conservative pre-call cost reservation. The runner also enforces a
+cumulative `--max-cost-usd` ceiling. Gemini analyst/critic calls used the
+role-scoped native structured-output canary with `reasoning_effort=low`; plain
+JSON fallback remains available and global native structured output remains
+off by default.
+
+Live coverage reached **11/15 cases** with VICE and Tavily disabled. After the
+grounding fix, the three representative storage/display cases passed. Bubble
+initial/decrement, all three Blood PRNG cases, and all three Petch cases then
+found every expected address at or above the configured confidence floor.
+Four otherwise correct answers exposed evaluator morphology rather than model
+quality (`life/lives`, `limit/limits/limited/bound/bounded`, `flag/flags`, and
+qualified phrases such as `animation and setup state`); whole-word patterns
+now admit those natural forms while the negative `I will state ...` regression
+still fails. The four cases not yet live-baselined are
+`vultures_lives_initial`, `vultures_lives_decrement`, `wor_sprite_enable`, and
+`wor_screen_ram`.
+
+Machine-readable completed batches are in
+`evals/results/golden-smoke-after-grounding-part2.jsonl`,
+`golden-blood-after-digest.jsonl`, and `golden-petch-baseline.jsonl`; interrupted
+batches retain their per-case reports under `evals/.sessions/`. Completed
+hardening calls reported **$3.6018**. Conservatively charging each interrupted
+in-flight case its entire remaining case allowance brings the additional-round
+upper estimate to **$5.6518**, under the approved $6 ceiling. A credentials-not-
+loaded diagnostic attempt recorded zero tokens and zero estimated cost.
+
+The live runs also exposed and fixed a planner-contract edge: descriptive prose
+in a Code-KB `role` argument is now normalized to a configured Layer-LLM role,
+and a string-valued backup role is treated as one role rather than a character
+list. Budget exhaustion now produces an empty planner plan instead of launching
+a free but noisy seven-step fallback loop. Current default verification after
+the Phase 7/deferred review hardening below is **445 passed, 15 skipped**;
+`compileall -q` and `git diff --check` are clean.
 
 ---
 
@@ -1038,11 +1150,9 @@ help, and `git diff --check` are clean. Item 5.5 remains deferred as specified.
 - [x] **6.6 Symbol-map export** (VICE monitor `.sym`/`.labels` from high-confidence labels) — **Source:** Gr §3.2.
 - [x] **6.7 Synthesizer→Code-KB Layer-1 without Layer-0 gate** — require enclosing Layer-0 window or tag `unverified_llm` so the call-graph UI stays honest. **Source:** Gr §3.5.
 
-- [-] **6.8 DAG-based planner / Code-KB Layer 2+3 / structured outputs (`with_structured_output`)**
-  - **Source:** Ge §1.2, G #10a, F §2.6. **My call:** Defer. DAG planning and Layer 2/3 are large architectural bets the
-    reports themselves rank as ambitious; the fable report explicitly recommends stabilizing the linear loop first.
-    `with_structured_output` is attractive (deletes a lot of JSON-salvage code) but risky across 5 providers — schedule
-    it as its own hardening pass *after* the loop is stable and the golden suite can catch regressions.
+- [!] **6.8 DAG-based planner / Code-KB Layer 2+3 / structured outputs (`with_structured_output`)**
+  - **Source:** Ge §1.2, G #10a, F §2.6. The offline implementation is complete behind conservative boundaries.
+    Cross-provider native structured output remains disabled by default pending a paid golden baseline.
 
 ### Phase 6 implementation notes
 
@@ -1065,6 +1175,14 @@ help, and `git diff --check` are clean. Item 5.5 remains deferred as specified.
 - **6.7:** synthesizer semantics are mirrored only as Layer-1 hypotheses/labels. Claims inside a deterministic Layer-0
   routine bind to that verified window and may enter annotation; claims outside Layer 0 remain queryable but carry
   `unverified_llm` and never create routine/xref ground truth.
+- **6.8 (deferred-work implementation):** dependency-ready, independent read-only steps use bounded LangGraph `Send`
+  fan-out (item 1.7), while retries, VICE, mutation, and LLM-backed Code-KB writes remain serial. Explicit Code-KB
+  `layer2` groups at least two verified Layer-0 routines and rejects hallucinated routine IDs; `layer3` appends
+  support/question/reject critiques against exact Layer-1/2 annotation IDs and never mutates Layer 0. Read-only
+  `groups`/`critiques` modes expose the results. Native JSON-schema output is opt-in through
+  `defaults/agents.*.structured_output` or `C64RE_STRUCTURED_OUTPUT`; provider rejection automatically retries the
+  same role through the existing plain-JSON contract before the backup chain. The default remains off until the live
+  golden suite establishes provider compatibility and answer-quality parity.
 
 ### Hardening pass (2026-07-18)
 
@@ -1075,50 +1193,135 @@ routine guesses no longer materialize as parent-KB routines; they remain explici
 
 **Verification boundary:** default offline `pytest -q` is **367 passing, 15 skipped**; the skips remain only the
 explicitly gated paid/live golden cases. `compileall -q` and `git diff --check` are clean. No live VICE, Tavily, vision,
-or paid golden calls were run. Item 6.8 remains deferred and Phase 7 was not started.
+or paid golden calls were run. The later 6.8 implementation is covered offline; its native-output rollout remains
+gated on the paid golden baseline.
 
 ---
 
 ## Phase 7 — Hygiene / packaging
 
-- [ ] **7.1 Wheel ships only `graph/`** ✅ — `pyproject.toml:37` `packages = ["graph"]` while runtime needs `memory/`,
+> **STATUS: Phase 7 implemented and verified (2026-07-18); 7.1–7.3 complete.**
+
+- [x] **7.1 Wheel ships only `graph/`** ✅ — `pyproject.toml:37` `packages = ["graph"]` while runtime needs `memory/`,
   `tools/`, `code_kb/`, `config/`. Package all importable packages + config data (or clearly document editable-only). **Source:** Gr §4.1.
-- [ ] **7.2 Dead `coordinator`/`researcher` roles** — defined in `config/llm.json` + `graph/llm.py`, never invoked, no
+- [x] **7.2 Dead `coordinator`/`researcher` roles** — defined in `config/llm.json` + `graph/llm.py`, never invoked, no
   `ROLE_BLOCKS` entries. Remove them or wire real paths (researcher = owned web research; coordinator = multi-turn
   agenda, pairs with 6.2). Dead config invites accidental provider spend. **Source:** Gr §4.2.
-- [ ] **7.3 Secret redaction in digests / SQL previews** — `kb mode=sql` can `SELECT` full `text_docs.content`; redact
+- [x] **7.3 Secret redaction in digests / SQL previews** — `kb mode=sql` can `SELECT` full `text_docs.content`; redact
   API-key-shaped strings; document `text_dir` as trusted LLM-context input. **Source:** Gr §4.4.
+
+### Phase 7 implementation notes
+
+- **7.1:** the wheel now includes `graph`, `memory`, `tools`, `code_kb`, `evals`, a small `c64re_agent` runtime
+  package, bundled configuration, the CLI/UI modules, and `langgraph.json`. Runtime paths distinguish packaged
+  read-only config from writable workspace/session data and support `C64RE_CONFIG_DIR`, `C64RE_WORKSPACE_DIR`, and
+  `C64RE_SESSIONS_DIR` overrides. An offline wheel build plus an isolated target install verified imports, bundled
+  config lookup, relocated sessions, and the `c64re --help` entry point.
+- **7.2:** removed the configured-but-unreachable coordinator and researcher clients instead of inventing new graph
+  paths for them. Tavily remains a planner-owned tool, the dedicated vision path remains explicit, README role/config
+  examples now match the graph, and a config regression prevents the dead roles from silently returning.
+- **7.3:** original session evidence remains intact, while a shared recursive redactor now protects LLM-facing KB
+  digests, note/asm search excerpts, semantic/event previews, and arbitrary parent/Code-KB SQL results and metadata.
+  README documents `text_dir`/asm inputs as trusted, locally persisted material and makes the best-effort boundary clear.
+
+### Deferred-work pass verification (2026-07-18)
+
+The complete combined tree passes **445 tests with 15 skipped**; the skips are exactly the opt-in paid/live golden graph
+cases. `compileall -q`, entry-point imports, and `git diff --check` are clean. A fresh offline wheel build succeeded,
+and an isolated target install verified bundled configuration, relocated session paths, runtime imports, and
+`c64re --help`. All VICE, vision, LangSmith, and structured-provider paths added in this pass were exercised with
+mocks only. No paid golden, live VICE, Tavily, vision, embedding, or LangSmith dataset call was made.
+
+The later Phase 3.8 live-baseline follow-up is documented in its own section above. It added the real-server transport,
+schema, read-back, snapshot-restore, and visual-verdict regressions; the no-live statement here remains the boundary of
+the original offline pass, not the final project state.
+
+### Phase 7 / deferred review hardening (2026-07-18)
+
+- Both dedicated vision paths now reserve a conservative image-inclusive
+  worst-case call cost before invoking the provider. Reservation denial records
+  ordinary usage/rejection telemetry, sets the budget-exhausted signal, skips
+  the provider, and preserves the existing vision-unavailable tool fallback;
+  successful description and before/after comparison calls still settle actual
+  token/cost usage. Generic `_vice_text` screenshot flattening is non-billable
+  unless its stateful caller supplies an explicit remaining-budget context.
+- `vice.poke_verify` now applies the selected bank consistently to the original
+  read, candidate write, verification read, and byte-fallback restore. Snapshot
+  restoration remains preferred and the approval/alias gate is unchanged.
+- Redaction is idempotent and credential-shape-aware at text assignments:
+  C64 addresses such as `secret=$0780` survive, while prefixed API keys,
+  bearer tokens, JWTs, and recursive secret fields remain protected. Persisted
+  source evidence is still never mutated.
+- A failed native-structured call can no longer reuse its uncertain transport
+  reservation for a same-role plain retry. The held allowance is deducted
+  before `_invoke_one` performs the retry's own reservation check.
+- The 96-row limit now applies only to bulky tool-result payloads. Every result
+  attempt keeps an unbounded compact status identity, so an older success
+  remains done and continues satisfying dependencies after payload pressure;
+  event IDs and durable aggregate tool-call statistics remain intact.
+- Runtime path helpers remain dynamic, while CLI/UI/graph/semantic modules
+  deliberately snapshot their paths at import. The environment-before-import
+  contract is documented and tested in a fresh subprocess, including the
+  evaluation runner's explicit ability to patch `graph.nodes.SESSIONS_DIR`.
+
+Offline verification: **445 passed, 15 skipped**; the exact focused review
+suite, `compileall -q`, and `git diff --check` are clean. No paid/live model,
+VICE, Tavily, vision, LangSmith, or embedding call was made, and semantic
+indexing remains disabled by default.
 
 ---
 
 ## Suggested execution order (condensed)
 
-1. **Phase 0** (all) — one PR per item or one "control-loop" PR, each with a regression test.
-2. **5.1 + 5.2** (golden + unit harness) — stand up before Phase 1/3 so savings and heuristics are measurable.
-3. **1.4** (cost accounting) → **1.1 + 1.2 + 1.3** (executor skip + deterministic/batch synthesis + fan-out cap).
-4. **2.1 + 2.2 + 2.3** (curator honesty + freshness + confidence replay).
-5. **Phase 3** in order **3.3 → 3.4 → 3.7 → 3.1 → 3.2 → 3.5 → 3.6** (offline/static heuristics first — testable without
-   live VICE — then the dynamic VICE composites, then idioms/banking).
-6. **Phase 4** papercuts bundled into a single sweep (each has a unit test from 5.2).
-7. **1.5 + 1.6 + 2.4** (perf/scan cleanup + real resume).
-8. **Phase 6/7** as product/hygiene follow-ups.
+The deferred-work pass used this dependency order after Phases 0–6 were stable:
+
+1. **7.3 → 7.1 → 7.2:** protect prompt boundaries first, make the wheel/install paths real, then remove dead roles.
+2. **4.8 → 1.7:** bound persisted graph payloads before allowing concurrent result fan-in; fan-out is read-only and
+   capped at four branches.
+3. **2.5 cache → 3.8 offline:** remove repeat embedding work, then add loop scoring and conservative pseudocode without
+   requiring external services.
+4. **5.5:** collect ratings locally only after stable notebook run IDs exist; make LangSmith export explicit.
+5. **6.8:** reuse the proven fan-out as the DAG execution layer, add evidence-gated Layer 2/3, and put native
+   structured output behind an opt-in compatibility flag.
+6. **External baselines last:** validate poke-and-peek against a disposable live VICE session (completed), select
+   `text-embedding-3-small` while keeping automatic spend opt-in, then run the paid golden baseline before changing
+   provider-facing defaults (11/15 cases complete).
 
 ---
 
-## Open questions for review (user + GPT 5.6)
+## Remaining rollout decisions for review (user + GPT 5.6)
 
-1. **Resume strategy (2.4):** switch to `SqliteSaver` checkpointing, or keep KB-only persistence and just fix the help
-   text? SqliteSaver adds crash-resume + composes with the multi-turn archive but adds a checkpoint file to manage.
-2. **`recursion_limit` value (0.1):** 400 is a rough fit for 12 iterations × 8-step plans. Confirm the target
-   iteration/plan sizes so we set it deliberately rather than "big enough."
-3. **VICE availability for testing (3.1/3.2):** is a live vice-mcp server available in the dev/CI loop, or should the
-   dynamic composites be validated only via the offline dump-catalog path (6.5) until then?
-4. **`with_structured_output` (6.8):** worth the cross-provider risk, or keep the current regex-salvage path? Leaning
-   "later, behind the golden suite."
-5. **Scope of this milestone:** do we target Phases 0–3 + eval harness as the first shippable milestone, or a tighter
-   Phase 0 + efficiency-only cut first?
+1. **Semantic activation (2.5):** `text-embedding-3-small` is configured and the persistent miss-only cache is
+   complete. Decide whether a future release should change `enabled` to `true`; it remains explicit opt-in so opening
+   an ordinary session cannot silently incur embedding spend.
+2. **Provider rollout (6.8):** role-scoped native structured output for Gemini analyst/critic passed the live canary,
+   with compatible plain-JSON fallback. Keep the global default off until the final four golden cases are baselined,
+   then decide whether to enable only those roles or widen the rollout.
+3. **Paid golden completion (5.1):** 11/15 live cases have been exercised after grounding/contract fixes. The remaining
+   Vultures initial/decrement and Wizard of Wor sprite/screen cases need a separate paid completion allowance; pre-call
+   reservations and the runner's cumulative cap are now implemented and tested.
+
+### Future live-validation / A-B backlog — do not lose
+
+- **Finish the fixed-input live baseline:** run `vultures_lives_initial`, `vultures_lives_decrement`,
+  `wor_sprite_enable`, and `wor_screen_ram` with fresh per-case sessions, VICE/Tavily disabled, and both the per-case
+  reservation guard and cumulative runner ceiling enabled. Do not describe the 15-case suite as fully baselined until
+  all four have machine-readable results.
+- **Structured-output A/B:** on the same manifest and provider/model versions, compare the current plain-JSON default
+  (control) with `C64RE_STRUCTURED_OUTPUT_ROLES=analyst,critic` (treatment). Use fresh session roots and at least two
+  repetitions per arm when budget permits; compare pass rate, address/keyword misses, confidence, contract/fallback
+  failures, input/output tokens, estimated cost, LLM-call count, and wall time. Keep VICE/Tavily off so external state
+  does not confound the result. Do not enable native structured output globally unless the treatment has no material
+  quality regression and its fallback behavior remains bounded.
+- **Optional semantic-search A/B:** before changing `config/kb_semantic.json` to `enabled=true`, compare semantic-off
+  against a cold-cache and warm-cache `text-embedding-3-small` run on a small fixed subset. Record embedding calls,
+  cache misses/hits, incremental cost, retrieval relevance, answer quality, and reopen behavior. Automatic embedding
+  remains opt-in until this establishes a worthwhile benefit and an acceptable spend policy.
+- Preserve raw JSONL results and the exact config/environment metadata for every arm. A future comparison should use
+  paired case-level deltas rather than mixing results from different manifests, model revisions, or live emulator
+  states.
 
 ---
 
-_Last updated: 2026-07-16 · Planning pass by Claude (Opus 4.8). Line numbers reference the working tree at planning
-time; re-verify at edit time. Items tagged ✅ were confirmed against the code during planning._
+_Last updated: 2026-07-18 · Original planning pass plus implementation updates. Historical line numbers reference
+the working tree at planning time; re-verify at edit time. Items tagged ✅ were confirmed during planning._

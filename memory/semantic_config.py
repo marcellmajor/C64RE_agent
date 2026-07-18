@@ -9,7 +9,9 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
-CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "kb_semantic.json"
+from c64re_agent.paths import config_dir
+
+CONFIG_PATH = config_dir() / "kb_semantic.json"
 
 
 @dataclass(frozen=True)

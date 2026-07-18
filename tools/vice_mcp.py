@@ -171,7 +171,11 @@ class _ViceMcpClient:
         fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
         res = fut.result(timeout=timeout)
         return [
-            {"name": t.name, "description": t.description}
+            {
+                "name": t.name,
+                "description": t.description,
+                "input_schema": getattr(t, "inputSchema", None),
+            }
             for t in getattr(res, "tools", [])
         ]
 

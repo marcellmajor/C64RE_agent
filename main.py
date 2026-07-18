@@ -36,8 +36,9 @@ from graph.plan_utils import (
     resolve_session_slug,
     slugify,
 )
+from c64re_agent.paths import sessions_dir
 
-SESSIONS_DIR = Path(__file__).resolve().parent / "sessions"
+SESSIONS_DIR = sessions_dir()
 
 
 def _default_thread_id(game: str, question: str) -> str:
@@ -45,8 +46,8 @@ def _default_thread_id(game: str, question: str) -> str:
 
     Same game + question → same thread, so re-running after a crash
     continues on top of the checkpointed state. A different question
-    gets a fresh thread: the state's add-reducer fields (tool_results,
-    messages, llm_usage) would otherwise bleed between questions.
+    gets a fresh thread: accumulated state (bounded tool results, messages,
+    LLM usage) would otherwise bleed between questions.
     `--thread-id` overrides for explicit cross-run continuation.
     """
     q_hash = hashlib.sha1((question or "").encode("utf-8")).hexdigest()[:8]
@@ -209,7 +210,9 @@ def main() -> None:
         "asm_dir": str(args.asm_dir) if args.asm_dir else None,
         "asm_files": list(args.asm_files) if args.asm_files else None,
         "plan": [],
+        "current_step_ids": [],
         "tool_results": [],
+        "tool_call_stats": {},
         "history": [],
         "messages": [],
         "require_vice_approval": True,

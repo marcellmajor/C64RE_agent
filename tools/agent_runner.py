@@ -26,6 +26,7 @@ from typing import Any, Iterator
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.errors import GraphRecursionError
 
+from c64re_agent.paths import sessions_dir
 from graph.build import build_graph
 from graph.plan_utils import (
     RECURSION_LIMIT,
@@ -75,6 +76,7 @@ class TurnResult:
     raw_state: dict[str, Any] = field(default_factory=dict)
     elapsed_s: float = 0.0
     thread_id: str = ""
+    run_id: str = ""
 
 
 @dataclass
@@ -148,7 +150,9 @@ def _initial_state(
         "asm_dir": str(asm_dir) if asm_dir else None,
         "asm_files": [str(path) for path in asm_files] if asm_files else None,
         "plan": [],
+        "current_step_ids": [],
         "tool_results": [],
+        "tool_call_stats": {},
         "history": [],
         "messages": [],
         "require_vice_approval": True,
@@ -195,6 +199,7 @@ def _turn_result_from_state(
         raw_state=final,
         elapsed_s=time.monotonic() - started,
         thread_id=thread_id,
+        run_id=str(final.get("run_id") or ""),
     )
 
 
@@ -528,7 +533,7 @@ def _resolve_code_store(game: str):
     """Locate the persistent CodeKnowledgeStore for a game, if it exists."""
     from code_kb import get_code_store
 
-    sessions = Path("sessions")
+    sessions = sessions_dir()
     root = sessions / resolve_session_slug(game, sessions) / "code_kb"
     if not root.exists():
         return None
@@ -670,7 +675,7 @@ def reset_code_kb(game: str) -> bool:
     user wants a clean slate. Returns True iff something was removed.
     """
     import shutil as _sh
-    sessions = Path("sessions")
+    sessions = sessions_dir()
     target = sessions / resolve_session_slug(game, sessions) / "code_kb"
     if not target.exists():
         return False

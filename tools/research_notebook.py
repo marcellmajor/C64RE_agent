@@ -6,12 +6,14 @@ import hashlib
 import json
 import re
 import shutil
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 
 TURN_ARCHIVE = "turns.jsonl"
+RATING_ARCHIVE = "ratings.jsonl"
 CATALOG_DIR = "dumps"
 CATALOG_FILE = "catalog.json"
 
@@ -73,6 +75,170 @@ def append_turn(session_dir: str | Path, record: dict[str, Any]) -> bool:
     with (root / TURN_ARCHIVE).open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(row, sort_keys=True, default=str) + "\n")
     return True
+
+
+def load_turn_ratings(session_dir: str | Path) -> list[dict[str, Any]]:
+    """Load the append-only human-rating history for a game session."""
+    path = Path(session_dir) / RATING_ARCHIVE
+    if not path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    for raw in path.read_text(errors="replace").splitlines():
+        if not raw.strip():
+            continue
+        try:
+            row = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict) and row.get("run_id"):
+            rows.append(row)
+    return rows
+
+
+def latest_turn_ratings(
+    session_dir: str | Path,
+) -> dict[str, dict[str, Any]]:
+    """Return the latest rating revision keyed by archived run id."""
+    latest: dict[str, dict[str, Any]] = {}
+    for row in load_turn_ratings(session_dir):
+        latest[str(row["run_id"])] = row
+    return latest
+
+
+def record_turn_rating(
+    session_dir: str | Path,
+    *,
+    run_id: str,
+    rating: str,
+    comment: str = "",
+    source: str = "streamlit",
+) -> tuple[dict[str, Any], bool]:
+    """Append a validated rating revision; identical repeats are idempotent."""
+    canonical = str(rating or "").strip().lower()
+    if canonical not in {"helpful", "not_helpful"}:
+        raise ValueError("rating must be 'helpful' or 'not_helpful'")
+    run_id = str(run_id or "").strip()
+    if not run_id:
+        raise ValueError("rating requires an archived run_id")
+    comment = str(comment or "").strip()[:2_000]
+    root = Path(session_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    prior = latest_turn_ratings(root).get(run_id)
+    if (
+        prior
+        and prior.get("rating") == canonical
+        and str(prior.get("comment") or "") == comment
+    ):
+        return prior, False
+    row = {
+        "rating_id": uuid.uuid4().hex,
+        "run_id": run_id,
+        "rating": canonical,
+        "score": 1 if canonical == "helpful" else 0,
+        "comment": comment,
+        "source": str(source or "unknown"),
+        "rated_at": _utc_now(),
+    }
+    with (root / RATING_ARCHIVE).open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, sort_keys=True) + "\n")
+    return row, True
+
+
+def rated_turn_examples(session_dir: str | Path) -> list[dict[str, Any]]:
+    """Join latest human ratings to archived turns for evaluation export."""
+    ratings = latest_turn_ratings(session_dir)
+    return [
+        {**turn, "human_rating": ratings[str(turn.get("run_id"))]}
+        for turn in load_turns(session_dir)
+        if str(turn.get("run_id")) in ratings
+    ]
+
+
+def sync_ratings_to_langsmith(
+    session_dir: str | Path,
+    *,
+    dataset_name: str,
+    client: Any | None = None,
+) -> dict[str, int | str]:
+    """Idempotently create/update one LangSmith example per rated turn.
+
+    This function performs external writes only when called explicitly (the
+    CLI in ``evals.ratings``); recording a Streamlit rating remains local.
+    """
+    dataset_name = str(dataset_name or "").strip()
+    if not dataset_name:
+        raise ValueError("dataset_name is required")
+    if client is None:
+        from langsmith import Client
+
+        client = Client()
+    from langsmith.utils import LangSmithNotFoundError
+
+    try:
+        dataset = client.read_dataset(dataset_name=dataset_name)
+    except LangSmithNotFoundError:
+        dataset = client.create_dataset(
+            dataset_name,
+            description=(
+                "Human-rated C64-RE answers exported from local research "
+                "notebooks. Addresses/evidence remain attached."
+            ),
+        )
+
+    created = updated = 0
+    for turn in rated_turn_examples(session_dir):
+        rating = turn["human_rating"]
+        example_id = uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"c64re-rating:{dataset_name}:{turn['run_id']}",
+        )
+        inputs = {
+            "game": turn.get("game"),
+            "question": turn.get("question"),
+        }
+        outputs = {
+            "answer": turn.get("answer"),
+            "evidence": turn.get("evidence") or [],
+            "open_questions": turn.get("open_questions") or [],
+        }
+        metadata = {
+            "run_id": turn.get("run_id"),
+            "verdict": turn.get("verdict"),
+            "confidence": turn.get("confidence"),
+            "rating": rating.get("rating"),
+            "rating_score": rating.get("score"),
+            "rating_comment": rating.get("comment"),
+            "rated_at": rating.get("rated_at"),
+            "addresses": turn.get("addresses") or [],
+        }
+        try:
+            client.read_example(example_id)
+        except LangSmithNotFoundError:
+            client.create_example(
+                example_id=example_id,
+                dataset_id=dataset.id,
+                inputs=inputs,
+                outputs=outputs,
+                metadata=metadata,
+                split="human_rated",
+            )
+            created += 1
+        else:
+            client.update_example(
+                example_id,
+                dataset_id=dataset.id,
+                inputs=inputs,
+                outputs=outputs,
+                metadata=metadata,
+                split="human_rated",
+            )
+            updated += 1
+    return {
+        "dataset": dataset_name,
+        "rated_turns": created + updated,
+        "created": created,
+        "updated": updated,
+    }
 
 
 def prior_answers_digest(

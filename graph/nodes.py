@@ -25,13 +25,14 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-from graph.llm import get_llm, load_config
+from graph.llm import get_llm, load_config, structured_output_enabled
 from graph import usage as llm_usage
 from graph.plan_utils import (
     MAX_CONSECUTIVE_REVISES,
     MAX_PLAN_STEPS,
     VICE_ADDRESS_ALIASES as _VICE_ADDRESS_ALIASES,
     failed_step_notes,
+    parallel_runnable_steps,
     pending_steps,
     resolve_session_slug,
     runnable_steps,
@@ -40,8 +41,15 @@ from graph.plan_utils import (
     step_status,
 )
 from graph.prompts import MASTER_PREAMBLE, system_message
-from graph.state import C64State
+from graph.state import (
+    C64State,
+    compact_tool_results_update,
+    identify_tool_results,
+    tool_call_total,
+)
+from c64re_agent.paths import sessions_dir
 from memory import KnowledgeStore, extract_hex_addresses, get_store
+from memory.redaction import redact_text, redact_value
 from memory.schema import (
     EVT_ANALYSIS,
     EVT_CONSOLIDATED,
@@ -55,7 +63,7 @@ from memory.schema import (
 )
 from tools import c64_disasm
 
-SESSIONS_DIR = Path(__file__).resolve().parent.parent / "sessions"
+SESSIONS_DIR = sessions_dir()
 
 # Kept for back-compat with anything that imported the old name. New code
 # should call `graph.prompts.system_message(role)` instead.
@@ -372,11 +380,59 @@ def _flatten_lc_ai_message_content(msg: Any) -> str:
     return text
 
 
+def _call_cost_reservation_usd(
+    llm: Any,
+    model_name: str | None,
+    prompt: str,
+    *,
+    system_role: str | None = None,
+    system_text: str | None = None,
+) -> float:
+    """Conservative worst-case cost for one text call before it is sent.
+
+    One character per input token intentionally over-reserves source-heavy
+    prompts, and the configured maximum completion is reserved in full. The
+    cushion covers provider wrappers and native JSON-schema tokens that are
+    not represented in the user/system strings.
+    """
+    max_output = (
+        getattr(llm, "max_tokens", None)
+        or getattr(llm, "max_completion_tokens", None)
+        or 0
+    )
+    try:
+        max_output = max(0, int(max_output))
+    except (TypeError, ValueError):
+        max_output = 0
+    system = (
+        system_text
+        if system_text is not None
+        else system_message(system_role or "")
+    )
+    estimated_input = len(system) + len(prompt) + 4_096
+    return llm_usage.estimate_cost_usd(
+        model_name, estimated_input, max_output,
+    )
+
+
+def _remaining_llm_budget(state: C64State) -> float:
+    """Remaining priced-call allowance including this node's pending calls."""
+    from graph.routers import budget_cap
+
+    return max(
+        0.0,
+        budget_cap()
+        - float(state.get("budget_used") or 0.0)
+        - llm_usage.pending_cost_usd(),
+    )
+
+
 def _invoke_one(
     role: str,
     prompt: str,
     *,
     system_role: str | None = None,
+    max_cost_usd: float | None = None,
 ) -> tuple[str, str | None, dict[str, Any] | None]:
     """Run a single LLM call. Returns (content, error_or_None, usage_entry).
 
@@ -400,6 +456,28 @@ def _invoke_one(
         llm = get_llm(role)
         model_name = getattr(llm, "model_name", None) or getattr(llm, "model", None)
         sys_prompt = system_message(system_role or role)
+        reservation = _call_cost_reservation_usd(
+            llm, model_name, prompt, system_role=system_role or role,
+        )
+        if max_cost_usd is not None and reservation > max_cost_usd:
+            error = (
+                f"cost reservation ${reservation:.4f} exceeds remaining "
+                f"run allowance ${max_cost_usd:.4f}"
+            )
+            entry = llm_usage.record({
+                "role": role,
+                "as_role": as_role,
+                "model": model_name,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cost_usd": 0.0,
+                "reserved_cost_usd": reservation,
+                "ok": False,
+                "transport_ok": False,
+                "rejection": "cost_reservation",
+                "error": error,
+            })
+            return "", error, entry
         msg = llm.invoke([SystemMessage(sys_prompt), HumanMessage(prompt)])
     except Exception as e:  # noqa: BLE001
         entry = llm_usage.record({
@@ -436,6 +514,180 @@ def _invoke_one(
     return content, None, entry
 
 
+_ROLE_JSON_SCHEMAS: dict[str, dict[str, Any]] = {
+    "planner": {
+        "title": "C64REPlanner",
+        "type": "object",
+        "properties": {"plan": {"type": "array", "items": {"type": "object"}}},
+        "required": ["plan"],
+    },
+    "executor": {
+        "title": "C64REExecutor",
+        "type": "object",
+        "properties": {
+            "step_id": {"type": "string"},
+            "tool": {"type": "string"},
+            "args": {"type": "object"},
+            "rationale": {"type": "string"},
+        },
+        "required": ["step_id", "tool", "args"],
+    },
+    "synthesizer": {
+        "title": "C64RESynthesizer",
+        "type": "object",
+        "properties": {
+            "labels": {"type": "array"},
+            "routines": {"type": "array"},
+            "data_structures": {"type": "array"},
+            "hypotheses": {"type": "array"},
+            "notes": {"type": "string"},
+        },
+        "minProperties": 1,
+    },
+    "analyst": {
+        "title": "C64REAnalyst",
+        "type": "object",
+        "properties": {
+            "answer": {"type": "string"},
+            "confidence": {"type": "number"},
+            "evidence": {"type": "array"},
+            "open_questions": {"type": "array"},
+        },
+        "required": ["answer", "confidence", "evidence", "open_questions"],
+    },
+    "critic": {
+        "title": "C64RECritic",
+        "type": "object",
+        "properties": {
+            "decision": {"type": "string", "enum": ["accept", "revise", "replan"]},
+            "critique": {"type": "string"},
+            "suggested_steps": {"type": "array"},
+            "refuted_hypotheses": {"type": "array"},
+            "optional_followups": {"type": "array"},
+        },
+        "required": ["decision", "critique"],
+    },
+    "curator": {
+        "title": "C64RECurator",
+        "type": "object",
+        "properties": {
+            "summary": {"type": "string"},
+            "addresses_kept": {"type": "array"},
+            "events_compacted": {"type": "array"},
+        },
+        "required": ["summary", "addresses_kept", "events_compacted"],
+    },
+}
+
+
+def _invoke_one_structured(
+    role: str,
+    prompt: str,
+    *,
+    contract_role: str,
+    max_cost_usd: float | None = None,
+) -> tuple[str, str | None, dict[str, Any] | None]:
+    """Try one native JSON-schema call and preserve ordinary usage telemetry."""
+    model_name = None
+    reservation = 0.0
+    try:
+        llm = get_llm(role)
+        model_name = getattr(llm, "model_name", None) or getattr(llm, "model", None)
+        reservation = _call_cost_reservation_usd(
+            llm, model_name, prompt, system_role=contract_role,
+        )
+        if max_cost_usd is not None and reservation > max_cost_usd:
+            error = (
+                f"cost reservation ${reservation:.4f} exceeds remaining "
+                f"run allowance ${max_cost_usd:.4f}"
+            )
+            entry = llm_usage.record({
+                "role": role,
+                "as_role": contract_role if contract_role != role else None,
+                "model": model_name,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cost_usd": 0.0,
+                "reserved_cost_usd": reservation,
+                "ok": False,
+                "transport_ok": False,
+                "structured_output": True,
+                "rejection": "cost_reservation",
+                "error": error,
+            })
+            return "", error, entry
+        schema = _ROLE_JSON_SCHEMAS[contract_role]
+        structured = llm.with_structured_output(
+            schema,
+            method="json_schema",
+            include_raw=True,
+            strict=False,
+        )
+        result = structured.invoke([
+            SystemMessage(system_message(contract_role)),
+            HumanMessage(prompt),
+        ])
+    except Exception as exc:  # noqa: BLE001
+        entry = llm_usage.record({
+            "role": role,
+            "as_role": contract_role if contract_role != role else None,
+            "model": model_name,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cost_usd": 0.0,
+            "reserved_cost_usd": reservation,
+            "ok": False,
+            "transport_ok": False,
+            "structured_output": True,
+            "error": f"{type(exc).__name__}: {exc}"[:200],
+        })
+        return "", f"{type(exc).__name__}: {exc}", entry
+
+    raw_message = None
+    parsing_error = None
+    if isinstance(result, dict) and (
+        "parsed" in result or "parsing_error" in result or "raw" in result
+    ):
+        parsed = result.get("parsed")
+        raw_message = result.get("raw")
+        parsing_error = result.get("parsing_error")
+    else:
+        parsed = result
+    if hasattr(parsed, "model_dump"):
+        parsed = parsed.model_dump()
+
+    in_tok, out_tok = (
+        llm_usage.extract_usage(raw_message)
+        if raw_message is not None else (0, 0)
+    )
+    entry = llm_usage.record({
+        "role": role,
+        "as_role": contract_role if contract_role != role else None,
+        "model": model_name,
+        "input_tokens": in_tok,
+        "output_tokens": out_tok,
+        "cost_usd": llm_usage.estimate_cost_usd(
+            model_name, in_tok, out_tok,
+        ),
+        "ok": parsed is not None and parsing_error is None,
+        "transport_ok": True,
+        "structured_output": True,
+    })
+    if parsing_error is not None or parsed is None:
+        err = (
+            f"structured parse failed: {parsing_error}"
+            if parsing_error is not None else "structured response had no parsed value"
+        )
+        llm_usage.mark_failed(entry, err)
+        return "", err, entry
+    try:
+        return json.dumps(parsed, ensure_ascii=False), None, entry
+    except (TypeError, ValueError) as exc:
+        err = f"structured response is not JSON serializable: {exc}"
+        llm_usage.mark_failed(entry, err)
+        return "", err, entry
+
+
 def _safe_invoke(
     role: str,
     prompt: str,
@@ -443,6 +695,7 @@ def _safe_invoke(
     backup_roles: list[str] | None = None,
     *,
     allow_plan_steps_array: bool = False,
+    remaining_budget_usd: float | None = None,
 ) -> dict[str, Any] | list[Any]:
     """Try the LLM, with optional backup providers, then degrade to fallback.
 
@@ -458,12 +711,69 @@ def _safe_invoke(
     chain = [role, *(backup_roles or [])]
     errors: list[str] = []
     last_entry: dict[str, Any] | None = None
+    reservation_denied = False
+    remaining = remaining_budget_usd
+
+    def _charge(entry: dict[str, Any] | None) -> None:
+        nonlocal remaining
+        if remaining is not None and entry is not None:
+            remaining = max(
+                0.0, remaining - float(entry.get("cost_usd") or 0.0),
+            )
+
+    def _hold_unknown_transport_reservation(
+        entry: dict[str, Any] | None,
+    ) -> None:
+        """Do not reuse worst-case allowance after an unknown transport failure."""
+        nonlocal remaining
+        if (
+            remaining is None
+            or entry is None
+            or entry.get("transport_ok") is not False
+            or entry.get("rejection") == "cost_reservation"
+        ):
+            return
+        reserved = float(entry.get("reserved_cost_usd") or 0.0)
+        actual = float(entry.get("cost_usd") or 0.0)
+        remaining = max(0.0, remaining - max(0.0, reserved - actual))
 
     for r in chain:
-        content, err, entry = _invoke_one(r, prompt, system_role=role)
+        if structured_output_enabled(r) and role in _ROLE_JSON_SCHEMAS:
+            content, err, entry = _invoke_one_structured(
+                r, prompt, contract_role=role, max_cost_usd=remaining,
+            )
+            _charge(entry)
+            if err:
+                if entry and entry.get("rejection") == "cost_reservation":
+                    reservation_denied = True
+                else:
+                    # A structured transport exception may occur after the
+                    # provider accepted/billed the request but before usage
+                    # metadata returned. Hold its full reservation before the
+                    # same-role plain retry; `_invoke_one` then performs a
+                    # fresh reservation check against the reduced remainder.
+                    _hold_unknown_transport_reservation(entry)
+                    print(
+                        f"[llm:{r}] native structured output unavailable — "
+                        f"falling back to plain JSON: {err}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    errors.append(f"{r} structured: {err}")
+                    content, err, entry = _invoke_one(
+                        r, prompt, system_role=role, max_cost_usd=remaining,
+                    )
+                    _charge(entry)
+        else:
+            content, err, entry = _invoke_one(
+                r, prompt, system_role=role, max_cost_usd=remaining,
+            )
+            _charge(entry)
         if entry is not None:
             last_entry = entry
         if err:
+            if entry and entry.get("rejection") == "cost_reservation":
+                reservation_denied = True
             print(
                 f"[llm:{r}] CALL FAILED — {err}",
                 file=sys.stderr, flush=True,
@@ -546,7 +856,13 @@ def _safe_invoke(
     # heuristic fallback. Flag the final attempt (no extra call counted).
     if last_entry is not None:
         last_entry["fallback_activated"] = True
-    return {"_error": " ; ".join(errors) or "all LLM calls failed", **fallback}
+        if reservation_denied:
+            last_entry["budget_reservation_exhausted"] = True
+    return {
+        "_error": " ; ".join(errors) or "all LLM calls failed",
+        "_budget_exhausted": reservation_denied,
+        **fallback,
+    }
 
 
 def _usage_update() -> dict[str, Any]:
@@ -559,7 +875,7 @@ def _usage_update() -> dict[str, Any]:
     entries = llm_usage.drain()
     if not entries:
         return {}
-    return {
+    update: dict[str, Any] = {
         "llm_usage": entries,
         "budget_used": sum(float(e.get("cost_usd") or 0.0) for e in entries),
         # Token fallback budget (review finding 3): always populated, so
@@ -569,6 +885,9 @@ def _usage_update() -> dict[str, Any]:
             for e in entries
         ),
     }
+    if any(bool(e.get("budget_reservation_exhausted")) for e in entries):
+        update["budget_reservation_exhausted"] = True
+    return update
 
 
 # --------------------------------------------------------------------------- #
@@ -599,15 +918,142 @@ def _addr_to_int(value: Any) -> int | None:
     return None
 
 
+_CODE_DIGEST_STOP_WORDS = frozenset({
+    "about", "after", "around", "before", "begin", "caller", "control",
+    "current", "does", "from", "have", "into", "player", "players",
+    "produce", "provided", "remaining", "starts", "stored", "their",
+    "there", "these", "value", "where", "which", "with",
+})
+
+
+def _code_digest_terms(question: str) -> list[str]:
+    """Small stable keyword set for deterministic partial-ASM retrieval."""
+    terms: list[str] = []
+    for token in re.findall(r"[A-Za-z0-9_]+", question.lower()):
+        if len(token) < 4 or token in _CODE_DIGEST_STOP_WORDS:
+            continue
+        if token not in terms:
+            terms.append(token)
+    return terms[:8]
+
+
+def _code_kb_digest_for_question(
+    handle: str | None,
+    question: str,
+    *,
+    max_chars: int = 10_000,
+) -> str:
+    """Return high-density excerpts from explicitly selected ASM documents.
+
+    Partial assembly was previously ingested only into Code-KB while the
+    planner/analyst digest contained only parent-KB facts. That made exact,
+    human-annotated evidence invisible unless the planner happened to choose a
+    ``code_kb search`` step. Retrieval here is deterministic and local: rank
+    windows by distinct question-keyword density, then retain non-overlapping
+    excerpts under a hard character cap.
+    """
+    if not handle or not question.strip():
+        return ""
+    terms = _code_digest_terms(question)
+    if not terms:
+        return ""
+    try:
+        from code_kb import get_code_store
+
+        rows = get_code_store(handle).query(
+            "SELECT path, content FROM asm_docs ORDER BY path",
+        )
+    except Exception:  # noqa: BLE001
+        return ""
+
+    candidates: list[tuple[int, str, int, int, str]] = []
+    for row in rows:
+        content = str(row.get("content") or "")
+        lower = content.lower()
+        path = str(row.get("path") or "?")
+        positions: set[int] = set()
+        for term in terms:
+            positions.update(m.start() for m in re.finditer(re.escape(term), lower))
+        for pos in sorted(positions):
+            start = max(0, pos - 500)
+            end = min(len(content), pos + 900)
+            window_lower = lower[start:end]
+            matched = sum(1 for term in terms if term in window_lower)
+            occurrences = sum(window_lower.count(term) for term in terms)
+            score = matched * 100 + min(occurrences, 20)
+            candidates.append((score, path, start, end, content[start:end]))
+
+        # A deliberately selected, compact excerpt may encode the answer only
+        # in its instructions and addresses (for example a two-call wrapper)
+        # without repeating the natural-language words from the question.
+        # Keep those small source documents visible as a low-ranked fallback;
+        # lexical matches still sort first and large listings remain bounded.
+        compact_limit = min(4_000, max(800, max_chars // 2))
+        if content.strip() and len(content) <= compact_limit:
+            candidates.append((1, path, 0, len(content), content))
+
+    chosen: list[tuple[str, int, int, str]] = []
+    for _score, path, start, end, snippet in sorted(
+        candidates, key=lambda item: (-item[0], item[1], item[2]),
+    ):
+        if any(
+            path == prior_path and start < prior_end and end > prior_start
+            for prior_path, prior_start, prior_end, _ in chosen
+        ):
+            continue
+        chosen.append((path, start, end, snippet))
+        if len(chosen) >= 6:
+            break
+    if not chosen:
+        return ""
+
+    blocks = [
+        "## Question-relevant partial-assembly excerpts",
+        "These are deterministic excerpts from explicitly selected ASM files. "
+        "Treat their dump-consistent instructions as primary static evidence, "
+        "even when the source has no natural-language labels.",
+    ]
+    used = sum(len(line) + 1 for line in blocks)
+    for path, start, _end, snippet in chosen:
+        block = (
+            f"\n### {Path(path).name} (character offset {start})\n"
+            f"{redact_text(snippet).strip()}"
+        )
+        remaining = max_chars - used
+        if remaining <= 120:
+            break
+        if len(block) > remaining:
+            block = block[: max(0, remaining - 16)].rstrip() + "\n…[truncated]"
+        blocks.append(block)
+        used += len(block) + 1
+    return "\n".join(blocks)[:max_chars]
+
+
+def _combined_kb_digest(
+    state: C64State,
+    store: KnowledgeStore,
+    *,
+    max_chars: int = 32_000,
+) -> str:
+    code_digest = state.get("code_kb_digest") or _code_kb_digest_for_question(
+        state.get("code_kb_handle"), state.get("question", "") or "",
+    )
+    parent_limit = max(4_000, max_chars - len(code_digest) - 2)
+    parent = store.digest_for_question(
+        state.get("question", "") or "", max_chars=parent_limit,
+    )
+    if not code_digest:
+        return parent[:max_chars]
+    return (parent + "\n\n" + code_digest)[:max_chars]
+
+
 def _kb_digest_for_state(state: C64State) -> str:
-    """Build (or reuse) the question-relevant KB digest for this state."""
+    """Build the combined parent-KB and selected-ASM evidence digest."""
     handle = state.get("kb_handle")
     if not handle:
         return "_(no KB handle yet)_"
     store = get_store(handle)
-    return store.digest_for_question(
-        state.get("question", "") or "", max_chars=32_000,
-    )
+    return _combined_kb_digest(state, store)
 
 
 def _step_for(state: C64State, step_id: str | None) -> dict[str, Any]:
@@ -773,6 +1219,9 @@ def _normalize_plan_ids(plan: list[dict[str, Any]], state: C64State) -> list[dic
         id_map.setdefault(old_id, new_id)
         s = dict(step)
         s["id"] = new_id
+        s["tool"] = str(s.get("tool") or "kb")
+        if not isinstance(s.get("args"), dict):
+            s["args"] = {}
         normalized.append(s)
 
     for s in normalized:
@@ -860,7 +1309,14 @@ def load_inputs(state: C64State) -> dict[str, Any]:
     # Build the initial question-relevant digest so the planner can avoid
     # repeating work the partial-asm or text notes already answered.
     question = state.get("question", "") or ""
-    initial_digest = store.digest_for_question(question, max_chars=24_000)
+    code_kb_digest = _code_kb_digest_for_question(
+        code_kb_handle, question, max_chars=10_000,
+    )
+    initial_digest = store.digest_for_question(
+        question, max_chars=max(4_000, 32_000 - len(code_kb_digest) - 2),
+    )
+    if code_kb_digest:
+        initial_digest = (initial_digest + "\n\n" + code_kb_digest)[:32_000]
     try:
         from tools.research_notebook import prior_answers_digest
 
@@ -896,11 +1352,13 @@ def load_inputs(state: C64State) -> dict[str, Any]:
         ),
         "kb_handle": kb_handle,
         "code_kb_handle": code_kb_handle,
+        "code_kb_digest": code_kb_digest,
         "kb_digest": initial_digest,
         "iteration": 0,
         "replan_count": 0,
         "revise_count": 0,
         "budget_used": 0.0,
+        "budget_reservation_exhausted": False,
         "tokens_used": 0,
         # Substantive (non-bookkeeping) events only — same measure the
         # critic uses, so the first verdict's growth check is honest.
@@ -1091,8 +1549,33 @@ def write_report(state: C64State) -> dict[str, Any]:
             "answer": answer,
         })[:24]
 
+    state_tool_results = list(state.get("tool_results", []) or [])
+    report_tool_results = state_tool_results[-20:]
+    if store and any(r.get("_event_id") for r in report_tool_results):
+        event_ids = [
+            str(r["_event_id"])
+            for r in report_tool_results if r.get("_event_id")
+        ]
+        placeholders = ",".join("?" for _ in event_ids)
+        persisted_by_id: dict[str, dict[str, Any]] = {}
+        if placeholders:
+            for row in store.query(
+                f"SELECT id, payload_json FROM events WHERE id IN ({placeholders})",
+                tuple(event_ids),
+            ):
+                try:
+                    persisted_by_id[str(row["id"])] = json.loads(
+                        row["payload_json"],
+                    )
+                except (TypeError, json.JSONDecodeError):
+                    continue
+        report_tool_results = [
+            persisted_by_id.get(str(result.get("_event_id")), result)
+            for result in report_tool_results
+        ]
+
     tr_lines = []
-    for r in state.get("tool_results", [])[-20:]:
+    for r in report_tool_results:
         ok = "✓" if r.get("ok") else "✗"
         tool = r.get("tool", "?")
         step_id = r.get("step_id", "?")
@@ -1182,11 +1665,12 @@ def write_report(state: C64State) -> dict[str, Any]:
 
         # Which budget limit (if any) terminated the run — recomputed
         # against the same thresholds the router enforces.
-        from graph.routers import BUDGET_CAP, token_budget
+        from graph.routers import budget_cap, token_budget
+        usd_cap = budget_cap()
         token_cap = token_budget()
         enforced = []
-        if budget_used >= BUDGET_CAP:
-            enforced.append(f"USD cap (${BUDGET_CAP:.2f})")
+        if budget_used >= usd_cap:
+            enforced.append(f"USD cap (${usd_cap:.2f})")
         if tokens_used >= token_cap:
             enforced.append(f"token cap ({token_cap:,})")
 
@@ -1200,7 +1684,7 @@ def write_report(state: C64State) -> dict[str, Any]:
             "\n".join(u_lines)
             + "\n\n**Budget:**\n"
             + f"- total tokens: {tokens_used:,} / {token_cap:,} (token cap)\n"
-            + f"- estimated cost: ${budget_used:.4f} / ${BUDGET_CAP:.2f} (USD cap)\n"
+            + f"- estimated cost: ${budget_used:.4f} / ${usd_cap:.2f} (USD cap)\n"
             + f"- calls priced/unpriced: {priced_calls}/{unpriced_calls}\n"
             + f"- budget limit enforced: {', '.join(enforced) or 'none'}"
             + pricing_note
@@ -1208,14 +1692,21 @@ def write_report(state: C64State) -> dict[str, Any]:
     else:
         usage_block = "_no LLM usage recorded_"
 
-    all_tool_results = state.get("tool_results", []) or []
-    tool_counts: dict[str, list[int]] = {}
-    for r in all_tool_results:
-        t = str(r.get("tool") or "?")
-        row = tool_counts.setdefault(t, [0, 0])
-        row[0] += 1
-        if not r.get("ok"):
-            row[1] += 1
+    durable_tool_stats = state.get("tool_call_stats") or {}
+    tool_counts: dict[str, list[int]] = {
+        str(tool): [
+            int(values.get("calls", 0)),
+            int(values.get("failures", 0)),
+        ]
+        for tool, values in durable_tool_stats.items()
+    }
+    if not tool_counts:
+        for r in state_tool_results:
+            t = str(r.get("tool") or "?")
+            row = tool_counts.setdefault(t, [0, 0])
+            row[0] += 1
+            if not r.get("ok"):
+                row[1] += 1
     tool_lines = [
         f"- {t}: {n} call(s), {f} failure(s)"
         for t, (n, f) in sorted(tool_counts.items())
@@ -1283,6 +1774,7 @@ _generated {completed_at.isoformat()}_
     report_path.write_text(report)
     append_turn(out_dir, {
         "run_id": run_id,
+        "game": str(game),
         "completed_at": completed_at.isoformat(),
         "question": str(state.get("question") or ""),
         "answer": str(answer),
@@ -1325,7 +1817,7 @@ _generated {completed_at.isoformat()}_
                 "cost_usd": float(state.get("budget_used") or 0.0),
                 "tokens": total_tokens,
                 "llm_calls": len(usage_entries),
-                "tool_calls": len(state.get("tool_results") or []),
+                "tool_calls": tool_call_total(state),
                 "elapsed_s": elapsed_s,
                 "termination_reason": state.get("termination_reason"),
                 "answer_excerpt": str(answer)[:1_000],
@@ -1482,8 +1974,14 @@ def planner_node(state: C64State) -> dict[str, Any]:
         "planner", prompt, {"plan": fallback_plan},
         backup_roles=["analyst", "executor", "critic"],
         allow_plan_steps_array=True,
+        remaining_budget_usd=_remaining_llm_budget(state),
     )
-    if isinstance(out, list):
+    if isinstance(out, dict) and out.get("_budget_exhausted"):
+        # Do not turn an exhausted invocation into the seven-step heuristic
+        # fallback plan: that would re-enter tools/curator and repeatedly
+        # attempt calls that the reservation guard must continue rejecting.
+        plan_raw = []
+    elif isinstance(out, list):
         plan_raw = out
     elif isinstance(out, dict):
         plan_raw = out.get("plan") or fallback_plan
@@ -1548,10 +2046,31 @@ def executor_node(state: C64State) -> dict[str, Any]:
     # step being retried never starves fresh work.
     runnable = runnable_steps(state)
 
+    parallel = parallel_runnable_steps(state)
+    if parallel:
+        step_ids = [str(step["id"]) for step in parallel]
+        return {
+            "current_step_id": None,
+            "current_step_ids": step_ids,
+            "plan_blocked": False,
+            "messages": [AIMessage(content=(
+                "Executor selected read-only fan-out: "
+                + ", ".join(
+                    f"{step['id']}→{step['tool']}" for step in parallel
+                )
+                + "."
+            ))],
+            **_usage_update(),
+        }
+
     if not runnable:
         pending = [s for s in plan if str(s.get("id")) not in status.done]
         if not pending:
-            return {"current_step_id": None, "plan_blocked": False}
+            return {
+                "current_step_id": None,
+                "current_step_ids": [],
+                "plan_blocked": False,
+            }
         # Blocked plan: every pending step has an unsatisfied dependency
         # (a prerequisite that failed permanently, a dep id missing from
         # the plan, or a dependency cycle). The old fallback dispatched
@@ -1594,8 +2113,25 @@ def executor_node(state: C64State) -> dict[str, Any]:
             })
         return {
             "current_step_id": None,
+            "current_step_ids": [],
             "plan_blocked": True,
             "tool_results": blocked_results,
+            "tool_call_stats": {
+                str(tool): {
+                    "calls": sum(
+                        1 for result in blocked_results
+                        if str(result.get("tool") or "?") == str(tool)
+                    ),
+                    "failures": sum(
+                        1 for result in blocked_results
+                        if str(result.get("tool") or "?") == str(tool)
+                    ),
+                }
+                for tool in {
+                    str(result.get("tool") or "?")
+                    for result in blocked_results
+                }
+            },
             "messages": [AIMessage(content=(
                 f"Executor: plan blocked — {len(pending)} step(s) with "
                 f"unsatisfiable dependencies ({', '.join(blocked_ids)}); "
@@ -1621,6 +2157,7 @@ def executor_node(state: C64State) -> dict[str, Any]:
     if not prev_failures and step_is_concrete(nxt):
         return {
             "current_step_id": step_id,
+            "current_step_ids": [],
             "plan_blocked": False,
             "messages": [AIMessage(content=(
                 f"Executor selected step {step_id} → {nxt['tool']} "
@@ -1659,6 +2196,7 @@ def executor_node(state: C64State) -> dict[str, Any]:
             "args": nxt.get("args") or {},
             "rationale": "fallback — LLM unavailable",
         },
+        remaining_budget_usd=_remaining_llm_budget(state),
     )
 
     # Merge enriched args back into the plan step (never clobber id/tool/deps).
@@ -1677,6 +2215,7 @@ def executor_node(state: C64State) -> dict[str, Any]:
 
     return {
         "current_step_id": step_id,
+        "current_step_ids": [],
         "plan": updated_plan,
         "plan_blocked": False,
         "messages": [
@@ -1793,16 +2332,21 @@ def _mechanical_extract(
             if addr is None:
                 continue
             reasons = "; ".join(str(x) for x in (c.get("reasons") or [])[:4])
+            candidate_type = str(
+                c.get("candidate_type") or "loop",
+            ).replace("_", " ")
             store.append_event(EVT_HYPOTHESIS, "synthesizer_mechanical", {
                 # Deterministic id: re-detection updates instead of duplicating.
                 "id": f"h_loop_{addr:04x}",
                 "text": (
-                    f"Main-loop candidate at ${addr:04X} "
+                    f"{candidate_type.title()} candidate at ${addr:04X} "
                     f"(score {c.get('score')}): {reasons}"
                 ),
                 "status": "open",
                 "evidence": [ev_id],
                 "provenance": "mechanical",
+                "candidate_type": c.get("candidate_type"),
+                "metrics": c.get("metrics") or {},
             })
             counts["hypotheses"] += 1
 
@@ -1971,17 +2515,25 @@ def synthesizer_node(state: C64State) -> dict[str, Any]:
         return {"messages": [AIMessage(content="Synthesizer: no KB handle.")]}
 
     store = get_store(state["kb_handle"])
-    all_results = state.get("tool_results", []) or []
+    all_results = identify_tool_results(state.get("tool_results", []) or [])
 
     # ---- Stage 1: idempotent recording of raw tool_results ----
     new_raw: list[dict[str, Any]] = []
     new_event_ids: list[str] = []
+    event_id_by_result: dict[str, str] = {}
     for r in all_results:
-        if store.has_tool_result(r):
+        result_id = str(r["_state_result_id"])
+        compact_event_id = str(r.get("_event_id") or "")
+        if compact_event_id:
+            event_id_by_result[result_id] = compact_event_id
             continue
-        new_event_ids.append(
-            store.append_event(EVT_TOOL_RESULT, "synthesizer", r),
-        )
+        existing_event_id = store.tool_result_event_id(r)
+        if existing_event_id:
+            event_id_by_result[result_id] = existing_event_id
+            continue
+        event_id = store.append_event(EVT_TOOL_RESULT, "synthesizer", r)
+        new_event_ids.append(event_id)
+        event_id_by_result[result_id] = event_id
         new_raw.append(r)
 
     # ---- Stage 1.5: mechanical extraction (structured outputs) ----
@@ -1991,8 +2543,22 @@ def synthesizer_node(state: C64State) -> dict[str, Any]:
             mech_counts[k] += v
 
     # ---- Stage 2: batched LLM extraction of structured facts ----
-    processed = int(state.get("synth_processed_count", 0) or 0)
-    unprocessed = all_results[processed:]
+    result_ids = [str(r["_state_result_id"]) for r in all_results]
+    prior_processed_ids = {
+        str(result_id)
+        for result_id in (state.get("synth_processed_result_ids") or [])
+    }
+    if not prior_processed_ids:
+        # Durable checkpoints written before tracker 4.8 carry only the
+        # numeric prefix cursor. Migrate it once into stable identities.
+        legacy_processed = max(
+            0, min(int(state.get("synth_processed_count", 0) or 0), len(all_results)),
+        )
+        prior_processed_ids.update(result_ids[:legacy_processed])
+    unprocessed = [
+        result for result in all_results
+        if str(result["_state_result_id"]) not in prior_processed_ids
+    ]
     worthy = [r for r in unprocessed if _llm_worthy_result(r)]
     worthy_chars = sum(len(str(r.get("data", ""))) for r in worthy)
     # The analyst runs next once no step needs a (re)run — extraction
@@ -2010,12 +2576,19 @@ def synthesizer_node(state: C64State) -> dict[str, Any]:
     notes_msg = ""
     annotate_notes: list[str] = []
     new_processed_count: int | None = None
+    processed_ids = set(prior_processed_ids)
     if not worthy and unprocessed:
         # Nothing LLM-worthy in the tail — mark it considered.
         new_processed_count = len(all_results)
+        processed_ids.update(
+            str(result["_state_result_id"]) for result in unprocessed
+        )
 
     if flush:
         new_processed_count = len(all_results)
+        processed_ids.update(
+            str(result["_state_result_id"]) for result in unprocessed
+        )
         # Compact view of the batched tool outputs for the extractor.
         # (Results recorded in earlier deferred passes are labelled by
         # tool/step_id; their event ids live in the KB.)
@@ -2046,6 +2619,7 @@ def synthesizer_node(state: C64State) -> dict[str, Any]:
             fallback={"labels": [], "routines": [], "data_structures": [],
                       "hypotheses": [], "notes": ""},
             backup_roles=["analyst", "planner", "executor"],
+            remaining_budget_usd=_remaining_llm_budget(state),
         )
 
         # Layer-1 annotation candidates queued by the routines loop and
@@ -2336,11 +2910,23 @@ def synthesizer_node(state: C64State) -> dict[str, Any]:
     # one batch stale for the executor prompt — tracker 1.5).
     update: dict[str, Any] = {}
     if flush or plan_drained or any(mech_counts.values()) or not all_results:
-        update["kb_digest"] = store.digest_for_question(
-            state.get("question", "") or "", max_chars=32_000,
-        )
+        update["kb_digest"] = _combined_kb_digest(state, store)
     if new_processed_count is not None:
         update["synth_processed_count"] = new_processed_count
+    bounded_processed_ids = [
+        result_id for result_id in result_ids if result_id in processed_ids
+    ]
+    if bounded_processed_ids != list(
+        state.get("synth_processed_result_ids") or [],
+    ):
+        update["synth_processed_result_ids"] = bounded_processed_ids
+    compactable = {
+        result_id: event_id_by_result[result_id]
+        for result_id in bounded_processed_ids
+        if event_id_by_result.get(result_id)
+    }
+    if compactable:
+        update["tool_results"] = compact_tool_results_update(compactable)
 
     deferred = 0 if flush else len(worthy)
     s = store.stats()
@@ -2416,6 +3002,7 @@ def curator_node(state: C64State) -> dict[str, Any]:
         fallback={"summary": "", "addresses_kept": [],
                   "events_compacted": event_ids},
         backup_roles=["analyst", "planner", "critic"],
+        remaining_budget_usd=_remaining_llm_budget(state),
     )
 
     summary = (out.get("summary") or "").strip() or out.get("_text", "")
@@ -2431,14 +3018,11 @@ def curator_node(state: C64State) -> dict[str, Any]:
             "through_ts": through_ts,
         })
 
-    # NB: `tool_results` uses an `add` reducer in C64State, so we cannot
-    # shrink it from a node return. The analyst is shielded from blow-up
-    # because it reads via `digest_for_question` (which caps recent
-    # excerpts), not by walking `state["tool_results"]` directly.
+    # Raw checkpoint copies are independently compacted by the synthesizer's
+    # bounded result reducer (tracker 4.8). This curator owns semantic KB
+    # compaction; the two mechanisms deliberately have separate provenance.
     return {
-        "kb_digest": store.digest_for_question(
-            state.get("question", "") or "", max_chars=32_000,
-        ),
+        "kb_digest": _combined_kb_digest(state, store),
         "messages": [
             AIMessage(content=f"Curator compacted {len(event_ids)} events."),
         ],
@@ -2526,6 +3110,7 @@ def analyst_node(state: C64State) -> dict[str, Any]:
     out = _safe_invoke(
         "analyst", prompt, fallback,
         backup_roles=["critic", "synthesizer", "planner", "executor"],
+        remaining_budget_usd=_remaining_llm_budget(state),
     )
 
     candidate = {k: out.get(k, fallback[k]) for k in fallback}
@@ -2630,6 +3215,7 @@ def critic_node(state: C64State) -> dict[str, Any]:
     out = _safe_invoke(
         "critic", prompt, fallback,
         backup_roles=["analyst", "planner", "synthesizer"],
+        remaining_budget_usd=_remaining_llm_budget(state),
     )
 
     decision = out.get("decision") or fallback["decision"]
@@ -2768,6 +3354,9 @@ def _record_result(
     snippet = str(data)[:120].replace("\n", " ")
     return {
         "tool_results": [result],
+        "tool_call_stats": {
+            str(tool): {"calls": 1, "failures": 0 if ok else 1},
+        },
         "messages": [
             AIMessage(content=f"[tool:{tool}] {badge} step={step_id} — {snippet}")
         ],
@@ -2828,6 +3417,9 @@ def _vice_normalize_method(raw_method: str) -> str:
         "vice.memory.monotonic_scan": "vice.memory.monotonic_scan",
         "trace": "vice.trace",
         "vice.trace": "vice.trace",
+        "poke_verify": "vice.poke_verify",
+        "poke_and_peek": "vice.poke_verify",
+        "vice.poke_verify": "vice.poke_verify",
         # ---- registers ----
         "registers": "vice.registers.get",
         "registers_get": "vice.registers.get",
@@ -2916,6 +3508,7 @@ def _vice_normalize_method(raw_method: str) -> str:
 
 _MUTATING_VICE_METHODS = frozenset({
     "vice.trace",
+    "vice.poke_verify",
     "vice.memory.write",
     "vice.memory.fill",
     "vice.execution.run",
@@ -3065,10 +3658,43 @@ def _vice_normalize_args(method: str, args: dict[str, Any]) -> dict[str, Any]:
         out: dict[str, Any] = {
             "address": address,
             "size": int(max(1, min(65535, int(size)))),
+            # The live vice-mcp server can return a compact hex string; the
+            # agent's deterministic formatter needs explicit byte values.
+            "encoding": "array",
         }
         if a.get("bank"):
             out["bank"] = str(a["bank"])
         return out
+
+    if method == "vice.memory.write":
+        address = _extract_vice_address(a)
+        if address is None:
+            raise ViceArgsError(
+                "vice.memory.write requires an `address` argument."
+            )
+        raw_data = a.get("data")
+        if raw_data is None:
+            raw_data = a.get("values")
+        if raw_data is None and a.get("value") is not None:
+            raw_data = [a.get("value")]
+        if isinstance(raw_data, (bytes, bytearray)):
+            raw_data = list(raw_data)
+        if not isinstance(raw_data, list) or not raw_data:
+            raise ViceArgsError(
+                "vice.memory.write requires `data` bytes or one `value`."
+            )
+        values = [_coerce_vice_byte(value) for value in raw_data]
+        if any(value is None for value in values):
+            raise ViceArgsError(
+                "vice.memory.write data values must be bytes (0..255)."
+            )
+        return {"address": address, "data": values}
+
+    if method == "vice.execution.run":
+        # Current vice-mcp's run verb has an empty schema. Watchpoint-based
+        # bounds are enforced by the checkpoint itself; unsupported planner
+        # hints such as `frames` must not make the MCP request invalid.
+        return {}
 
     if method == "vice.display.screenshot":
         # Always return base64 so the agent sees the image without needing
@@ -3222,7 +3848,8 @@ def _capstone_find_loops(
         text = "No game-loop candidates found."
     else:
         lines = [
-            f"#{i + 1} {c['address']} score={c['score']} — {' | '.join(c['reasons'])}"
+            f"#{i + 1} {c['address']} {c.get('candidate_type', 'loop')} "
+            f"score={c['score']} — {' | '.join(c['reasons'])}"
             for i, c in enumerate(cands)
         ]
         text = "\n".join(lines)
@@ -3646,7 +4273,10 @@ def _vice_call(method: str, args: dict[str, Any]) -> dict[str, Any]:
 
     tool_name = _vice_normalize_method(method)
     tool_args = _vice_normalize_args(tool_name, args)
-    out = vice_mcp.call_tool(tool_name, tool_args)
+    # vice-mcp documents dotted logical methods but registers MCP tools with
+    # underscore identifiers (vice.memory.read -> vice_memory_read).
+    transport_name = tool_name.replace(".", "_")
+    out = vice_mcp.call_tool(transport_name, tool_args)
     out["args"] = tool_args
     out["tool"] = tool_name
     if out.get("is_error"):
@@ -3663,6 +4293,79 @@ _VISION_SYSTEM_PROMPT = (
     "emit JSON, do not infer unseen memory values, and clearly mark uncertain "
     "text or objects."
 )
+
+
+def _invoke_vision_messages(
+    messages: list[Any],
+    *,
+    reservation_text: str,
+    max_cost_usd: float | None,
+) -> tuple[str, str | None, dict[str, Any], str | None]:
+    """Invoke the vision role behind the same conservative cost gate."""
+    role = "vision"
+    model_name = None
+    reservation = 0.0
+    try:
+        llm = get_llm(role)
+        model_name = getattr(llm, "model_name", None) or getattr(llm, "model", None)
+        reservation = _call_cost_reservation_usd(
+            llm,
+            model_name,
+            reservation_text,
+            system_text=_VISION_SYSTEM_PROMPT,
+        )
+        if max_cost_usd is not None and reservation > max_cost_usd:
+            error = (
+                f"cost reservation ${reservation:.4f} exceeds remaining "
+                f"run allowance ${max_cost_usd:.4f}"
+            )
+            entry = llm_usage.record({
+                "role": role,
+                "model": model_name,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cost_usd": 0.0,
+                "reserved_cost_usd": reservation,
+                "ok": False,
+                "transport_ok": False,
+                "rejection": "cost_reservation",
+                "budget_reservation_exhausted": True,
+                "error": error,
+            })
+            return "", error, entry, model_name
+        response = llm.invoke(messages)
+    except Exception as exc:  # noqa: BLE001
+        error = f"{type(exc).__name__}: {exc}"
+        entry = llm_usage.record({
+            "role": role,
+            "model": model_name,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cost_usd": 0.0,
+            "reserved_cost_usd": reservation,
+            "ok": False,
+            "transport_ok": False,
+            "error": error[:200],
+        })
+        return "", error, entry, model_name
+
+    in_tok, out_tok = llm_usage.extract_usage(response)
+    content = _flatten_lc_ai_message_content(response).strip()
+    error = None if content else "empty vision response"
+    entry = llm_usage.record({
+        "role": role,
+        "model": model_name,
+        "input_tokens": in_tok,
+        "output_tokens": out_tok,
+        "cost_usd": llm_usage.estimate_cost_usd(
+            model_name, in_tok, out_tok,
+        ),
+        "reserved_cost_usd": reservation,
+        "ok": bool(content),
+        "transport_ok": True,
+        **({} if error is None else {"error": error}),
+    })
+    return content, error, entry, model_name
 
 
 def _screenshot_data_uri(data: Any) -> str | None:
@@ -3717,6 +4420,8 @@ def _persist_screenshot(
 
 def _describe_screenshot_result(
     data_uri: str,
+    *,
+    remaining_budget_usd: float | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Describe one screenshot through the dedicated vision role.
 
@@ -3740,63 +4445,109 @@ def _describe_screenshot_result(
         "Be precise and terse — this description goes into a reverse-engineering KB."
     )
     role = "vision"
-    model_name = None
     meta: dict[str, Any] = {"vision_role": role}
-    try:
-        llm = get_llm(role)
-        model_name = getattr(llm, "model_name", None) or getattr(llm, "model", None)
-        multimodal_msg = HumanMessage(content=[
-            {"type": "image_url", "image_url": {"url": data_uri}},
-            {"type": "text", "text": prompt_text},
-        ])
-        resp = llm.invoke([SystemMessage(_VISION_SYSTEM_PROMPT), multimodal_msg])
-        in_tok, out_tok = llm_usage.extract_usage(resp)
-        description = _flatten_lc_ai_message_content(resp).strip()
-        error = None if description else "empty description"
-        llm_usage.record({
-            "role": role, "model": model_name,
-            "input_tokens": in_tok, "output_tokens": out_tok,
-            "cost_usd": llm_usage.estimate_cost_usd(
-                model_name, in_tok, out_tok,
-            ),
-            "ok": bool(description), "transport_ok": True,
-            **({} if error is None else {"error": error}),
-        })
-        meta.update({
-            "vision_model": model_name,
-            "vision_ok": bool(description),
-            "vision_status": "ok" if description else "empty",
-            "description_chars": len(description),
-        })
-        if description:
-            return f"[screenshot description via {role}]\n{description}", meta
-        meta["vision_error"] = error
-    except Exception as e:  # noqa: BLE001
-        err = f"{type(e).__name__}: {e}"
-        llm_usage.record({
-            "role": role, "model": model_name,
-            "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0,
-            "ok": False, "transport_ok": False, "error": err[:200],
-        })
-        meta.update({
-            "vision_model": model_name, "vision_ok": False,
-            "vision_status": "error", "vision_error": err[:200],
-        })
+    multimodal_msg = HumanMessage(content=[
+        {"type": "image_url", "image_url": {"url": data_uri}},
+        {"type": "text", "text": prompt_text},
+    ])
+    remaining = (
+        _remaining_llm_budget({})
+        if remaining_budget_usd is None else remaining_budget_usd
+    )
+    description, error, entry, model_name = _invoke_vision_messages(
+        [SystemMessage(_VISION_SYSTEM_PROMPT), multimodal_msg],
+        reservation_text=prompt_text + "\n" + data_uri,
+        max_cost_usd=remaining,
+    )
+    status = (
+        "cost_reservation"
+        if entry.get("rejection") == "cost_reservation"
+        else ("ok" if description else "error")
+    )
+    meta.update({
+        "vision_model": model_name,
+        "vision_ok": bool(description),
+        "vision_status": status,
+        "description_chars": len(description),
+    })
+    if description:
+        return f"[screenshot description via {role}]\n{description}", meta
+    meta["vision_error"] = error
+    if entry.get("rejection") != "cost_reservation":
         print(
-            f"[vice/screenshot] dedicated vision call failed: {err}",
+            f"[vice/screenshot] dedicated vision call failed: {error}",
             file=sys.stderr, flush=True,
         )
 
+    return _screenshot_unavailable_text(data_uri), meta
+
+
+def _screenshot_unavailable_text(data_uri: str) -> str:
     b64_len = len(data_uri) - (data_uri.index(",") + 1) if "," in data_uri else 0
     return (
-        f"[screenshot: base64 image, {b64_len} chars — vision description unavailable]",
-        meta,
+        f"[screenshot: base64 image, {b64_len} chars — "
+        "vision description unavailable]"
     )
 
 
-def _describe_screenshot(data_uri: str) -> str:
-    """Compatibility wrapper used by generic VICE response flattening."""
-    return _describe_screenshot_result(data_uri)[0]
+def _describe_screenshot(
+    data_uri: str,
+    *,
+    remaining_budget_usd: float | None = None,
+) -> str:
+    """Compatibility wrapper; never bills without explicit run budget context."""
+    if remaining_budget_usd is None:
+        return _screenshot_unavailable_text(data_uri)
+    return _describe_screenshot_result(
+        data_uri, remaining_budget_usd=remaining_budget_usd,
+    )[0]
+
+
+def _compare_screenshot_pair(
+    before_uri: str,
+    after_uri: str,
+    *,
+    expectation: str,
+    remaining_budget_usd: float | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Compare a labelled before/after pair with one dedicated vision call."""
+    role = "vision"
+    meta: dict[str, Any] = {"vision_role": role, "vision_comparison": True}
+    prompt = (
+        "Compare the labelled BEFORE and AFTER Commodore 64 screenshots. "
+        "Report only visible differences, especially HUD text/numbers, sprites, "
+        "screen corruption, and whether this expectation is visibly supported: "
+        f"{expectation}. State supported, contradicted, or inconclusive and why."
+    )
+    message = HumanMessage(content=[
+        {"type": "text", "text": "BEFORE"},
+        {"type": "image_url", "image_url": {"url": before_uri}},
+        {"type": "text", "text": "AFTER"},
+        {"type": "image_url", "image_url": {"url": after_uri}},
+        {"type": "text", "text": prompt},
+    ])
+    remaining = (
+        _remaining_llm_budget({})
+        if remaining_budget_usd is None else remaining_budget_usd
+    )
+    comparison, error, entry, model_name = _invoke_vision_messages(
+        [SystemMessage(_VISION_SYSTEM_PROMPT), message],
+        reservation_text=prompt + "\n" + before_uri + "\n" + after_uri,
+        max_cost_usd=remaining,
+    )
+    meta.update({
+        "vision_model": model_name,
+        "vision_ok": bool(comparison),
+        "vision_status": (
+            "cost_reservation"
+            if entry.get("rejection") == "cost_reservation"
+            else ("ok" if comparison else "error")
+        ),
+    })
+    if comparison:
+        return f"[before/after comparison via {role}]\n{comparison}", meta
+    meta["vision_error"] = error
+    return "[before/after vision comparison unavailable]", meta
 
 
 def _coerce_vice_byte(value: Any) -> int | None:
@@ -3838,7 +4589,13 @@ def _extract_vice_bytes(data: Any) -> tuple[list[int], Any | None]:
         return [], address
     values: list[int] = []
     for value in candidate:
-        byte = _coerce_vice_byte(value)
+        # `vice_memory_read encoding=array` returns legacy two-digit HEX
+        # strings. Keep user-supplied write values decimal by handling this
+        # representation only at the response boundary.
+        if isinstance(value, str) and re.fullmatch(r"[0-9A-Fa-f]{2}", value.strip()):
+            byte = int(value.strip(), 16)
+        else:
+            byte = _coerce_vice_byte(value)
         if byte is None:
             return [], address
         values.append(byte)
@@ -3846,12 +4603,18 @@ def _extract_vice_bytes(data: Any) -> tuple[list[int], Any | None]:
 
 
 def _format_vice_memory_read(
-    data: Any, requested_addr: Any, *, max_chars: int = 4_000,
+    data: Any,
+    requested_addr: Any,
+    *,
+    max_chars: int = 4_000,
+    remaining_budget_usd: float | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Compact a VICE byte array into 16-byte hex lines before truncation."""
     values, payload_addr = _extract_vice_bytes(data)
     if not values:
-        return _vice_text(data), {"memory_bytes_returned": 0}
+        return _vice_text(
+            data, remaining_budget_usd=remaining_budget_usd,
+        ), {"memory_bytes_returned": 0}
     addr_text = _coerce_vice_address(payload_addr or requested_addr) or "$0000"
     base = int(addr_text[1:], 16)
     lines = [
@@ -3881,18 +4644,26 @@ def _format_vice_memory_read(
     }
 
 
-def _vice_text(data: Any) -> str:
+def _vice_text(
+    data: Any,
+    *,
+    remaining_budget_usd: float | None = None,
+) -> str:
     """Best-effort flatten of a vice-mcp response payload into a string."""
     if isinstance(data, str):
         # Screenshot data-URI: defer to the vision helper rather than discarding.
         if data.startswith("data:image/"):
-            return _describe_screenshot(data)
+            return _describe_screenshot(
+                data, remaining_budget_usd=remaining_budget_usd,
+            )
         return data
     if isinstance(data, dict):
         # Screenshot response: {status, format, data_uri, base64, size}
         data_uri = _screenshot_data_uri(data)
         if data_uri:
-            return _describe_screenshot(data_uri)
+            return _describe_screenshot(
+                data_uri, remaining_budget_usd=remaining_budget_usd,
+            )
         if "lines" in data and isinstance(data["lines"], list):
             return "\n".join(
                 (
@@ -3905,7 +4676,10 @@ def _vice_text(data: Any) -> str:
         if "text" in data and isinstance(data["text"], str):
             return data["text"]
     if isinstance(data, list):
-        parts = [_vice_text(d) for d in data]
+        parts = [
+            _vice_text(d, remaining_budget_usd=remaining_budget_usd)
+            for d in data
+        ]
         return "\n".join(p for p in parts if p)
     return json.dumps(data, indent=2, default=str)
 
@@ -3975,6 +4749,7 @@ _VICE_COMPOSITE_METHODS = {
     "diff", "memory.diff", "vice.memory.diff",
     "monotonic_scan", "memory.monotonic_scan", "vice.memory.monotonic_scan",
     "trace", "vice.trace",
+    "poke_verify", "poke_and_peek", "vice.poke_verify",
 }
 
 
@@ -4063,6 +4838,8 @@ def _vice_composite(
     monotonic_scan  : intersect ≥2 snapshots by a known delta (−1 lives)
     trace           : watchpoint on an address → run → read PC/registers →
                       resolve the writing instruction → disasm around it
+    poke_verify     : save full state + capture before → write/read-back one
+                      approved byte → capture after → restore in finally
     """
     from tools import mem_diff
 
@@ -4194,10 +4971,299 @@ def _vice_composite(
     if m == "trace":
         return _vice_trace(args, step_id)
 
+    if m == "poke_verify":
+        return _vice_poke_verify(state, args, step_id)
+
     return _record_result(
         "vice", step_id, False,
         f"unknown vice composite {method!r}",
         extra={"method": method, "retryable": False},
+    )
+
+
+def _vice_poke_verify(
+    state: C64State,
+    args: dict[str, Any],
+    step_id: str,
+) -> dict[str, Any]:
+    """Approval-gated, restore-on-exit one-byte visual experiment.
+
+    This deliberately supports one candidate byte only. A before screenshot
+    must exist and the original byte must be readable before any mutation.
+    A full VICE snapshot is preferred and reloaded in ``finally`` before the
+    vision model sees the captured pair; older servers fall back to restoring
+    the original byte. The write is read back from the same bank before an
+    after image is accepted. Optional execution resume can change unrelated
+    emulator state, which is why the full snapshot is the primary safety path.
+    """
+    address = _extract_vice_address(args)
+    value = _coerce_vice_byte(
+        args.get("value") if args.get("value") is not None
+        else args.get("candidate"),
+    )
+    expectation = str(args.get("expect") or args.get("expectation") or "").strip()
+    if address is None or value is None or not expectation:
+        return _record_result(
+            "vice",
+            step_id,
+            False,
+            "vice.poke_verify requires address, one byte value (0..255), "
+            "and an explicit expect string.",
+            extra={
+                "method": "vice.poke_verify",
+                "rejection": "missing_arg",
+                "retryable": False,
+            },
+        )
+    try:
+        frames = int(args.get("frames", 0))
+    except (TypeError, ValueError):
+        frames = -1
+    if frames < 0 or frames > 60:
+        return _record_result(
+            "vice",
+            step_id,
+            False,
+            "vice.poke_verify frames must be between 0 and 60.",
+            extra={
+                "method": "vice.poke_verify",
+                "rejection": "invalid_arg",
+                "retryable": False,
+            },
+        )
+
+    snapshot_name: str | None = None
+    snapshot_error: str | None = None
+    try:
+        candidate_name = f"c64re_poke_{uuid.uuid4().hex[:12]}"
+        _vice_call("vice.snapshot.save", {
+            "name": candidate_name,
+            "description": (
+                f"Automatic safety restore before {step_id} poke verification"
+            ),
+            "include_roms": False,
+            "include_disks": False,
+        })
+        snapshot_name = candidate_name
+    except Exception as exc:  # noqa: BLE001
+        # Older servers may not expose snapshot save/load. The byte-level
+        # fallback below remains mandatory and is still verified by tests.
+        snapshot_error = f"{type(exc).__name__}: {exc}"
+
+    try:
+        read_args: dict[str, Any] = {"address": address, "size": 1}
+        if args.get("bank"):
+            read_args["bank"] = str(args["bank"])
+        original_result = _vice_call("vice.memory.read", read_args)
+        original_values, _payload_address = _extract_vice_bytes(
+            original_result.get("data"),
+        )
+        if len(original_values) != 1:
+            raise RuntimeError("memory.read did not return exactly one byte")
+        original = original_values[0]
+        if value == original:
+            return _record_result(
+                "vice",
+                step_id,
+                False,
+                f"vice.poke_verify candidate ${value:02X} equals the current "
+                "byte; no visual experiment was run.",
+                extra={
+                    "method": "vice.poke_verify",
+                    "address": address,
+                    "original_value": original,
+                    "candidate_value": value,
+                    "bank": args.get("bank"),
+                    "rejection": "invalid_arg",
+                    "retryable": False,
+                },
+            )
+
+        before_result = _vice_call("vice.display.screenshot", {})
+        before_uri = _screenshot_data_uri(before_result.get("data"))
+        if not before_uri:
+            raise RuntimeError("baseline screenshot contained no image")
+        before_path, before_meta = _persist_screenshot(
+            state, f"{step_id}-before", before_uri,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _record_result(
+            "vice",
+            step_id,
+            False,
+            "vice.poke_verify aborted before mutation: "
+            f"{type(exc).__name__}: {exc}",
+            extra={"method": "vice.poke_verify", "address": address},
+        )
+
+    after_uri: str | None = None
+    after_path: str | None = None
+    after_meta: dict[str, Any] = {}
+    experiment_error: str | None = None
+    restore_error: str | None = None
+    restore_method = "byte"
+    write_verified = False
+    try:
+        write_args: dict[str, Any] = {"address": address, "value": value}
+        if args.get("bank"):
+            write_args["bank"] = str(args["bank"])
+        _vice_call("vice.memory.write", write_args)
+        verify_result = _vice_call("vice.memory.read", read_args)
+        verify_values, _verify_address = _extract_vice_bytes(
+            verify_result.get("data"),
+        )
+        if verify_values != [value]:
+            observed = (
+                f"${verify_values[0]:02X}" if len(verify_values) == 1
+                else repr(verify_values)
+            )
+            raise RuntimeError(
+                f"memory.write read-back mismatch: requested ${value:02X}, "
+                f"observed {observed}"
+            )
+        write_verified = True
+        if frames:
+            _vice_call("vice.execution.run", {"frames": frames})
+        after_result = _vice_call("vice.display.screenshot", {})
+        after_uri = _screenshot_data_uri(after_result.get("data"))
+        if not after_uri:
+            raise RuntimeError("after screenshot contained no image")
+        after_path, after_meta = _persist_screenshot(
+            state, f"{step_id}-after", after_uri,
+        )
+    except Exception as exc:  # noqa: BLE001
+        experiment_error = f"{type(exc).__name__}: {exc}"
+    finally:
+        snapshot_load_error: str | None = None
+        if snapshot_name:
+            try:
+                _vice_call("vice.snapshot.load", {"name": snapshot_name})
+                restore_method = "full_snapshot"
+            except Exception as exc:  # noqa: BLE001
+                snapshot_load_error = f"{type(exc).__name__}: {exc}"
+        if restore_method != "full_snapshot":
+            try:
+                restore_args: dict[str, Any] = {
+                    "address": address, "value": original,
+                }
+                if args.get("bank"):
+                    restore_args["bank"] = str(args["bank"])
+                _vice_call("vice.memory.write", restore_args)
+            except Exception as exc:  # noqa: BLE001
+                byte_error = f"{type(exc).__name__}: {exc}"
+                restore_error = (
+                    f"snapshot load failed ({snapshot_load_error}); "
+                    f"byte fallback failed ({byte_error})"
+                    if snapshot_load_error else byte_error
+                )
+
+    if restore_error:
+        return _record_result(
+            "vice",
+            step_id,
+            False,
+            f"CRITICAL: vice.poke_verify could not restore {address} to "
+            f"${original:02X}: {restore_error}",
+            extra={
+                "method": "vice.poke_verify",
+                "address": address,
+                "original_value": original,
+                "candidate_value": value,
+                "bank": args.get("bank"),
+                "restored": False,
+                "write_verified": write_verified,
+                "restore_method": restore_method,
+                "safety_snapshot": snapshot_name,
+                "snapshot_save_error": snapshot_error,
+                "rejection": "restore_failed",
+                "retryable": False,
+                "before_screenshot_path": before_path,
+                "after_screenshot_path": after_path,
+            },
+        )
+    if experiment_error or after_uri is None:
+        return _record_result(
+            "vice",
+            step_id,
+            False,
+            "vice.poke_verify experiment failed after mutation; the original "
+            f"byte was restored: {experiment_error or 'no after screenshot'}",
+            extra={
+                "method": "vice.poke_verify",
+                "address": address,
+                "original_value": original,
+                "candidate_value": value,
+                "bank": args.get("bank"),
+                "restored": True,
+                "write_verified": write_verified,
+                "restore_method": restore_method,
+                "safety_snapshot": snapshot_name,
+                "snapshot_save_error": snapshot_error,
+                "before_screenshot_path": before_path,
+                "after_screenshot_path": after_path,
+            },
+        )
+
+    images_identical = bool(
+        before_meta.get("image_sha256")
+        and before_meta.get("image_sha256") == after_meta.get("image_sha256")
+    )
+    if images_identical:
+        comparison = (
+            "[mechanical before/after comparison]\n"
+            "Screenshots are byte-identical; the expected visible change "
+            "is contradicted."
+        )
+        vision_meta = {
+            "vision_role": "vision",
+            "vision_ok": False,
+            "vision_status": "skipped_identical_images",
+            "visual_verdict": "contradicted",
+        }
+    else:
+        comparison, vision_meta = _compare_screenshot_pair(
+            before_uri,
+            after_uri,
+            expectation=expectation,
+            remaining_budget_usd=_remaining_llm_budget(state),
+        )
+        comparison_lower = comparison.lower()
+        if re.search(r"\bcontradicted\b", comparison_lower):
+            visual_verdict = "contradicted"
+        elif re.search(r"\binconclusive\b", comparison_lower):
+            visual_verdict = "inconclusive"
+        elif re.search(r"\bsupported\b", comparison_lower):
+            visual_verdict = "supported"
+        else:
+            visual_verdict = "unknown"
+        vision_meta["visual_verdict"] = visual_verdict
+    return _record_result(
+        "vice",
+        step_id,
+        True,
+        f"poke verification at {address}: ${original:02X} → ${value:02X}; "
+        f"captured before/after and restored via {restore_method}.\n"
+        f"Expectation: {expectation}\n{comparison}",
+        extra={
+            "method": "vice.poke_verify",
+            "address": address,
+            "original_value": original,
+            "candidate_value": value,
+            "bank": args.get("bank"),
+            "frames": frames,
+            "expectation": expectation,
+            "images_identical": images_identical,
+            "restored": True,
+            "write_verified": write_verified,
+            "restore_method": restore_method,
+            "safety_snapshot": snapshot_name,
+            "snapshot_save_error": snapshot_error,
+            "before_screenshot_path": before_path,
+            "after_screenshot_path": after_path,
+            "before_image": before_meta,
+            "after_image": after_meta,
+            **vision_meta,
+        },
     )
 
 
@@ -4512,9 +5578,13 @@ def vice_mcp_node(state: C64State) -> dict[str, Any]:
     requested_addr = final_args.get("address") if isinstance(final_args, dict) else None
     canonical_method = str(out.get("tool", method))
     payload_meta: dict[str, Any] = {}
+    remaining_budget_usd = _remaining_llm_budget(state)
     if canonical_method == "vice.memory.read":
         raw_text, payload_meta = _format_vice_memory_read(
-            data, requested_addr, max_chars=4_000,
+            data,
+            requested_addr,
+            max_chars=4_000,
+            remaining_budget_usd=remaining_budget_usd,
         )
     elif canonical_method == "vice.display.screenshot":
         data_uri = _screenshot_data_uri(data)
@@ -4522,7 +5592,10 @@ def vice_mcp_node(state: C64State) -> dict[str, Any]:
             screenshot_path, save_meta = _persist_screenshot(
                 state, step_id, data_uri,
             )
-            raw_text, vision_meta = _describe_screenshot_result(data_uri)
+            raw_text, vision_meta = _describe_screenshot_result(
+                data_uri,
+                remaining_budget_usd=remaining_budget_usd,
+            )
             payload_meta.update(save_meta)
             payload_meta.update(vision_meta)
             if screenshot_path:
@@ -4532,7 +5605,9 @@ def vice_mcp_node(state: C64State) -> dict[str, Any]:
                 payload_meta["screenshot_path"] = screenshot_path
                 payload_meta["thumbnail_path"] = screenshot_path
         else:
-            raw_text = _vice_text(data)
+            raw_text = _vice_text(
+                data, remaining_budget_usd=remaining_budget_usd,
+            )
             payload_meta.update({
                 "vision_role": "vision",
                 "vision_ok": False,
@@ -4540,7 +5615,9 @@ def vice_mcp_node(state: C64State) -> dict[str, Any]:
                 "vision_error": "VICE response contained no image data URI",
             })
     else:
-        raw_text = _vice_text(data)
+        raw_text = _vice_text(
+            data, remaining_budget_usd=remaining_budget_usd,
+        )
     header = (
         f"[{canonical_method} "
         f"args={json.dumps(final_args, default=str)}]"
@@ -4727,7 +5804,7 @@ def kb_query_node(state: C64State) -> dict[str, Any]:
                     "kb mode='sql' is read-only — INSERT/UPDATE/DELETE/DDL "
                     "is rejected. Append-only writes go through "
                     "KnowledgeStore.append_event (synthesizer only).",
-                    extra={"mode": "sql", "sql": sql,
+                    extra={"mode": "sql", "sql": redact_text(sql),
                            "rejection": "forbidden_statement"},
                 )
 
@@ -4742,17 +5819,20 @@ def kb_query_node(state: C64State) -> dict[str, Any]:
             ):
                 try:
                     rows = store.query(attempt_sql)
-                    text = json.dumps(rows[:limit], indent=2, default=str)
+                    safe_rows = redact_value(rows[:limit])
+                    text = json.dumps(safe_rows, indent=2, default=str)
                     extra: dict[str, Any] = {
                         "mode": "sql",
-                        "sql": attempt_sql,
+                        "sql": redact_text(attempt_sql),
                         "row_count": len(rows),
                     }
                     if label != "original":
-                        extra["sql_was_auto_rewritten_from"] = sql
+                        extra["sql_was_auto_rewritten_from"] = redact_text(sql)
                         extra["sql_rewrites_applied"] = applied_rewrites
                     if sql_history:
-                        extra["sql_attempts_before_success"] = sql_history
+                        extra["sql_attempts_before_success"] = redact_value(
+                            sql_history,
+                        )
                     return _record_result(
                         "kb", step_id, True, text, extra=extra,
                     )
@@ -4776,9 +5856,9 @@ def kb_query_node(state: C64State) -> dict[str, Any]:
                 + KB_SCHEMA_HINT
             )
             return _record_result(
-                "kb", step_id, False, err_msg,
-                extra={"mode": "sql", "sql": sql,
-                       "sql_attempts": sql_history,
+                "kb", step_id, False, redact_text(err_msg),
+                extra={"mode": "sql", "sql": redact_text(sql),
+                       "sql_attempts": redact_value(sql_history),
                        "schema": KB_SCHEMA_HINT},
             )
 
@@ -4839,6 +5919,7 @@ def kb_query_node(state: C64State) -> dict[str, Any]:
                 if isinstance(r.get("addr"), int):
                     r["addr_hex"] = f"${r['addr']:04X}"
             text = json.dumps(rows, indent=2, default=str)
+            text = redact_text(text)
             return _record_result(
                 "kb", step_id, True, text,
                 extra={
@@ -4872,9 +5953,13 @@ def kb_query_node(state: C64State) -> dict[str, Any]:
                     )
                     lines.append(f"  …{h['snippet']}…")
                 text = "\n".join(lines)
+            text = redact_text(text)
             return _record_result(
                 "kb", step_id, True, text,
-                extra={"mode": "text", "q": q, "hits": hits},
+                extra={
+                    "mode": "text", "q": redact_text(q),
+                    "hits": redact_value(hits),
+                },
             )
 
         if mode == "text_semantic":
@@ -4937,13 +6022,14 @@ def kb_query_node(state: C64State) -> dict[str, Any]:
                         f"  {excerpt}",
                     )
                 text = "\n".join(lines)
+            text = redact_text(text)
             return _record_result(
                 "kb", step_id, True, text,
                 extra={
                     "mode": "text_semantic",
-                    "q": q,
+                    "q": redact_text(q),
                     "score_threshold": threshold,
-                    "hits": hits,
+                    "hits": redact_value(hits),
                 },
             )
 
@@ -4961,7 +6047,8 @@ def kb_query_node(state: C64State) -> dict[str, Any]:
                     " FROM events ORDER BY ts DESC LIMIT ?",
                     (limit,),
                 )
-            text = json.dumps(rows, indent=2, default=str)
+            safe_rows = redact_value(rows)
+            text = json.dumps(safe_rows, indent=2, default=str)
             return _record_result(
                 "kb", step_id, True, text,
                 extra={"mode": "events", "row_count": len(rows)},
@@ -4986,5 +6073,8 @@ def kb_query_node(state: C64State) -> dict[str, Any]:
         return _record_result(
             "kb", step_id, False,
             f"{type(e).__name__}: {e}\n\n{KB_SCHEMA_HINT}",
-            extra={"mode": mode, "args": args, "schema": KB_SCHEMA_HINT},
+            extra={
+                "mode": mode, "args": redact_value(args),
+                "schema": KB_SCHEMA_HINT,
+            },
         )

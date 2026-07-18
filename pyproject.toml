@@ -31,12 +31,21 @@ ui = [
     "graphviz>=0.20",
 ]
 
+[project.scripts]
+c64re = "main:main"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["graph"]
+packages = ["c64re_agent", "graph", "memory", "tools", "code_kb", "evals"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"config" = "c64re_agent/config"
+"main.py" = "main.py"
+"app.py" = "app.py"
+"langgraph.json" = "langgraph.json"
 
 [tool.pytest.ini_options]
 markers = [

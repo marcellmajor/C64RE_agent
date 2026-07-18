@@ -5,6 +5,7 @@ Modes the planner can request via ``args["mode"]``:
     - **stats**       : counts (routines, xrefs, SMC, instructions, …)
     - **routines**    : list code_routines (optional `like` for name filter)
     - **routine**     : full window for a single routine (by `start` addr)
+    - **pseudocode**  : conservative address-preserving Layer-0 transliteration
     - **xrefs_to**    : who calls/jumps to `addr`?
     - **xrefs_from**  : where does `addr` (or routine `start..end`) jump?
     - **smc**         : list SMC suspects
@@ -13,6 +14,10 @@ Modes the planner can request via ``args["mode"]``:
     - **disasm**      : disassemble a fresh range via capstone (default)
                        or vice (`engine: vice`); results feed Layer 0
     - **annotate**    : run Layer-1 LLM annotation on one routine
+    - **layer2**      : group verified routines into global behaviours (LLM)
+    - **groups**      : list stored Layer-2 behaviour groups
+    - **layer3**      : adversarially review Layer-1/2 annotations (LLM)
+    - **critiques**   : list stored Layer-3 critique records
     - **export**      : commented .asm dump of the entire code KB
     - **hardware**    : return the curated hardware pack as text
     - **schema**      : print the SQLite schema cheat-sheet
@@ -24,6 +29,7 @@ loop can route the response just like any other tool.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -33,6 +39,7 @@ from typing import Any
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from code_kb import (
+    Annotation,
     DEEP_RETRO_RE_PREAMBLE,
     annotation_from_layer1_json,
     build_window,
@@ -42,16 +49,24 @@ from code_kb import (
     export_vice_symbols,
     fetch_routines,
     get_code_store,
+    render_mechanical_pseudocode,
     render_user_prompt,
 )
 from code_kb import hardware_pack
-from code_kb.schema import EVT_LAYER_RUN
+from code_kb.schema import ANN_CRITIQUE, ANN_GROUP, EVT_LAYER_RUN
 from graph.state import C64State
+from memory.redaction import redact_text, redact_value
 
 # We deliberately reach into nodes for `_record_result` / `_step_for` /
 # `_hex_to_int` — re-implementing them here would drift from the contract
 # the rest of the graph relies on.
-from graph.nodes import _hex_to_int, _record_result, _step_for, _try_parse_json
+from graph.nodes import (
+    _hex_to_int,
+    _record_result,
+    _remaining_llm_budget,
+    _step_for,
+    _try_parse_json,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -218,6 +233,63 @@ def _mode_routine(store, args, step_id):
             "start_addr": win.start_addr, "end_addr": win.end_addr,
             "name": win.name, "callers": len(win.callers),
             "callees": len(win.callees), "smc_sites": len(win.smc_sites),
+        },
+    )
+
+
+def _mode_pseudocode(store, args, step_id):
+    """Address-preserving Layer-0 transliteration for one known routine."""
+    start_raw = args.get("start") or args.get("addr") or args.get("address")
+    if start_raw is None:
+        return _record_result(
+            "code_kb", step_id, False,
+            "code_kb mode='pseudocode' requires args.start (e.g. \"$0810\").",
+            extra={"mode": "pseudocode"},
+        )
+    start = _hex_to_int(start_raw, -1)
+    if start < 0:
+        return _record_result(
+            "code_kb", step_id, False,
+            f"could not parse start={start_raw!r} as address",
+            extra={"mode": "pseudocode"},
+        )
+    routines = store.query(
+        "SELECT start_addr, end_addr, name FROM code_routines"
+        " WHERE start_addr = ? LIMIT 1",
+        (start,),
+    )
+    if not routines:
+        return _record_result(
+            "code_kb", step_id, False,
+            f"no routine found with start_addr=${start:04X}. "
+            "Try mode='routines' first.",
+            extra={"mode": "pseudocode"},
+        )
+    routine = routines[0]
+    end = int(routine["end_addr"])
+    instructions = store.query(
+        "SELECT addr, bytes_hex, mnemonic, operand, size_bytes"
+        " FROM instructions WHERE addr BETWEEN ? AND ? ORDER BY addr",
+        (start, end),
+    )
+    if not instructions:
+        return _record_result(
+            "code_kb", step_id, False,
+            f"routine ${start:04X}-${end:04X} has no Layer-0 instructions",
+            extra={"mode": "pseudocode", "start_addr": start,
+                   "end_addr": end},
+        )
+    text = render_mechanical_pseudocode(
+        instructions, routine_name=routine.get("name"),
+    )
+    return _record_result(
+        "code_kb", step_id, True, text,
+        extra={
+            "mode": "pseudocode",
+            "start_addr": start,
+            "end_addr": end,
+            "instruction_count": len(instructions),
+            "provenance": "mechanical_layer0",
         },
     )
 
@@ -394,7 +466,7 @@ def _mode_search(store, args, step_id):
         out.append({
             "path": r["path"],
             "match_at": idx,
-            "snippet": snippet,
+            "snippet": redact_text(snippet),
         })
     if not out:
         text = f"No asm_doc hits for {q!r}."
@@ -404,9 +476,13 @@ def _mode_search(store, args, step_id):
             lines.append(f"- {h['path']} (offset={h['match_at']})")
             lines.append(f"  …{h['snippet']}…")
         text = "\n".join(lines)
+    text = redact_text(text)
     return _record_result(
         "code_kb", step_id, True, text,
-        extra={"mode": "search", "q": q, "hits": out},
+        extra={
+            "mode": "search", "q": redact_text(q),
+            "hits": redact_value(out),
+        },
     )
 
 
@@ -506,7 +582,10 @@ def _mode_sql(store, args, step_id):
             "code_kb", step_id, False,
             "code_kb mode='sql' is read-only — INSERT/UPDATE/DELETE/DDL "
             "rejected.",
-            extra={"mode": "sql", "sql": sql, "rejection": "forbidden_statement"},
+            extra={
+                "mode": "sql", "sql": redact_text(sql),
+                "rejection": "forbidden_statement",
+            },
         )
     rewritten, applied = _rewrite_sql(sql)
     last_err = None
@@ -517,9 +596,13 @@ def _mode_sql(store, args, step_id):
     ):
         try:
             rows = store.query(attempt_sql)
-            text = json.dumps(rows[: int(args.get("limit", 100))],
+            safe_rows = redact_value(rows[: int(args.get("limit", 100))])
+            text = json.dumps(safe_rows,
                               indent=2, default=str)
-            extra = {"mode": "sql", "sql": attempt_sql, "row_count": len(rows)}
+            extra = {
+                "mode": "sql", "sql": redact_text(attempt_sql),
+                "row_count": len(rows),
+            }
             if label != "original":
                 extra["sql_rewrites_applied"] = applied
             return _record_result(
@@ -530,15 +613,60 @@ def _mode_sql(store, args, step_id):
 
     return _record_result(
         "code_kb", step_id, False,
-        f"{type(last_err).__name__ if last_err else 'Error'}: {last_err}\n\n"
-        + CODE_KB_SCHEMA_HINT,
-        extra={"mode": "sql", "sql": sql, "schema": CODE_KB_SCHEMA_HINT},
+        redact_text(
+            f"{type(last_err).__name__ if last_err else 'Error'}: {last_err}\n\n"
+            + CODE_KB_SCHEMA_HINT,
+        ),
+        extra={
+            "mode": "sql", "sql": redact_text(sql),
+            "schema": CODE_KB_SCHEMA_HINT,
+        },
     )
 
 
 # --------------------------------------------------------------------------- #
 # Layer-1 annotate mode (LLM call)
 # --------------------------------------------------------------------------- #
+
+
+_LAYER_LLM_ROLES = frozenset({
+    "analyst", "critic", "curator", "executor", "planner", "synthesizer",
+})
+
+
+def _normalize_layer_roles(
+    raw_role: Any,
+    raw_backup_roles: Any,
+    *,
+    default_role: str,
+    default_backup_roles: list[str],
+) -> tuple[str, list[str]]:
+    """Keep planner prose out of the configured-agent role argument."""
+    requested = str(raw_role or "").strip().lower()
+    role = requested if requested in _LAYER_LLM_ROLES else default_role
+    if raw_backup_roles is None:
+        raw_backups = list(default_backup_roles)
+    elif isinstance(raw_backup_roles, str):
+        raw_backups = [raw_backup_roles]
+    elif isinstance(raw_backup_roles, (list, tuple)):
+        raw_backups = list(raw_backup_roles)
+    else:
+        raw_backups = []
+    backups: list[str] = []
+    for raw in raw_backups:
+        candidate = str(raw or "").strip().lower()
+        if (
+            candidate in _LAYER_LLM_ROLES
+            and candidate != role
+            and candidate not in backups
+        ):
+            backups.append(candidate)
+    if not backups:
+        backups = [
+            candidate for candidate in default_backup_roles
+            if candidate != role
+        ]
+    return role, backups
 
 
 def _mode_annotate(state, store, args, step_id):
@@ -619,8 +747,11 @@ def _mode_annotate(state, store, args, step_id):
                 f"no routine at ${start:04X} even after auto-disasm",
                 extra={"mode": "annotate", "auto_disasm": auto_disasm_info},
             )
-    role = str(args.get("role") or "analyst")
-    backup_roles = list(args.get("backup_roles") or ["critic", "synthesizer"])
+    role, backup_roles = _normalize_layer_roles(
+        args.get("role"), args.get("backup_roles"),
+        default_role="analyst",
+        default_backup_roles=["critic", "synthesizer"],
+    )
     window = build_window(store, routine_row=rows[0])
 
     # If the routine exists in code_routines but has NO instructions indexed
@@ -669,6 +800,7 @@ def _mode_annotate(state, store, args, step_id):
 
     parsed, used_role, last_err = _invoke_layer1(
         role, backup_roles, system_prompt, user_prompt,
+        remaining_budget_usd=_remaining_llm_budget(state),
     )
     if parsed is None:
         return _record_result(
@@ -709,16 +841,310 @@ def _mode_annotate(state, store, args, step_id):
     )
 
 
+def _bounded_confidence(value: Any, default: float = 0.5) -> float:
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _mode_layer2(state, store, args, step_id):
+    """Group verified routines into bounded cross-routine behaviours."""
+    limit = max(2, min(int(args.get("limit") or 40), 80))
+    routines = store.query(
+        "SELECT start_addr, end_addr, name, summary, source_file, confidence"
+        " FROM code_routines ORDER BY confidence DESC, start_addr LIMIT ?",
+        (limit,),
+    )
+    if len(routines) < 2:
+        return _record_result(
+            "code_kb", step_id, False,
+            "Layer 2 needs at least two verified Layer-0 routines.",
+            extra={"mode": "layer2", "routine_count": len(routines)},
+        )
+    layer1 = store.query(
+        "SELECT annotation_id, start_addr, end_addr, text, name_suggestion,"
+        " idiom_match, confidence FROM hypotheses"
+        " WHERE layer = 1 ORDER BY confidence DESC LIMIT ?",
+        (limit,),
+    )
+    known = {int(row["start_addr"]): row for row in routines}
+    prompt = (
+        "Group the verified C64 routines below into a small set of global "
+        "behaviours (rendering, input, score, audio, loader, IRQ, etc.).\n"
+        "Never add a routine address not present in VERIFIED ROUTINES. A "
+        "routine may appear in more than one group only when evidence warrants it.\n\n"
+        f"VERIFIED ROUTINES:\n{json.dumps(routines, indent=2, default=str)}\n\n"
+        f"LAYER-1 HYPOTHESES (fallible):\n"
+        f"{json.dumps(layer1, indent=2, default=str)}\n\n"
+        "Reply JSON only:\n"
+        '{"groups":[{"name":"snake_case","summary":"...",'
+        '"routine_starts":["$XXXX"],"confidence":0.0,'
+        '"evidence":["$XXXX: reason"]}]}'
+    )
+    role, backup_roles = _normalize_layer_roles(
+        args.get("role"), args.get("backup_roles"),
+        default_role="analyst",
+        default_backup_roles=["synthesizer"],
+    )
+    parsed, used_role, last_err = _invoke_layer1(
+        role,
+        backup_roles,
+        DEEP_RETRO_RE_PREAMBLE
+        + "\nYou are the Layer-2 global behaviour grouper. Layer 0 wins.",
+        prompt,
+        remaining_budget_usd=_remaining_llm_budget(state),
+    )
+    if parsed is None:
+        return _record_result(
+            "code_kb", step_id, False,
+            f"Layer-2 LLM call failed: {last_err}",
+            extra={"mode": "layer2", "tried_roles": [role, *backup_roles]},
+        )
+
+    raw_groups = parsed.get("groups") or []
+    if not isinstance(raw_groups, list):
+        raw_groups = []
+    stored: list[dict[str, Any]] = []
+    rejected_addresses: list[str] = []
+    for raw_group in raw_groups[:12]:
+        if not isinstance(raw_group, dict):
+            continue
+        starts: list[int] = []
+        for raw_start in raw_group.get("routine_starts") or []:
+            start = _hex_to_int(raw_start, -1)
+            if start not in known:
+                rejected_addresses.append(str(raw_start))
+                continue
+            if start not in starts:
+                starts.append(start)
+        if not starts:
+            continue
+        name = re.sub(
+            r"[^a-z0-9_]+", "_",
+            str(raw_group.get("name") or "behaviour_group").strip().lower(),
+        ).strip("_") or "behaviour_group"
+        summary = str(raw_group.get("summary") or "").strip()
+        confidence = _bounded_confidence(raw_group.get("confidence"))
+        start_addr = min(starts)
+        end_addr = max(int(known[start]["end_addr"]) for start in starts)
+        stable = json.dumps(
+            {"name": name, "starts": starts}, separators=(",", ":"),
+        )
+        ann = Annotation(
+            id="l2_" + hashlib.sha256(stable.encode()).hexdigest()[:16],
+            layer=2,
+            kind=ANN_GROUP,
+            start_addr=start_addr,
+            end_addr=end_addr,
+            producer=f"layer2:{used_role}",
+            confidence=confidence,
+            payload={
+                "text": summary or f"Cross-routine behaviour group {name}.",
+                "name_suggestion": name,
+                "routine_starts": starts,
+                "routine_id": None,
+                "source_file": None,
+            },
+            evidence=[str(item) for item in (raw_group.get("evidence") or [])],
+            flags=["global_group"],
+        )
+        annotation_id = store.append_annotation(
+            ann, source="code_kb_node.layer2",
+        )
+        stored.append({
+            "annotation_id": annotation_id,
+            "name": name,
+            "routine_starts": [f"${start:04X}" for start in starts],
+            "confidence": confidence,
+        })
+    store.append_event(EVT_LAYER_RUN, "code_kb_node", {
+        "layer": 2,
+        "role": used_role,
+        "groups_written": len(stored),
+        "rejected_addresses": rejected_addresses,
+    })
+    ok = bool(stored)
+    return _record_result(
+        "code_kb", step_id, ok,
+        json.dumps({
+            "groups": stored,
+            "rejected_unverified_addresses": rejected_addresses,
+        }, indent=2),
+        extra={
+            "mode": "layer2",
+            "producer": f"layer2:{used_role}",
+            "groups_written": len(stored),
+            "rejected_addresses": rejected_addresses,
+        },
+    )
+
+
+def _mode_layer3(state, store, args, step_id):
+    """Adversarially review existing semantic annotations without deleting them."""
+    limit = max(1, min(int(args.get("limit") or 40), 80))
+    targets = store.query(
+        "SELECT id, layer, kind, start_addr, end_addr, producer, confidence,"
+        " payload_json, evidence_json, flags_json, source_file"
+        " FROM annotations WHERE layer IN (1, 2)"
+        " ORDER BY layer DESC, confidence DESC, seq DESC LIMIT ?",
+        (limit,),
+    )
+    if not targets:
+        return _record_result(
+            "code_kb", step_id, False,
+            "Layer 3 needs at least one Layer-1 or Layer-2 annotation.",
+            extra={"mode": "layer3"},
+        )
+    by_id = {str(row["id"]): row for row in targets}
+    prompt = (
+        "Adversarially review the semantic annotations below against their "
+        "address ranges and evidence. Do not critique deterministic Layer 0. "
+        "Use only annotation_id values shown here.\n\n"
+        f"ANNOTATIONS:\n{json.dumps(targets, indent=2, default=str)}\n\n"
+        "Reply JSON only:\n"
+        '{"critiques":[{"annotation_id":"...",'
+        '"decision":"support|question|reject","critique":"...",'
+        '"confidence":0.0,"evidence":["$XXXX: reason"]}]}'
+    )
+    role, backup_roles = _normalize_layer_roles(
+        args.get("role"), args.get("backup_roles"),
+        default_role="critic",
+        default_backup_roles=["analyst"],
+    )
+    parsed, used_role, last_err = _invoke_layer1(
+        role,
+        backup_roles,
+        DEEP_RETRO_RE_PREAMBLE
+        + "\nYou are the Layer-3 adversarial annotation critic. Layer 0 wins.",
+        prompt,
+        remaining_budget_usd=_remaining_llm_budget(state),
+    )
+    if parsed is None:
+        return _record_result(
+            "code_kb", step_id, False,
+            f"Layer-3 LLM call failed: {last_err}",
+            extra={"mode": "layer3", "tried_roles": [role, *backup_roles]},
+        )
+    raw_critiques = parsed.get("critiques") or []
+    if not isinstance(raw_critiques, list):
+        raw_critiques = []
+    stored: list[dict[str, Any]] = []
+    rejected_targets: list[str] = []
+    for raw_critique in raw_critiques[:limit]:
+        if not isinstance(raw_critique, dict):
+            continue
+        target_id = str(raw_critique.get("annotation_id") or "").strip()
+        target = by_id.get(target_id)
+        if target is None:
+            rejected_targets.append(target_id or "(missing)")
+            continue
+        decision = str(raw_critique.get("decision") or "question").lower()
+        if decision not in {"support", "question", "reject"}:
+            decision = "question"
+        critique = str(raw_critique.get("critique") or "").strip()
+        confidence = _bounded_confidence(raw_critique.get("confidence"))
+        ann = Annotation(
+            id="l3_" + hashlib.sha256(target_id.encode()).hexdigest()[:16],
+            layer=3,
+            kind=ANN_CRITIQUE,
+            start_addr=int(target["start_addr"]),
+            end_addr=int(target["end_addr"]),
+            producer=f"layer3:{used_role}",
+            confidence=confidence,
+            payload={
+                "target_annotation_id": target_id,
+                "decision": decision,
+                "text": critique,
+                "source_file": target.get("source_file"),
+            },
+            evidence=[str(item) for item in (raw_critique.get("evidence") or [])],
+            flags=[f"layer3_{decision}"],
+        )
+        annotation_id = store.append_annotation(
+            ann, source="code_kb_node.layer3",
+        )
+        stored.append({
+            "annotation_id": annotation_id,
+            "target_annotation_id": target_id,
+            "decision": decision,
+            "confidence": confidence,
+        })
+    store.append_event(EVT_LAYER_RUN, "code_kb_node", {
+        "layer": 3,
+        "role": used_role,
+        "critiques_written": len(stored),
+        "rejected_targets": rejected_targets,
+    })
+    ok = bool(stored)
+    return _record_result(
+        "code_kb", step_id, ok,
+        json.dumps({
+            "critiques": stored,
+            "rejected_unknown_targets": rejected_targets,
+        }, indent=2),
+        extra={
+            "mode": "layer3",
+            "producer": f"layer3:{used_role}",
+            "critiques_written": len(stored),
+            "rejected_targets": rejected_targets,
+        },
+    )
+
+
+def _mode_groups(store, args, step_id):
+    limit = max(1, min(int(args.get("limit") or 50), 200))
+    rows = store.query(
+        "SELECT annotation_id, start_addr, end_addr, text, name_suggestion,"
+        " confidence, producer, flags_json FROM hypotheses"
+        " WHERE layer = 2 ORDER BY confidence DESC, start_addr LIMIT ?",
+        (limit,),
+    )
+    return _record_result(
+        "code_kb", step_id, True,
+        json.dumps(rows, indent=2, default=str),
+        extra={"mode": "groups", "row_count": len(rows)},
+    )
+
+
+def _mode_critiques(store, args, step_id):
+    limit = max(1, min(int(args.get("limit") or 50), 200))
+    rows = store.query(
+        "SELECT id, start_addr, end_addr, producer, confidence, payload_json,"
+        " evidence_json, flags_json FROM annotations"
+        " WHERE layer = 3 AND kind = ? ORDER BY seq DESC LIMIT ?",
+        (ANN_CRITIQUE, limit),
+    )
+    decoded = []
+    for row in rows:
+        try:
+            payload = json.loads(row.pop("payload_json") or "{}")
+        except json.JSONDecodeError:
+            payload = {}
+        decoded.append({**row, **payload})
+    return _record_result(
+        "code_kb", step_id, True,
+        json.dumps(decoded, indent=2, default=str),
+        extra={"mode": "critiques", "row_count": len(decoded)},
+    )
+
+
 def _invoke_layer1(
     role: str, backup_roles: list[str],
     system_prompt: str, user_prompt: str,
+    *,
+    remaining_budget_usd: float | None = None,
 ) -> tuple[dict | None, str | None, str | None]:
     """Try the LLM once per role; return (parsed_json, role_used, last_err)."""
     from graph import usage as llm_usage
     from graph.llm import get_llm
-    from graph.nodes import _flatten_lc_ai_message_content
+    from graph.nodes import (
+        _call_cost_reservation_usd,
+        _flatten_lc_ai_message_content,
+    )
 
     last_err = None
+    remaining = remaining_budget_usd
     for r in [role, *backup_roles]:
         model_name = None
         try:
@@ -726,6 +1152,30 @@ def _invoke_layer1(
             model_name = (
                 getattr(llm, "model_name", None) or getattr(llm, "model", None)
             )
+            reservation = _call_cost_reservation_usd(
+                llm,
+                model_name,
+                user_prompt,
+                system_text=system_prompt,
+            )
+            if remaining is not None and reservation > remaining:
+                last_err = (
+                    f"{r}: cost reservation ${reservation:.4f} exceeds "
+                    f"remaining run allowance ${remaining:.4f}"
+                )
+                llm_usage.record({
+                    "role": f"layer1:{r}",
+                    "model": model_name,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cost_usd": 0.0,
+                    "reserved_cost_usd": reservation,
+                    "ok": False,
+                    "transport_ok": False,
+                    "rejection": "cost_reservation",
+                    "error": last_err[:200],
+                })
+                continue
             msg = llm.invoke([
                 SystemMessage(system_prompt),
                 HumanMessage(user_prompt),
@@ -752,6 +1202,10 @@ def _invoke_layer1(
             "cost_usd": llm_usage.estimate_cost_usd(model_name, in_tok, out_tok),
             "ok": True, "transport_ok": True,
         })
+        if remaining is not None:
+            remaining = max(
+                0.0, remaining - float(entry.get("cost_usd") or 0.0),
+            )
 
         content = _flatten_lc_ai_message_content(msg)
         if not content.strip():
@@ -779,12 +1233,15 @@ _MODE_HANDLERS = {
     "hardware":      _mode_hardware,
     "routines":      _mode_routines,
     "routine":       _mode_routine,
+    "pseudocode":    _mode_pseudocode,
     "xrefs_to":      _mode_xrefs_to,
     "xrefs_from":    _mode_xrefs_from,
     "smc":           _mode_smc,
     "writes_to":     _mode_writes_to,
     "refs_to":       _mode_refs_to,
     "hardware_refs": _mode_hardware_refs,
+    "groups":        _mode_groups,
+    "critiques":     _mode_critiques,
     "search":        _mode_search,
     "disasm":        _mode_disasm,
     "export":        _mode_export,
@@ -810,14 +1267,19 @@ def code_kb_node(state: C64State) -> dict[str, Any]:
     store = get_code_store(handle)
     mode = str(args.get("mode") or "stats").lower().strip()
 
-    if mode == "annotate":
+    layered_modes = {
+        "annotate": _mode_annotate,
+        "layer2": _mode_layer2,
+        "layer3": _mode_layer3,
+    }
+    if mode in layered_modes:
         try:
-            return _mode_annotate(state, store, args, step_id)
+            return layered_modes[mode](state, store, args, step_id)
         except Exception as e:  # noqa: BLE001
             return _record_result(
                 "code_kb", step_id, False,
                 f"{type(e).__name__}: {e}",
-                extra={"mode": "annotate", "args": args},
+                extra={"mode": mode, "args": args},
             )
 
     handler = _MODE_HANDLERS.get(mode)
@@ -825,7 +1287,7 @@ def code_kb_node(state: C64State) -> dict[str, Any]:
         return _record_result(
             "code_kb", step_id, False,
             f"unknown code_kb mode {mode!r}. "
-            f"Supported: {', '.join(sorted(set(_MODE_HANDLERS)) | {'annotate'})}.",
+            f"Supported: {', '.join(sorted(set(_MODE_HANDLERS)) | set(layered_modes))}.",
             extra={"mode": mode, "args": args},
         )
     try:

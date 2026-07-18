@@ -36,6 +36,29 @@ MAX_PLAN_STEPS = 12
 # attempts, or immediately when the failure is marked non-retryable.
 MAX_STEP_ATTEMPTS = 2
 
+# Bound native LangGraph fan-out so one over-eager plan cannot create an
+# unbounded thread/API burst. Only fresh, concrete, read-only steps qualify;
+# VICE and result-producing Code-KB modes stay serial.
+MAX_PARALLEL_TOOL_STEPS = 4
+_PARALLEL_CODE_KB_MODES = frozenset({
+    "stats",
+    "schema",
+    "hardware",
+    "routines",
+    "routine",
+    "pseudocode",
+    "groups",
+    "critiques",
+    "xrefs_to",
+    "xrefs_from",
+    "smc",
+    "writes_to",
+    "refs_to",
+    "hardware_refs",
+    "search",
+    "sql",
+})
+
 # Consecutive `revise` verdicts before the critic is forced to `accept`
 # (with its remaining concerns attached to the critique), so the
 # analyst↔critic ping-pong cannot run until the recursion limit kills it.
@@ -222,6 +245,39 @@ def runnable_steps(state: dict[str, Any]) -> list[dict[str, Any]]:
     return runnable
 
 
+def is_parallel_read_only_step(step: dict[str, Any]) -> bool:
+    """Whether a plan step is safe for native concurrent dispatch.
+
+    Planner order is not a dependency contract; `depends_on` is. Static dump
+    analysis, parent-KB queries, Tavily searches, and explicitly read-only
+    Code-KB modes may overlap once their dependencies are satisfied. Emulator
+    calls and Code-KB modes that write evidence/files or invoke Layer-1 stay
+    serial to preserve external-state and usage-accounting semantics.
+    """
+    tool = str(step.get("tool") or "").strip().lower()
+    if tool in {"capstone", "kb", "tavily"}:
+        return True
+    if tool != "code_kb":
+        return False
+    args = step.get("args") or {}
+    mode = str(args.get("mode") or "stats").strip().lower()
+    return mode in _PARALLEL_CODE_KB_MODES
+
+
+def parallel_runnable_steps(
+    state: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Return a bounded batch of fresh, concrete, read-only runnable steps."""
+    status = step_status(state.get("tool_results"))
+    batch = [
+        step for step in runnable_steps(state)
+        if str(step.get("id")) not in status.fail_counts
+        and step_is_concrete(step)
+        and is_parallel_read_only_step(step)
+    ][:MAX_PARALLEL_TOOL_STEPS]
+    return batch if len(batch) >= 2 else []
+
+
 def failed_step_notes(state: dict[str, Any]) -> list[str]:
     """One line per permanently-failed step of the *current* plan.
 
@@ -329,6 +385,12 @@ def step_is_concrete(step: dict[str, Any]) -> bool:
             return True
         if method.endswith("trace"):
             return _has_value(args, *VICE_ADDRESS_ALIASES)
+        if method.endswith("poke_verify") or method.endswith("poke_and_peek"):
+            return (
+                _has_value(args, *VICE_ADDRESS_ALIASES)
+                and _has_value(args, "value", "candidate")
+                and _has_value(args, "expect", "expectation")
+            )
         if "disassemble" in method:
             return _has_value(args, *VICE_ADDRESS_ALIASES)
         if "memory" in method and ("read" in method or "search" in method):
@@ -354,10 +416,11 @@ def step_is_concrete(step: dict[str, Any]) -> bool:
         # handlers ignore — e.g. `xrefs_to` with only `src` bypassed
         # enrichment and then read a defaulted addr of 0).
         if mode in ("stats", "schema", "hardware", "routines", "smc",
-                    "export", "hardware_refs"):
+                    "export", "hardware_refs", "groups", "critiques",
+                    "layer2", "layer3"):
             # hardware_refs self-defaults to the full I/O range (3.4).
             return True
-        if mode in ("routine", "annotate"):
+        if mode in ("routine", "pseudocode", "annotate"):
             # handlers read: start | addr | address
             return _has_value(args, "start", "addr", "address")
         if mode in ("xrefs_to", "writes_to", "refs_to"):

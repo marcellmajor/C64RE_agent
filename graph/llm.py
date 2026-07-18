@@ -19,8 +19,9 @@ from pathlib import Path
 from typing import Any
 
 from langchain_openai import ChatOpenAI
+from c64re_agent.paths import config_dir
 
-CONFIG_DIR = Path(__file__).resolve().parent.parent / "config"
+CONFIG_DIR = config_dir()
 _ENV_RE = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
 
 
@@ -80,13 +81,30 @@ def _reasoning_effort_grok(model_name: str, agent_cfg_effort: Any) -> str:
     grok-4.3 accepts: "none", "low" (default), "medium", "high".
     Falls back to "low" (xAI default) when not configured or invalid.
     """
-    allowed = frozenset({"none", "low", "medium", "high"})
+    # grok-4.5 rejects ``none``; older 4.x endpoints accepted it.
+    allowed = (
+        frozenset({"low", "medium", "high"})
+        if "grok-4.5" in (model_name or "").lower()
+        else frozenset({"none", "low", "medium", "high"})
+    )
     configured = (
         agent_cfg_effort.strip().lower()
         if isinstance(agent_cfg_effort, str) and agent_cfg_effort.strip()
         else ""
     )
     return configured if configured in allowed else "low"
+
+
+def _reasoning_effort_gemini(agent_cfg_effort: Any) -> str | None:
+    """OpenAI-compat reasoning effort mapped by Gemini to thinking level."""
+    configured = (
+        agent_cfg_effort.strip().lower()
+        if isinstance(agent_cfg_effort, str) and agent_cfg_effort.strip()
+        else ""
+    )
+    if configured in {"minimal", "low", "medium", "high"}:
+        return configured
+    return None
 
 
 def _supports_temperature(provider_name: str, model_name: str) -> bool:
@@ -118,6 +136,12 @@ def _expand_env(value: Any) -> Any:
     return value
 
 
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 @lru_cache(maxsize=1)
 def load_config() -> dict[str, Any]:
     json_path = CONFIG_DIR / "llm.json"
@@ -137,13 +161,35 @@ def load_config() -> dict[str, Any]:
     return _expand_env(raw)
 
 
+def structured_output_enabled(role: str) -> bool:
+    """Resolve opt-in native JSON-schema output for one provider role.
+
+    Environment override wins so a golden baseline can exercise all roles
+    without editing config: ``C64RE_STRUCTURED_OUTPUT=1|0``.
+    """
+    env = os.getenv("C64RE_STRUCTURED_OUTPUT")
+    if env is not None and env.strip():
+        return _truthy(env)
+    roles_env = os.getenv("C64RE_STRUCTURED_OUTPUT_ROLES", "").strip()
+    if roles_env:
+        enabled_roles = {
+            item.strip() for item in roles_env.split(",") if item.strip()
+        }
+        return role in enabled_roles
+    cfg = load_config()
+    agent_cfg = (cfg.get("agents") or {}).get(role) or {}
+    if "structured_output" in agent_cfg:
+        return _truthy(agent_cfg.get("structured_output"))
+    return _truthy((cfg.get("defaults") or {}).get("structured_output"))
+
+
 @lru_cache(maxsize=None)
 def get_llm(role: str) -> ChatOpenAI:
     """Build (and cache) the chat client for a given sub-agent role.
 
     Roles are the keys under `agents:` in `config/llm.json` —
     e.g. `planner`, `executor`, `synthesizer`, `analyst`, `critic`,
-    `curator`, `researcher`, `coordinator`, `vision`.
+    `curator`, and `vision`.
     """
     cfg = load_config()
     try:
@@ -178,6 +224,21 @@ def get_llm(role: str) -> ChatOpenAI:
         floor = int(os.environ.get("C64RE_GPT5_MIN_MAX_TOKENS", "8192"))
         max_tok = max(max_tok, floor)
 
+    # A live evaluation can impose a conservative completion ceiling without
+    # mutating the checked-in role budgets. Apply it after model-specific
+    # floors so the caller's explicit spend constraint remains authoritative.
+    output_cap = os.getenv("C64RE_MAX_OUTPUT_TOKENS", "").strip()
+    if output_cap:
+        try:
+            output_cap_int = int(output_cap)
+        except ValueError as e:
+            raise ValueError(
+                "C64RE_MAX_OUTPUT_TOKENS must be a positive integer"
+            ) from e
+        if output_cap_int <= 0:
+            raise ValueError("C64RE_MAX_OUTPUT_TOKENS must be a positive integer")
+        max_tok = min(max_tok, output_cap_int)
+
     kwargs: dict[str, Any] = {
         "model": model_name,
         "base_url": provider["base_url"],
@@ -197,6 +258,12 @@ def get_llm(role: str) -> ChatOpenAI:
         kwargs["reasoning_effort"] = _reasoning_effort_grok(
             model_name, agent_cfg.get("reasoning_effort")
         )
+    elif provider_name == "gemini":
+        gemini_effort = _reasoning_effort_gemini(
+            agent_cfg.get("reasoning_effort"),
+        )
+        if gemini_effort:
+            kwargs["reasoning_effort"] = gemini_effort
     if _supports_temperature(provider_name, model_name):
         kwargs["temperature"] = agent_cfg.get("temperature", 0.2)
 
