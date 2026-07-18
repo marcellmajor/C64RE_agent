@@ -21,7 +21,9 @@ load_dotenv()
 
 import argparse
 import hashlib
+import uuid
 from contextlib import nullcontext
+from datetime import datetime, timezone
 from pathlib import Path
 
 from langgraph.checkpoint.memory import MemorySaver
@@ -123,63 +125,9 @@ def _configure_langsmith_tracing() -> None:
 
 
 def _resolve_evidence(ref: str, store: "Any") -> str:
-    """Turn an analyst evidence ref into a human-readable description.
+    from memory.evidence import resolve_evidence_ref
 
-    Handles:
-    - $XXXX / $XXXX-$YYYY  → label name(s) from KB
-    - h<n>/...             → hypothesis text
-    - UUID (event id)      → event kind + source + payload snippet
-    - file path            → kept as-is (already readable)
-    - bare word / unknown  → kept as-is
-    """
-    import re as _re
-
-    # --- address ref: $0780 or $0600-$063F ---
-    addr_match = _re.match(r"^\$([0-9A-Fa-f]{1,4})(?:-\$[0-9A-Fa-f]{1,4})?$", ref.strip())
-    if addr_match:
-        addr = int(addr_match.group(1), 16)
-        rows = store.query(
-            "SELECT name, kind, confidence FROM labels WHERE addr=? ORDER BY confidence DESC LIMIT 3",
-            (addr,),
-        )
-        if rows:
-            names = ", ".join(
-                f"{r['name']} ({r['kind']}, conf={r['confidence']:.1f})" for r in rows
-            )
-            return f"{ref}  →  {names}"
-        return ref
-
-    # --- hypothesis ref: h3/open, h7/confirmed, etc. ---
-    hyp_match = _re.match(r"^(h\d+)(/\w+)?$", ref.strip())
-    if hyp_match:
-        hid = hyp_match.group(1)
-        rows = store.query(
-            "SELECT text, status FROM hypotheses WHERE id LIKE ? LIMIT 1",
-            (f"%{hid}%",),
-        )
-        if rows:
-            text = (rows[0]["text"] or "")[:120]
-            return f"{ref}  →  [{rows[0]['status']}] {text}"
-        return ref
-
-    # --- UUID event id ---
-    uuid_match = _re.match(
-        r"^[0-9a-f]{8,12}$|^[0-9a-f]{8}-[0-9a-f]{4}-", ref.strip(), _re.IGNORECASE
-    )
-    if uuid_match:
-        rows = store.query(
-            "SELECT kind, source, substr(payload_json,1,160) AS snippet"
-            " FROM events WHERE id=? OR id LIKE ? LIMIT 1",
-            (ref.strip(), f"{ref.strip()}%"),
-        )
-        if rows:
-            r = rows[0]
-            snippet = (r["snippet"] or "").replace("\n", " ")
-            return f"{ref}  →  [{r['kind']}] {r['source']}: {snippet}"
-        return ref
-
-    # --- file path or anything else — return verbatim ---
-    return ref
+    return resolve_evidence_ref(ref, store)
 
 
 def main() -> None:
@@ -231,6 +179,12 @@ def main() -> None:
     )
     parser.add_argument("--no-trace", action="store_true",
                         help="Disable LangSmith tracing for this run.")
+    parser.add_argument(
+        "--approve-vice-mutations", action="store_true",
+        help="Allow plan steps that mutate live VICE state. Without this "
+             "flag, memory writes, execution controls, checkpoints, input "
+             "injection, and vice.trace are rejected before the MCP call.",
+    )
     args = parser.parse_args()
 
     if args.reset_code_kb:
@@ -245,6 +199,8 @@ def main() -> None:
         os.environ["LANGCHAIN_TRACING_V2"] = "false"
 
     initial_state = {
+        "run_id": uuid.uuid4().hex,
+        "run_started_at": datetime.now(timezone.utc).isoformat(),
         "game": args.game,
         "question": args.question,
         "dump_path": str(args.dump),
@@ -256,6 +212,9 @@ def main() -> None:
         "tool_results": [],
         "history": [],
         "messages": [],
+        "require_vice_approval": True,
+        "approved_mutation_steps": [],
+        "approve_all_vice_mutations": bool(args.approve_vice_mutations),
     }
 
     thread_id = args.thread_id or _default_thread_id(args.game, args.question)

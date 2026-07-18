@@ -14,6 +14,7 @@ EVT_HYPOTHESIS = "hypothesis"
 EVT_ANALYSIS = "analysis"
 EVT_VERDICT = "verdict"
 EVT_CONSOLIDATED = "consolidated_observation"
+EVT_RUN_SUMMARY = "run_summary"
 
 # Version of the DERIVED SQLite view. The view now persists between
 # processes (tracker 1.6 — incremental replay from a high-water offset
@@ -22,7 +23,8 @@ EVT_CONSOLIDATED = "consolidated_observation"
 # v3: routines.confidence added (tracker 2.3 — confidence-aware replay).
 # v4: compacted_tool_results added (tracker 2.1 hardening — exact,
 #     event-ID-based curator bookkeeping instead of timestamp cursors).
-SCHEMA_VERSION = "4"
+# v5: run_summaries added (tracker 5.4 — one queryable row per run).
+SCHEMA_VERSION = "5"
 
 # DDL — all tables created on `KnowledgeStore.load_or_init`.
 SCHEMA_DDL = """
@@ -98,12 +100,35 @@ CREATE TABLE IF NOT EXISTS compacted_tool_results (
     event_id        TEXT PRIMARY KEY,
     consolidated_id TEXT NOT NULL
 );
+
+-- One durable, queryable outcome row per completed graph run (tracker 5.4).
+-- `run_id` is unique so report retries/resume cannot double-record a run.
+CREATE TABLE IF NOT EXISTS run_summaries (
+    run_id             TEXT PRIMARY KEY,
+    event_id           TEXT NOT NULL,
+    completed_at       TEXT NOT NULL,
+    question           TEXT NOT NULL,
+    verdict            TEXT NOT NULL,
+    confidence         REAL NOT NULL,
+    iterations         INTEGER NOT NULL,
+    cost_usd           REAL NOT NULL,
+    tokens             INTEGER NOT NULL,
+    llm_calls          INTEGER NOT NULL,
+    tool_calls         INTEGER NOT NULL,
+    elapsed_s          REAL,
+    termination_reason TEXT,
+    answer_excerpt     TEXT,
+    report_path        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_run_summaries_completed
+    ON run_summaries(completed_at DESC);
 """
 
 # Drop all tables so the derived view can be rebuilt from kb.json without
 # unlinking the file (unlinking breaks concurrent processes that hold an
 # open connection to the old inode).
 CLEAR_DDL = """
+DROP TABLE IF EXISTS run_summaries;
 DROP TABLE IF EXISTS compacted_tool_results;
 DROP TABLE IF EXISTS tool_result_keys;
 DROP TABLE IF EXISTS text_docs;

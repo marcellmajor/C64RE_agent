@@ -15,7 +15,9 @@ Given a game name, a research question, and a 64 KB memory dump (plus optional d
 3. **Synthesises** raw tool output into a typed knowledge base — labelled addresses, named routines, cross-references, hypotheses.
 4. **Analyses** the accumulated KB to produce a candidate answer with evidence and a confidence score.
 5. **Critiques** the answer adversarially; if unsatisfied, replans and loops (up to 12 iterations by default).
-6. **Writes a Markdown report** to `sessions/<game>/report.md`.
+6. **Writes a versioned Markdown report** to
+   `sessions/<game>/report_<timestamp>_<run>.md`, refreshes `report.md`, and
+   archives the turn in `turns.jsonl`.
 
 Knowledge is persisted across runs — restart the agent on the same game and it picks up from where it left off.
 
@@ -154,6 +156,8 @@ python main.py \
 --text-dir      Directory of human-written notes .txt/.md (default: ./text_dir)
 --thread-id     Resume a previous session (default: derived from game name)
 --reset-code-kb Wipe the code KB before running (use if a prior run loaded wrong files)
+--approve-vice-mutations
+                Explicitly allow VICE steps that change emulator state
 --no-trace      Disable LangSmith tracing for this run
 ```
 
@@ -184,8 +188,12 @@ streamlit run app.py
 The web UI provides:
 
 - **Chat interface** — type your question, pick a game and dump file from the sidebar, click Send
+- **Plan review checkpoint** — edit, reorder, or delete planner steps before tools run; mutating VICE steps require their own checkboxes and a pending run can be cancelled
+- **Research notebook** — prior accepted turns reload from `turns.jsonl`, inform later questions, and expose one-click open-question follow-ups
+- **Named dump states** — freeze immutable title/ingame/death/level dumps and compare them offline
 - **Code lens panel** — after each answer, addresses cited (`$XXXX`) auto-populate a disassembly viewer and interactive call graph
 - **Routines panel** — top routines ranked by cross-reference count, with one-click jump to their disassembly
+- **VICE symbol export** — download verified, high-confidence Code-KB names as a `.labels` monitor command file
 - **Knowledge accumulation** — every turn enriches the same file-backed KB; close and reopen the browser and your session is intact
 
 ---
@@ -205,6 +213,7 @@ graph/
   llm.py            Provider-agnostic LLM factory
 memory/
   store.py          KnowledgeStore — general KB (SQLite + JSONL event log)
+  evidence.py       Shared evidence-reference resolver for reports, CLI, and UI
 code_kb/
   store.py          CodeKnowledgeStore — layered code-comprehension KB
   layer0.py         Ground-truth layer: parsed asm / dump bytes
@@ -214,6 +223,7 @@ tools/
   vice_mcp.py       MCP client for VICE emulator
   c64_disasm.py     Capstone 6502/6510 disassembly wrapper
   agent_runner.py   Headless runner used by the Streamlit UI
+  research_notebook.py  Turn archive, report-version, and dump-catalog services
 asm_dir/            Partial disassembly files (game disassemblies go here)
 memdump_dir/        Memory dumps (.dump files go here)
 text_dir/           Human-written notes and research documents
@@ -230,3 +240,32 @@ app.py              Streamlit web GUI
 - At least one LLM API key (OpenAI, Anthropic, xAI, Gemini, or a local Ollama instance)
 - Streamlit + Graphviz for the web GUI (`pip install -e ".[ui]"`)
 - VICE with the [vice-mcp](https://github.com/vice-emu/vice-mcp) plugin for live emulator features (optional)
+
+---
+
+## Evaluation
+
+The normal test suite validates deterministic analysis, persistence, and the
+golden manifest without making paid model calls. Its offline dump-anchor gate
+checks every expected address for dump-backed bytes or 6502 references and
+rejects exact-address assembly bytes that disagree with the selected dump:
+
+```bash
+pytest -q
+```
+
+The live suite has not yet been baselined; the dump-anchor tests are currently
+the required offline gate. The 15-question end-to-end golden suite is opt-in.
+It runs the real graph,
+stores its temporary KBs under `evals/.sessions/`, and writes per-case quality,
+token, cost, tool-call, and wall-time metrics under `evals/results/`. VICE and
+Tavily are disabled by default so the checked-in dumps/asm remain the stable
+inputs:
+
+```bash
+C64RE_RUN_GOLDEN=1 python -m evals.runner
+```
+
+Use `--case <id>` to run a subset. Live evaluation requires the configured LLM
+credentials; it does not run as part of ordinary `pytest`. Pass
+`--allow-external-tools` only when emulator/web variability is intentional.

@@ -33,6 +33,7 @@ from memory.schema import (
     EVT_INGEST_PARTIAL_ASM,
     EVT_INGEST_TEXT,
     EVT_LABEL,
+    EVT_RUN_SUMMARY,
     EVT_ROUTINE,
     EVT_TOOL_RESULT,
     SCHEMA_DDL,
@@ -348,6 +349,95 @@ class KnowledgeStore:
             self._semantic_on_append_locked(evt)
         return evt["id"]
 
+    def record_run_summary(self, payload: dict[str, Any]) -> str | None:
+        """Append one idempotent ``run_summary`` event.
+
+        Report generation can be retried after a checkpoint/resume. The
+        stable ``run_id`` makes that retry a no-op instead of inflating
+        cross-run metrics with duplicate completions.
+        """
+        run_id = str(payload.get("run_id") or "").strip()
+        if not run_id:
+            raise ValueError("run_summary requires a non-empty run_id")
+        rows = self.query(
+            "SELECT event_id FROM run_summaries WHERE run_id = ? LIMIT 1",
+            (run_id,),
+        )
+        if rows:
+            return None
+        return self.append_event(EVT_RUN_SUMMARY, "write_report", payload)
+
+    def transition_hypotheses(
+        self, references: Iterable[Any], *, status: str, source: str,
+        evidence: Iterable[Any] | None = None,
+    ) -> list[str]:
+        """Append lifecycle updates for explicitly referenced hypotheses."""
+        target = str(status).strip().lower()
+        if target not in {"open", "supported", "refuted"}:
+            raise ValueError(f"invalid hypothesis status: {status!r}")
+        changed: list[str] = []
+        seen: set[str] = set()
+        for reference in references:
+            hid = str(reference or "").strip().split("/", 1)[0]
+            if not hid or hid in seen:
+                continue
+            seen.add(hid)
+            rows = self.query(
+                "SELECT id, text, status, evidence_json FROM hypotheses"
+                " WHERE id = ? LIMIT 1",
+                (hid,),
+            )
+            if not rows:
+                # Analyst evidence may cite the append-only event id rather
+                # than the semantic hypothesis id. Resolve that provenance
+                # token on events.id only. A short prefix must be unique;
+                # never let it degrade into substring matching against the
+                # semantic hypothesis ids.
+                events = self.query(
+                    "SELECT payload_json FROM events"
+                    " WHERE kind = ? AND id = ? LIMIT 1",
+                    (EVT_HYPOTHESIS, hid),
+                )
+                if not events:
+                    prefix_events = self.query(
+                        "SELECT payload_json FROM events"
+                        " WHERE kind = ? AND id LIKE ? ORDER BY id LIMIT 2",
+                        (EVT_HYPOTHESIS, f"{hid}%"),
+                    )
+                    events = prefix_events if len(prefix_events) == 1 else []
+                if events:
+                    try:
+                        event_payload = json.loads(
+                            events[0].get("payload_json") or "{}",
+                        )
+                    except json.JSONDecodeError:
+                        event_payload = {}
+                    event_hid = str(event_payload.get("id") or "").strip()
+                    if event_hid:
+                        rows = self.query(
+                            "SELECT id, text, status, evidence_json"
+                            " FROM hypotheses WHERE id = ? LIMIT 1",
+                            (event_hid,),
+                        )
+            if not rows or str(rows[0].get("status")) == target:
+                continue
+            row = rows[0]
+            try:
+                prior_evidence = json.loads(row.get("evidence_json") or "[]")
+            except json.JSONDecodeError:
+                prior_evidence = []
+            combined = [*prior_evidence, *(str(item) for item in evidence or [])]
+            payload = {
+                "id": str(row["id"]),
+                "text": str(row.get("text") or ""),
+                "status": target,
+                "evidence": list(dict.fromkeys(combined)),
+                "transition_source": source,
+            }
+            self.append_event(EVT_HYPOTHESIS, source, payload)
+            changed.append(str(row["id"]))
+        return changed
+
     def _semantic_build_from_derived_kb(self) -> None:
         """Hydrate cosine index from SQLite after full event replay."""
 
@@ -566,6 +656,36 @@ class KnowledgeStore:
                     " (event_id, consolidated_id) VALUES (?, ?)",
                     (str(eid), evt["id"]),
                 )
+
+        if evt["kind"] == EVT_RUN_SUMMARY:
+            p = evt["payload"]
+            self._db.execute(
+                "INSERT OR IGNORE INTO run_summaries"
+                " (run_id, event_id, completed_at, question, verdict,"
+                "  confidence, iterations, cost_usd, tokens, llm_calls,"
+                "  tool_calls, elapsed_s, termination_reason, answer_excerpt,"
+                "  report_path)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    str(p["run_id"]), evt["id"],
+                    str(p.get("completed_at") or evt["ts"]),
+                    str(p.get("question") or ""),
+                    str(p.get("verdict") or "n/a"),
+                    float(p.get("confidence") or 0.0),
+                    int(p.get("iterations") or 0),
+                    float(p.get("cost_usd") or 0.0),
+                    int(p.get("tokens") or 0),
+                    int(p.get("llm_calls") or 0),
+                    int(p.get("tool_calls") or 0),
+                    (
+                        float(p["elapsed_s"])
+                        if p.get("elapsed_s") is not None else None
+                    ),
+                    p.get("termination_reason"),
+                    str(p.get("answer_excerpt") or ""),
+                    p.get("report_path"),
+                ),
+            )
 
         if evt["kind"] == EVT_LABEL:
             # Confidence-aware compare-and-swap (tracker 2.3): a later,
@@ -957,11 +1077,15 @@ class KnowledgeStore:
         text_docs = self._db.execute(
             "SELECT COUNT(*) AS n FROM text_docs"
         ).fetchone()["n"]
+        run_summaries = self._db.execute(
+            "SELECT COUNT(*) AS n FROM run_summaries"
+        ).fetchone()["n"]
         return {
             "events_total": events,
             "events_by_kind": by_kind,
             "labels": labels,
             "text_docs": text_docs,
+            "run_summaries": run_summaries,
             "dump_bytes": len(self._dump_bytes) if self._dump_bytes else 0,
             "semantic_kb_enabled": load_semantic_config().enabled,
             "semantic_kb_ready": bool(
@@ -1167,6 +1291,24 @@ class KnowledgeStore:
             })
         return out
 
+    def recent_run_summaries(
+        self, question: str | None = None, limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Recent completed runs, prioritising the same exact question."""
+        limit = max(1, min(50, int(limit)))
+        if question:
+            return self.query(
+                "SELECT * FROM run_summaries"
+                " ORDER BY CASE WHEN question = ? THEN 0 ELSE 1 END,"
+                " completed_at DESC LIMIT ?",
+                (question, limit),
+            )
+        return self.query(
+            "SELECT * FROM run_summaries"
+            " ORDER BY completed_at DESC LIMIT ?",
+            (limit,),
+        )
+
     def recent_tool_excerpts(
         self, limit: int = 12, max_chars_per: int = 4_000,
         exclude_compacted: bool = False,
@@ -1322,6 +1464,29 @@ class KnowledgeStore:
             f"- events_by_kind: {s.get('events_by_kind', {})}\n"
             f"- question_terms: {terms or '(none extracted)'}"
         )
+
+        # Completed-run outcomes (tracker 5.4): the planner receives these
+        # through the same digest as all other durable evidence, so it can
+        # avoid repeating a prior accepted investigation and can target the
+        # open gap from a low-confidence/replanned one.
+        prior_runs = self.recent_run_summaries(question, limit=5)
+        if prior_runs:
+            run_lines: list[str] = []
+            for run in prior_runs:
+                same = "same question" if run.get("question") == question else "prior question"
+                excerpt = re.sub(
+                    r"\s+", " ", str(run.get("answer_excerpt") or ""),
+                ).strip()[:500]
+                run_lines.append(
+                    f"- [{same}] `{run.get('run_id')}` verdict="
+                    f"{run.get('verdict')} confidence="
+                    f"{float(run.get('confidence') or 0.0):.2f} "
+                    f"iterations={int(run.get('iterations') or 0)} "
+                    f"cost=${float(run.get('cost_usd') or 0.0):.4f}\n"
+                    f"  question: {run.get('question') or ''}\n"
+                    f"  answer: {excerpt or '(no answer excerpt)'}"
+                )
+            sections.append("## Prior completed runs\n" + "\n".join(run_lines))
 
         labels = self.relevant_labels(question, limit=40)
         if labels:

@@ -37,3 +37,9 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["graph"]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: opt-in tests that may make external calls or take substantial time",
+    "golden: end-to-end golden-question graph evaluations",
+]

@@ -31,6 +31,15 @@ class C64State(TypedDict, total=False):
     # files belonging to several games and the game's slug-token heuristic
     # would otherwise pick up the wrong subset.
     asm_files: list[str] | None
+    # Stable identity/timing for one runner invocation. `write_report` uses
+    # these to persist exactly one queryable run_summary event (tracker 5.4).
+    run_id: str
+    run_started_at: str
+    run_completed_at: str | None
+    # Human approval boundary for emulator-mutating VICE steps (Phase 6.1).
+    require_vice_approval: bool
+    approved_mutation_steps: list[str]
+    approve_all_vice_mutations: bool
 
     # --- working memory ---
     kb_handle: str

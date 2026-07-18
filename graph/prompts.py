@@ -389,6 +389,7 @@ Emit JSON ONLY:
                              "tool": "kb"|"capstone"|"vice"|"tavily",
                              "args": {...}, "depends_on": [],
                              "hypothesis": null}],
+    "refuted_hypotheses": ["<hypothesis id explicitly contradicted by evidence>"],
     "optional_followups":  [{"goal": "..."}]
   }
 

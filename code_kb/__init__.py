@@ -34,7 +34,7 @@ from code_kb.layer1 import (
 )
 from code_kb.store import Annotation, CodeKnowledgeStore, get_code_store
 from code_kb.disasm import disasm_capstone, disasm_vice
-from code_kb.exporters import export_commented_asm
+from code_kb.exporters import export_commented_asm, export_vice_symbols
 from code_kb.call_graph import local_dot, routines_dot
 from code_kb.scoping import (
     Scoping,
@@ -58,6 +58,7 @@ __all__ = [
     "disasm_capstone",
     "disasm_vice",
     "export_commented_asm",
+    "export_vice_symbols",
     "fetch_routines",
     "game_tokens",
     "get_code_store",

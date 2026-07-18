@@ -74,18 +74,18 @@ ones in the legend above.
 | 4.6 | Broaden configurable Tavily research domains and support advanced search depth. | [x] Done |
 | 4.7 | Honor per-role output-token limits so planner and analyst JSON is not truncated mid-response. | [x] Done |
 | 4.8 | Bound or compact `tool_results` in graph state after persisted results no longer need full payloads. | [-] Deferred |
-| 5.1 | Add a golden-question regression suite that checks expected evidence, confidence, cost, and runtime. | [ ] Not started |
-| 5.2 | Add deterministic unit tests and compact synthetic dump fixtures for core parsing, routing, and disassembly behavior. | [ ] Not started |
+| 5.1 | Add a golden-question regression suite that checks expected evidence, confidence, cost, and runtime. | [x] Done |
+| 5.2 | Add deterministic unit tests and compact synthetic dump fixtures for core parsing, routing, and disassembly behavior. | [x] Done |
 | 5.3 | Add a per-role calls, tokens, failures, and fallback-activation table to generated reports. | [x] Done (delivered with 1.4) |
-| 5.4 | Persist one queryable run-summary event containing outcome, iterations, confidence, and cost. | [ ] Not started |
+| 5.4 | Persist one queryable run-summary event containing outcome, iterations, confidence, and cost. | [x] Done |
 | 5.5 | Add human ratings and LangSmith datasets after the product/UI work is ready to collect them. | [-] Deferred |
-| 6.1 | Add human approval/edit interrupts for plans and mutating VICE operations, plus UI cancellation. | [ ] Not started |
-| 6.2 | Turn sessions into a multi-turn research notebook with archived turns, versioned reports, and prior-answer context. | [ ] Not started |
-| 6.3 | Track hypotheses through open, supported, and refuted lifecycle states as evidence changes. | [ ] Not started |
-| 6.4 | Share one evidence-reference resolver between the CLI and Streamlit UI. | [ ] Not started |
-| 6.5 | Catalog named dumps from multiple game states so offline snapshot comparisons are reproducible. | [ ] Not started |
-| 6.6 | Export high-confidence labels as VICE-compatible symbol maps. | [ ] Not started |
-| 6.7 | Allow synthesizer-discovered Layer-1 facts into Code KB with a verified window or explicit unverified provenance. | [ ] Not started |
+| 6.1 | Add human approval/edit interrupts for plans and mutating VICE operations, plus UI cancellation. | [x] Done |
+| 6.2 | Turn sessions into a multi-turn research notebook with archived turns, versioned reports, and prior-answer context. | [x] Done |
+| 6.3 | Track hypotheses through open, supported, and refuted lifecycle states as evidence changes. | [x] Done |
+| 6.4 | Share one evidence-reference resolver between the CLI and Streamlit UI. | [x] Done |
+| 6.5 | Catalog named dumps from multiple game states so offline snapshot comparisons are reproducible. | [x] Done |
+| 6.6 | Export high-confidence labels as VICE-compatible symbol maps. | [x] Done |
+| 6.7 | Allow synthesizer-discovered Layer-1 facts into Code KB with a verified window or explicit unverified provenance. | [x] Done |
 | 6.8 | Revisit DAG planning, deeper Code-KB layers, and cross-provider structured output after loop stabilization. | [-] Deferred |
 | 7.1 | Package all runtime Python modules and configuration data instead of shipping only `graph/`. | [ ] Not started |
 | 7.2 | Remove unused coordinator/researcher role configuration or wire those roles into real graph paths. | [ ] Not started |
@@ -956,13 +956,17 @@ passes for `graph`, `memory`, `tools`, `code_kb`, and `tests`; `graph.build`, `m
 
 ## Phase 5 — Observability & evaluation (do alongside Phases 1–3)
 
-- [ ] **5.1 Golden-question regression suite** (`evals/golden.jsonl`)
+> **STATUS: Phase 5 implemented (2026-07-18); 5.1–5.4 complete, 5.5 remains deliberately deferred.**
+> Offline suite **345 passing, 15 skipped** (the 15 paid/live golden graph cases are opt-in); `compileall` and
+> `git diff --check` clean. No Phase 6 work started.
+
+- [x] **5.1 Golden-question regression suite** (`evals/golden.jsonl`)
   - ~10–20 `(game, question, expected_addresses, expected_keywords)` rows for manually verified facts (5 dumps + asm
     already exist). Pytest-marked slow suite runs the graph, asserts the expected `$XXXX` appears with confidence ≥
     threshold, records LLM calls/tokens/wall-time. **Source:** F §4, G #12, S.
   - **My call:** Do — without it every heuristic change is a guess. Build early so Phase 1–3 have a target.
 
-- [ ] **5.2 Unit tests for the deterministic layer**
+- [x] **5.2 Unit tests for the deterministic layer**
   - Pure functions with obvious fixtures: `detect_basic_sys`, recursive/SMC disasm, `_rewrite_kb_sql`,
     `_normalize_plan_ids`, `scoping.select_asm_files`, layer0 routine-boundary, "curator doesn't compact twice."
     Add tiny synthetic 64KB fixture dumps. **Source:** F §4, G #12, S.
@@ -971,35 +975,107 @@ passes for `graph`, `memory`, `tools`, `code_kb`, and `tests`; `graph.build`, `m
 - [x] **5.3 Per-role cost telemetry table in `write_report`** (depends on 1.4) — _delivered with 1.4_
   - role → calls / tokens / failures / backup-role activations. **Source:** F §4.
 
-- [ ] **5.4 `run_summary` event per completed run** (question, verdict, confidence, iterations, cost)
+- [x] **5.4 `run_summary` event per completed run** (question, verdict, confidence, iterations, cost)
   - Makes cross-run behavior queryable and feedable to the planner ("previous runs already established…"). **Source:** F §4.
 
 - [-] **5.5 Human ratings + LangSmith datasets** — **Source:** Gr §4.3. **My call:** Defer until UI work (Phase 6).
+
+### Phase 5 implementation notes (2026-07-18)
+
+1. **Golden graph evaluations (5.1).** `evals/golden.jsonl` contains 15 manually anchored questions across all five
+   corpus dumps (three per game), with expected addresses, keywords, and confidence floors. `evals.runner` executes
+   each through the real `run_question` graph, isolates KB/report output under `evals/.sessions/`, and writes JSONL
+   records containing pass/fail reasons, verdict, confidence, matched/missing evidence, LLM calls/tokens/cost,
+   tool calls, run id, and wall time. VICE/Tavily are disabled by default so mutable external state cannot move the
+   baseline; `--allow-external-tools` is explicit. Ordinary pytest validates the manifest and evaluator offline;
+   `C64RE_RUN_GOLDEN=1 pytest -m golden` (or `python -m evals.runner`) enables the real, potentially paid graph runs.
+   Those 15 cases were deliberately **not** invoked during implementation, so the normal suite reports them skipped.
+2. **Deterministic protection (5.2).** A reusable sparse 64 KiB fixture exercises BASIC SYS detection, recursive
+   JSR reachability, and self-modifying-code detection. Focused tests cover SQL column rewriting without mutating
+   string literals, plan-id/dependency normalization, per-game asm scoping/overrides, and Layer-0 routine boundaries
+   from JSR targets and explicit gaps. The existing curator regression continues to prove events are never compacted
+   twice. Coverage exposed and fixed a real edge case: duplicate planner step ids now receive stable unique suffixes,
+   while dependencies resolve to the first occurrence.
+3. **Queryable run outcomes (5.4).** Schema v5 adds `run_summary` events plus a derived `run_summaries` table. CLI,
+   UI runner, and Studio/load fallback stamp a unique `run_id` and UTC start time; successful report generation
+   records question, verdict, confidence, iterations, estimated cost, tokens, LLM/tool calls, elapsed time,
+   termination reason, answer excerpt, and report path. Re-reporting the same run is idempotent. Recent outcomes are
+   included in the planner/analyst digest (same question first), and summary bookkeeping does not count as new
+   substantive evidence for the dead-end detector. Replay, digest visibility, metrics, and idempotence use real stores.
+4. **Existing cost table retained (5.3).** The per-role report table delivered with 1.4 remains the human-readable
+   view; run summaries and golden JSONL provide the cross-run/machine-readable layer.
+
+### Hardening pass (2026-07-18)
+
+Default pytest now anchors every golden address to its 64 KiB dump, records local bytes/disassembly or decoded 6502
+references, and rejects exact-address asm/dump byte conflicts without an LLM call. Dump-derived Blood and Petch
+snippets replace or supplement incomplete listings; keyword checks use whole-token patterns, with explicit
+entity/animation-state context and `limit`/`limited` morphology, and negative evaluator paths are locked down. The
+paid/live suite has not yet been baselined and was not run during hardening; this offline dump gate is the current
+baseline. At the Phase 5 boundary, item 5.5 remained deferred and no Phase 6 work had started.
+
+**Verification boundary:** default `pytest -q` is **345 passing, 15 skipped**; skips are only the explicitly gated
+live golden cases. Manifest validation, all evaluator arithmetic, run-summary persistence/replay/digest integration,
+and deterministic fixtures run offline on every test invocation. `compileall -q`, entry-point imports, CLI evaluator
+help, and `git diff --check` are clean. Item 5.5 remains deferred as specified.
 
 ---
 
 ## Phase 6 — Product/UX (research-notebook direction; larger, optional)
 
-- [ ] **6.1 Human-in-the-loop interrupts** (plan edit + mutating-VICE gate)
-  - LangGraph `interrupt_before` after planner (edit/reorder/delete steps) and before mutating VICE calls
+- [x] **6.1 Human-in-the-loop interrupts** (plan edit + mutating-VICE gate)
+  - LangGraph `interrupt_after=["planner"]` for plan review (edit/reorder/delete steps), plus approval before mutating VICE calls
     (`memory.write`, poke-and-peek); Stop/cancel in Streamlit. **Source:** Gr §2.1.
   - **My call:** High-trust, but prerequisite for any `memory.write`/poke-and-peek work; sequence before 3.8's poke-and-peek.
 
-- [ ] **6.2 Multi-turn research notebook** (turn archive, versioned reports, digest "prior answers" section)
+- [x] **6.2 Multi-turn research notebook** (turn archive, versioned reports, digest "prior answers" section)
   - Persist `sessions/<game>/turns.jsonl`; version reports (`report_<ts>.md` + latest copy); add prior accepted answers
     + open questions to the digest; open-question chips in Streamlit. **Source:** Gr §2.2. Pairs with 2.4 (real resume).
 
-- [ ] **6.3 Hypothesis lifecycle** (mark supported/refuted on accept/contrary evidence) — **Source:** Gr §2.3.
-- [ ] **6.4 Share one evidence resolver between CLI and UI** — **Source:** Gr §2.4.
-- [ ] **6.5 Named multi-state dump catalog** (title/ingame/death/level2; diff frozen stages offline) — **Source:** Gr §3.3. Offline complement to 3.1.
-- [ ] **6.6 Symbol-map export** (VICE monitor `.sym`/`.labels` from high-confidence labels) — **Source:** Gr §3.2.
-- [ ] **6.7 Synthesizer→Code-KB Layer-1 without Layer-0 gate** — require enclosing Layer-0 window or tag `unverified_llm` so the call-graph UI stays honest. **Source:** Gr §3.5.
+- [x] **6.3 Hypothesis lifecycle** (mark supported/refuted on accept/contrary evidence) — **Source:** Gr §2.3.
+- [x] **6.4 Share one evidence resolver between CLI and UI** — **Source:** Gr §2.4.
+- [x] **6.5 Named multi-state dump catalog** (title/ingame/death/level2; diff frozen stages offline) — **Source:** Gr §3.3. Offline complement to 3.1.
+- [x] **6.6 Symbol-map export** (VICE monitor `.sym`/`.labels` from high-confidence labels) — **Source:** Gr §3.2.
+- [x] **6.7 Synthesizer→Code-KB Layer-1 without Layer-0 gate** — require enclosing Layer-0 window or tag `unverified_llm` so the call-graph UI stays honest. **Source:** Gr §3.5.
 
 - [-] **6.8 DAG-based planner / Code-KB Layer 2+3 / structured outputs (`with_structured_output`)**
   - **Source:** Ge §1.2, G #10a, F §2.6. **My call:** Defer. DAG planning and Layer 2/3 are large architectural bets the
     reports themselves rank as ambitious; the fable report explicitly recommends stabilizing the linear loop first.
     `with_structured_output` is attractive (deletes a lot of JSON-salvage code) but risky across 5 providers — schedule
     it as its own hardening pass *after* the loop is stable and the golden suite can catch regressions.
+
+### Phase 6 implementation notes
+
+- **6.1:** the Streamlit runner compiles with `interrupt_after=["planner"]`, pausing after every planner pass. The user can
+  edit/reorder/delete the JSON plan, while validation rejects duplicate IDs, missing dependencies, cycles, and unknown
+  tools. Mutating VICE methods and aliases are normalized and rejected before MCP/composite dispatch unless that exact
+  step was explicitly approved; the CLI stays deny-by-default unless `--approve-vice-mutations` is supplied. The UI can
+  cancel a pending run before tool execution and asks again after every replan.
+- **6.2:** every completed run is idempotently appended to `sessions/<game>/turns.jsonl`; reports are written to a
+  run-specific `report_<timestamp>_<run>.md` plus the `report.md` latest copy. The planner digest includes bounded prior
+  accepted answers/open questions, the UI reloads archived turns, and open questions have one-click investigation actions.
+- **6.3–6.4:** hypothesis status changes are append-only events (`open` → `supported`/`refuted`) driven by explicit
+  critic references, including hypothesis event IDs. Reports, the CLI, and Streamlit use the same resolver for typed
+  address, hypothesis, and event references.
+- **6.5:** named 64 KiB states are immutable, SHA-256 catalogued copies under the game session; source files can change
+  without changing frozen evidence, and any two states can be diffed offline from the UI. Live VICE snapshots are also
+  added to this catalog on a best-effort basis.
+- **6.6:** Code-KB exports VICE monitor `.labels` commands for names at or above the confidence threshold, excluding
+  generic fallbacks, low-confidence names, and `unverified_llm` suggestions; Streamlit exposes the result as a download.
+- **6.7:** synthesizer semantics are mirrored only as Layer-1 hypotheses/labels. Claims inside a deterministic Layer-0
+  routine bind to that verified window and may enter annotation; claims outside Layer 0 remain queryable but carry
+  `unverified_llm` and never create routine/xref ground truth.
+
+### Hardening pass (2026-07-18)
+
+Hypothesis lifecycle/evidence lookup now uses exact semantic IDs; event provenance uses a separate, unambiguous
+exact-or-unique-prefix path. The VICE gate covers reset, autostart, disk/tape/cartridge attachment, snapshot loading,
+resource changes, and normalized mutation aliases, with approved and read-only paths locked down offline. Unverified
+routine guesses no longer materialize as parent-KB routines; they remain explicit `unverified_llm` hypotheses.
+
+**Verification boundary:** default offline `pytest -q` is **367 passing, 15 skipped**; the skips remain only the
+explicitly gated paid/live golden cases. `compileall -q` and `git diff --check` are clean. No live VICE, Tavily, vision,
+or paid golden calls were run. Item 6.8 remains deferred and Phase 7 was not started.
 
 ---
 

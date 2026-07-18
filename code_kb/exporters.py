@@ -221,3 +221,66 @@ def export_commented_asm(
     out.append(f";  end — {len(rows)} instruction lines")
     out.append(f"; ============================================================")
     return "\n".join(out) + "\n"
+
+
+def export_vice_symbols(
+    store: CodeKnowledgeStore, *, min_confidence: float = 0.75,
+) -> str:
+    """Export high-confidence labels in VICE monitor ``.labels`` form."""
+    candidates: dict[int, tuple[float, str]] = {}
+
+    def add(address: Any, name: Any, confidence: Any, flags: Any = None) -> None:
+        try:
+            addr = int(address) & 0xFFFF
+            conf = float(confidence)
+        except (TypeError, ValueError):
+            return
+        if conf < float(min_confidence):
+            return
+        if isinstance(flags, str):
+            try:
+                flags = json.loads(flags)
+            except json.JSONDecodeError:
+                flags = []
+        if "unverified_llm" in (flags or []):
+            return
+        symbol = re.sub(r"[^A-Za-z0-9_]", "_", str(name or "").strip())
+        if not symbol or symbol.lower().startswith(("sub_", "loc_")):
+            return
+        if symbol[0].isdigit():
+            symbol = "sym_" + symbol
+        prior = candidates.get(addr)
+        if prior is None or conf > prior[0]:
+            candidates[addr] = (conf, symbol[:64])
+
+    for row in store.query(
+        "SELECT start_addr, name, confidence FROM code_routines"
+        " WHERE name IS NOT NULL AND confidence >= ?",
+        (float(min_confidence),),
+    ):
+        add(row["start_addr"], row["name"], row["confidence"])
+
+    for row in store.query(
+        "SELECT start_addr, payload_json, confidence, flags_json"
+        " FROM annotations WHERE kind IN ('label', 'hypothesis')"
+        " AND confidence >= ? ORDER BY seq",
+        (float(min_confidence),),
+    ):
+        try:
+            payload = json.loads(row.get("payload_json") or "{}")
+        except json.JSONDecodeError:
+            payload = {}
+        add(
+            row["start_addr"],
+            payload.get("name") or payload.get("name_suggestion"),
+            row["confidence"],
+            row.get("flags_json"),
+        )
+
+    lines = [
+        "; C64-RE high-confidence symbols",
+        f"; minimum confidence: {float(min_confidence):.2f}",
+    ]
+    for address, (confidence, symbol) in sorted(candidates.items()):
+        lines.append(f"al ${address:04X} .{symbol} ; confidence={confidence:.2f}")
+    return "\n".join(lines) + "\n"

@@ -40,16 +40,28 @@ _UI_PREFS_PATH = _HERE / "sessions" / ".ui_prefs.json"
 
 from tools.agent_runner import (  # noqa: E402
     annotate_routine,
+    begin_question,
+    PlanReview,
     TurnResult,
     call_graph_dot,
     code_kb_summary,
     disasm_for_addresses,
     list_dump_candidates,
+    mutating_step_ids,
     parse_addresses,
     preview_asm_scoping,
     reset_code_kb,
+    resume_question,
     run_question,
+    symbol_map_for_game,
     top_routines_by_xrefs,
+    validate_review_plan,
+)
+from tools.research_notebook import (  # noqa: E402
+    diff_dump_states,
+    freeze_dump_state,
+    load_dump_catalog,
+    load_turns,
 )
 
 
@@ -152,6 +164,10 @@ def _init_state() -> None:
     # Track the slug we last computed defaults for so the asm-file
     # multi-select auto-refreshes when the user changes the game.
     ss.setdefault("last_scoped_slug", "")
+    ss.setdefault("pending_plan_review", None)
+    ss.setdefault("pending_plan_json", "")
+    ss.setdefault("queued_question", "")
+    ss.setdefault("catalog_diff", None)
 
 
 _init_state()
@@ -228,6 +244,12 @@ with st.sidebar:
     game_just_changed = game_slug != st.session_state.last_scoped_slug
 
     if game_just_changed:
+        # A review checkpoint belongs to the game/thread that created it.
+        # Switching games cancels that pending run before any tools execute.
+        st.session_state.pending_plan_review = None
+        st.session_state.pending_plan_json = ""
+        st.session_state.pending_question = ""
+        st.session_state.catalog_diff = None
         # Restore per-game notes dir via the staging key so the text_dir
         # widget picks it up consistently (same pattern as the picker path).
         prefs = _load_ui_prefs()
@@ -247,6 +269,30 @@ with st.sidebar:
             st.session_state["_pending_game_picker_slug"] = game_slug
         else:
             st.session_state["_pending_game_picker_slug"] = "(keep typed game)"
+        from graph.plan_utils import resolve_session_slug as _resolve_turn_slug
+
+        _turn_session = (
+            _HERE / "sessions"
+            / _resolve_turn_slug(
+                st.session_state.game or "unknown", _HERE / "sessions",
+            )
+        )
+        st.session_state.history = [
+            {
+                "question": row.get("question") or "",
+                "answer": row.get("answer") or "",
+                "confidence": row.get("confidence"),
+                "verdict": row.get("verdict") or "n/a",
+                "critique": row.get("critique"),
+                "evidence": row.get("evidence") or [],
+                "resolved_evidence": row.get("resolved_evidence") or [],
+                "open_questions": row.get("open_questions") or [],
+                "addresses": row.get("addresses") or [],
+                "elapsed_s": row.get("elapsed_s") or 0.0,
+                "thread_id": row.get("run_id") or "",
+            }
+            for row in load_turns(_turn_session)
+        ]
 
     # ---------- Memory dump picker ---------- #
     st.text_input(
@@ -302,6 +348,73 @@ with st.sidebar:
              "the game-name auto-match update this; you can also edit "
              "it directly to point outside memdump_dir/.",
     )
+
+    with st.expander("Named dump states", expanded=False):
+        st.caption(
+            "Freeze title/ingame/death/level states, then compare them "
+            "offline without changing VICE."
+        )
+        from graph.plan_utils import resolve_session_slug as _resolve_slug
+
+        _catalog_session = (
+            _HERE / "sessions"
+            / _resolve_slug(st.session_state.game or "unknown", _HERE / "sessions")
+        )
+        st.text_input(
+            "State name", key="catalog_state_name",
+            placeholder="title, ingame, death, level2",
+        )
+        st.text_input(
+            "State description", key="catalog_state_description",
+        )
+        if st.button("Freeze selected dump", key="freeze_dump_state"):
+            try:
+                frozen = freeze_dump_state(
+                    _catalog_session,
+                    name=st.session_state.catalog_state_name,
+                    source_path=st.session_state.dump_path,
+                    description=st.session_state.catalog_state_description,
+                )
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Could not freeze dump: {exc}")
+            else:
+                st.success(
+                    f"Frozen `{frozen['name']}` ({frozen['sha256'][:10]}…)."
+                )
+        _catalog_rows = load_dump_catalog(_catalog_session)
+        if _catalog_rows:
+            st.dataframe([
+                {
+                    "name": row.get("name"),
+                    "description": row.get("description"),
+                    "sha256": str(row.get("sha256") or "")[:12],
+                }
+                for row in _catalog_rows
+            ], hide_index=True)
+        if len(_catalog_rows) >= 2:
+            _catalog_names = [str(row["name"]) for row in _catalog_rows]
+            _before = st.selectbox(
+                "Before", _catalog_names,
+                key=f"catalog_before_{game_slug}",
+            )
+            _after = st.selectbox(
+                "After", _catalog_names,
+                index=1,
+                key=f"catalog_after_{game_slug}",
+            )
+            if st.button("Compare frozen states", key="compare_dump_states"):
+                from tools.mem_diff import summarize_diff
+
+                try:
+                    _diff_rows = diff_dump_states(
+                        _catalog_session, before=_before, after=_after,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"Could not diff states: {exc}")
+                else:
+                    st.session_state.catalog_diff = summarize_diff(_diff_rows)
+            if st.session_state.catalog_diff:
+                st.code(st.session_state.catalog_diff, language="text")
 
     # ---------- Asm-file selection ---------- #
     st.divider()
@@ -574,12 +687,21 @@ def _render_turn(turn: dict) -> None:
         st.markdown(_esc_addrs(turn["answer"]))
         if turn.get("evidence"):
             with st.expander(f"Evidence ({len(turn['evidence'])})", expanded=False):
-                for e in turn["evidence"]:
-                    st.markdown(f"- `{e}`")
+                evidence_rows = turn.get("resolved_evidence") or turn["evidence"]
+                for e in evidence_rows:
+                    st.markdown(f"- {_esc_addrs(str(e))}")
         if turn.get("open_questions"):
             with st.expander(f"Open questions ({len(turn['open_questions'])})"):
-                for q in turn["open_questions"]:
+                for index, q in enumerate(turn["open_questions"]):
                     st.markdown(f"- {_esc_addrs(q)}")
+                    if st.button(
+                        "Investigate this",
+                        key=(
+                            f"open_q_{turn.get('thread_id', 'turn')}_"
+                            f"{index}"
+                        ),
+                    ):
+                        st.session_state.queued_question = str(q)
         if turn.get("critique"):
             with st.expander("Critic notes", expanded=False):
                 st.markdown(_esc_addrs(turn["critique"]))
@@ -599,49 +721,36 @@ for turn in st.session_state.history:
 # --------------------------------------------------------------------------- #
 
 
-def _run_turn(question: str) -> TurnResult | None:
-    """Execute one turn of the agent and stream progress into the UI."""
-    if not st.session_state.game:
-        st.error("Set a game name in the sidebar first.")
-        return None
-    if not st.session_state.dump_path:
-        st.error("Set the dump path in the sidebar first.")
-        return None
-    if not Path(st.session_state.dump_path).exists():
-        st.error(f"Dump file not found: {st.session_state.dump_path}")
-        return None
-
-    progress_box = st.status(
-        "Running deep research…", expanded=True, state="running",
-    )
+def _consume_agent_events(events, *, label: str) -> TurnResult | PlanReview | None:
+    """Render one begin/resume stream through completion or plan pause."""
+    progress_box = st.status(label, expanded=True, state="running")
     final: TurnResult | None = None
+    review: PlanReview | None = None
     error_msg: str | None = None
     with progress_box:
-        for kind, payload in run_question(
-            game=st.session_state.game,
-            question=question,
-            dump_path=st.session_state.dump_path,
-            asm_dir=st.session_state.asm_dir or None,
-            asm_files=(
-                st.session_state.asm_files_selected or None
-            ),
-            partial_asm=st.session_state.partial_asm or None,
-            text_dir=st.session_state.text_dir or None,
-        ):
+        for kind, payload in events:
             if kind == "status":
                 st.caption(payload)
             elif kind == "step":
-                msgs = payload.get("messages") or []
-                for m in msgs:
-                    _render_agent_msg(m)
+                for message in payload.get("messages") or []:
+                    _render_agent_msg(message)
             elif kind == "error":
                 error_msg = str(payload)
                 st.error(error_msg)
+            elif kind == "plan_review":
+                review = payload
             elif kind == "done":
-                final = payload  # type: ignore[assignment]
+                final = payload
     if error_msg:
         progress_box.update(label=f"Failed: {error_msg}", state="error")
         return None
+    if review is not None:
+        progress_box.update(
+            label=f"Plan ready · {len(review.plan)} step(s) · awaiting approval",
+            state="complete",
+            expanded=False,
+        )
+        return review
     if final is None:
         progress_box.update(label="No final state produced.", state="error")
         return None
@@ -652,7 +761,153 @@ def _run_turn(question: str) -> TurnResult | None:
     return final
 
 
-question = st.chat_input("Ask the agent something specific about the game…")
+def _run_turn(question: str) -> TurnResult | PlanReview | None:
+    """Run through the planner and stop for human plan review."""
+    if not st.session_state.game:
+        st.error("Set a game name in the sidebar first.")
+        return None
+    if not st.session_state.dump_path:
+        st.error("Set the dump path in the sidebar first.")
+        return None
+    if not Path(st.session_state.dump_path).exists():
+        st.error(f"Dump file not found: {st.session_state.dump_path}")
+        return None
+
+    return _consume_agent_events(
+        begin_question(
+            game=st.session_state.game,
+            question=question,
+            dump_path=st.session_state.dump_path,
+            asm_dir=st.session_state.asm_dir or None,
+            asm_files=(
+                st.session_state.asm_files_selected or None
+            ),
+            partial_asm=st.session_state.partial_asm or None,
+            text_dir=st.session_state.text_dir or None,
+        ),
+        label="Planning research…",
+    )
+
+
+def _resume_turn(
+    review: PlanReview, plan: list[dict], approved: list[str],
+) -> TurnResult | PlanReview | None:
+    return _consume_agent_events(
+        resume_question(
+            review,
+            plan=plan,
+            approved_mutation_steps=approved,
+        ),
+        label="Running approved research plan…",
+    )
+
+
+def _store_turn_result(result: TurnResult) -> None:
+    if result.addresses and st.session_state.focus_addr is None:
+        st.session_state.focus_addr = result.addresses[0]
+    st.session_state.history.append({
+        "question": result.question,
+        "answer": result.answer,
+        "confidence": result.confidence,
+        "verdict": result.verdict,
+        "critique": result.critique,
+        "evidence": result.evidence,
+        "resolved_evidence": result.resolved_evidence,
+        "open_questions": result.open_questions,
+        "addresses": result.addresses,
+        "elapsed_s": result.elapsed_s,
+        "thread_id": result.thread_id,
+    })
+
+
+pending_review = st.session_state.pending_plan_review
+if isinstance(pending_review, PlanReview):
+    with st.container(border=True):
+        st.subheader("Review research plan")
+        st.caption(
+            "Edit, reorder, or delete JSON steps. Execution remains paused "
+            "until you approve this checkpointed plan."
+        )
+        st.text_area(
+            "Planner JSON",
+            key="pending_plan_json",
+            height=320,
+        )
+        if pending_review.mutating_step_ids:
+            st.warning(
+                "These VICE steps can change emulator state and require "
+                "separate approval: "
+                + ", ".join(f"`{step}`" for step in pending_review.mutating_step_ids)
+            )
+            for step_id in pending_review.mutating_step_ids:
+                st.checkbox(
+                    f"Approve emulator mutation in {step_id}",
+                    key=f"approve_mutation_{pending_review.thread_id}_{step_id}",
+                )
+        approve_col, cancel_col = st.columns(2)
+        approve_clicked = approve_col.button(
+            "Run approved plan", type="primary", key="run_reviewed_plan",
+        )
+        cancel_clicked = cancel_col.button(
+            "Cancel research", key="cancel_reviewed_plan",
+        )
+        if cancel_clicked:
+            st.session_state.pending_plan_review = None
+            st.session_state.pending_plan_json = ""
+            st.session_state.pending_question = ""
+            st.toast("Research run cancelled before tool execution.", icon="🛑")
+            st.rerun()
+        if approve_clicked:
+            try:
+                edited_plan = validate_review_plan(
+                    json.loads(st.session_state.pending_plan_json),
+                )
+            except (json.JSONDecodeError, ValueError) as exc:
+                st.error(f"Plan is not valid: {exc}")
+            else:
+                required = mutating_step_ids(edited_plan)
+                approved = [
+                    step_id for step_id in required
+                    if st.session_state.get(
+                        f"approve_mutation_{pending_review.thread_id}_{step_id}",
+                        False,
+                    )
+                ]
+                missing = [step_id for step_id in required if step_id not in approved]
+                if missing:
+                    # The edit may have changed a read-only row into a
+                    # mutation. Surface fresh approval controls on the next
+                    # rerun; edited mutations can never inherit approval from
+                    # the original planner output silently.
+                    pending_review.mutating_step_ids = required
+                    st.session_state.pending_plan_review = pending_review
+                    st.error(
+                        "Explicit approval is still required for: "
+                        + ", ".join(missing)
+                    )
+                else:
+                    st.session_state.running = True
+                    outcome = _resume_turn(pending_review, edited_plan, approved)
+                    st.session_state.running = False
+                    if isinstance(outcome, PlanReview):
+                        st.session_state.pending_plan_review = outcome
+                        st.session_state.pending_plan_json = json.dumps(
+                            outcome.plan, indent=2,
+                        )
+                        st.rerun()
+                    elif isinstance(outcome, TurnResult):
+                        _store_turn_result(outcome)
+                        st.session_state.pending_plan_review = None
+                        st.session_state.pending_plan_json = ""
+                        st.session_state.pending_question = ""
+                        st.rerun()
+
+question = st.chat_input(
+    "Ask the agent something specific about the game…",
+    disabled=isinstance(pending_review, PlanReview),
+)
+if not question and not isinstance(pending_review, PlanReview):
+    question = st.session_state.pop("queued_question", "") or None
 if question:
     st.session_state.pending_question = question
     st.session_state.running = True
@@ -661,23 +916,12 @@ if question:
     with st.chat_message("assistant"):
         result = _run_turn(question)
     st.session_state.running = False
-    if result is not None:
-        # Auto-focus the first cited address so the call graph tab is
-        # already aimed somewhere useful when the user opens it.
-        if result.addresses and st.session_state.focus_addr is None:
-            st.session_state.focus_addr = result.addresses[0]
-        st.session_state.history.append({
-            "question": result.question,
-            "answer": result.answer,
-            "confidence": result.confidence,
-            "verdict": result.verdict,
-            "critique": result.critique,
-            "evidence": result.evidence,
-            "open_questions": result.open_questions,
-            "addresses": result.addresses,
-            "elapsed_s": result.elapsed_s,
-            "thread_id": result.thread_id,
-        })
+    if isinstance(result, PlanReview):
+        st.session_state.pending_plan_review = result
+        st.session_state.pending_plan_json = json.dumps(result.plan, indent=2)
+        st.rerun()
+    elif isinstance(result, TurnResult):
+        _store_turn_result(result)
         st.rerun()
 
 
@@ -1012,6 +1256,16 @@ with tab_kb:
             st.info("No code KB on disk yet.")
         else:
             st.json(summary, expanded=False)
+            symbol_map = symbol_map_for_game(
+                st.session_state.game, min_confidence=0.75,
+            )
+            if symbol_map:
+                st.download_button(
+                    "Download VICE symbols (.labels)",
+                    data=symbol_map,
+                    file_name=f"{_slugify_game_name(st.session_state.game)}.labels",
+                    mime="text/plain",
+                )
         from graph.plan_utils import resolve_session_slug
 
         sessions = Path("sessions")

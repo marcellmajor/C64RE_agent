@@ -18,6 +18,7 @@ import json
 import os
 import re
 import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -47,6 +48,7 @@ from memory.schema import (
     EVT_DATA_STRUCTURE,
     EVT_HYPOTHESIS,
     EVT_LABEL,
+    EVT_RUN_SUMMARY,
     EVT_ROUTINE,
     EVT_TOOL_RESULT,
     EVT_VERDICT,
@@ -637,7 +639,9 @@ def _session_dir(game: str) -> Path:
 # detector must ignore them: the analyst and critic append one each per
 # iteration, so counting them would make the KB "grow" every verdict
 # and the detector could never fire.
-_BOOKKEEPING_EVENT_KINDS = (EVT_ANALYSIS, EVT_VERDICT, EVT_CONSOLIDATED)
+_BOOKKEEPING_EVENT_KINDS = (
+    EVT_ANALYSIS, EVT_VERDICT, EVT_CONSOLIDATED, EVT_RUN_SUMMARY,
+)
 
 
 def _stable_content_hash(value: Any) -> str:
@@ -694,8 +698,10 @@ def _substantive_event_count(store: KnowledgeStore) -> int:
     indexing this is part of tracker 1.6.
     """
     try:
+        placeholders = ",".join("?" for _ in _BOOKKEEPING_EVENT_KINDS)
         rows = store.query(
-            "SELECT kind, payload_json FROM events WHERE kind NOT IN (?, ?, ?)",
+            f"SELECT kind, payload_json FROM events"
+            f" WHERE kind NOT IN ({placeholders})",
             _BOOKKEEPING_EVENT_KINDS,
         )
     except Exception:  # noqa: BLE001
@@ -750,11 +756,21 @@ def _normalize_plan_ids(plan: list[dict[str, Any]], state: C64State) -> list[dic
     prefix = f"i{state.get('iteration', 0) + 1}_"
     normalized: list[dict[str, Any]] = []
     id_map: dict[str, str] = {}
+    used_ids: set[str] = set()
 
     for idx, step in enumerate(plan, start=1):
         old_id = str(step.get("id") or f"s{idx}")
-        new_id = old_id if old_id.startswith(prefix) else f"{prefix}{old_id}"
-        id_map[old_id] = new_id
+        base_id = old_id if old_id.startswith(prefix) else f"{prefix}{old_id}"
+        new_id = base_id
+        suffix = 2
+        while new_id in used_ids:
+            new_id = f"{base_id}_{suffix}"
+            suffix += 1
+        used_ids.add(new_id)
+        # A dependency on a duplicated planner id resolves to its first
+        # occurrence; later duplicates are renamed solely to keep state keys
+        # collision-free (tracker 5.2 regression coverage).
+        id_map.setdefault(old_id, new_id)
         s = dict(step)
         s["id"] = new_id
         normalized.append(s)
@@ -843,11 +859,41 @@ def load_inputs(state: C64State) -> dict[str, Any]:
 
     # Build the initial question-relevant digest so the planner can avoid
     # repeating work the partial-asm or text notes already answered.
-    initial_digest = store.digest_for_question(
-        state.get("question", "") or "", max_chars=32_000,
-    )
+    question = state.get("question", "") or ""
+    initial_digest = store.digest_for_question(question, max_chars=24_000)
+    try:
+        from tools.research_notebook import prior_answers_digest
 
+        prior_answers = prior_answers_digest(
+            _session_dir(game), current_question=question, max_chars=8_000,
+        )
+    except Exception:  # noqa: BLE001
+        prior_answers = ""
+    if prior_answers:
+        initial_digest = (initial_digest + "\n\n" + prior_answers)[:32_000]
+
+    prior_run_completed = bool(state.get("run_completed_at"))
     return {
+        "run_id": (
+            uuid.uuid4().hex
+            if prior_run_completed or not state.get("run_id")
+            else state["run_id"]
+        ),
+        "run_started_at": (
+            datetime.now(timezone.utc).isoformat()
+            if prior_run_completed or not state.get("run_started_at")
+            else state["run_started_at"]
+        ),
+        "run_completed_at": None,
+        "require_vice_approval": bool(
+            state.get("require_vice_approval", True)
+        ),
+        "approved_mutation_steps": list(
+            state.get("approved_mutation_steps") or []
+        ),
+        "approve_all_vice_mutations": bool(
+            state.get("approve_all_vice_mutations", False)
+        ),
         "kb_handle": kb_handle,
         "code_kb_handle": code_kb_handle,
         "kb_digest": initial_digest,
@@ -998,78 +1044,9 @@ def _hydrate_code_kb(
 
 
 def _format_evidence(evidence: list[Any], store: "KnowledgeStore | None") -> str:
-    """Resolve KB event IDs in the evidence list to human-readable lines.
+    from memory.evidence import format_evidence_markdown
 
-    Each entry may be:
-    - a file path (starts with '/' or contains path separators) → shown as-is
-    - a KB event ID → resolved to kind + address/name/summary from payload
-    - anything else → shown verbatim
-    """
-    if not evidence:
-        return "_none recorded_"
-
-    lines: list[str] = []
-    for item in evidence:
-        s = str(item).strip()
-        if not s:
-            continue
-
-        # File path — show as a relative link
-        if s.startswith("/") or (len(s) > 4 and ("/" in s or "\\" in s)):
-            lines.append(f"- {s}")
-            continue
-
-        # Try to resolve as a KB event ID
-        if store is not None:
-            try:
-                rows = store.query(
-                    "SELECT kind, source, payload_json FROM events WHERE id = ?",
-                    (s,),
-                )
-                if rows:
-                    row = rows[0]
-                    kind = row.get("kind", "?")
-                    src = row.get("source", "?")
-                    try:
-                        payload = json.loads(row.get("payload_json") or "{}")
-                    except Exception:
-                        payload = {}
-
-                    # Build a one-line human-readable summary from the payload
-                    if kind == "label":
-                        addr = payload.get("addr")
-                        name = payload.get("name", "?")
-                        desc = f"label `{name}` @ ${addr:04X}" if isinstance(addr, int) else f"label `{name}`"
-                    elif kind == "routine":
-                        start = payload.get("start")
-                        name = payload.get("name") or "?"
-                        summary = (payload.get("summary") or "")[:120]
-                        desc = f"routine `{name}` @ ${start:04X}" if isinstance(start, int) else f"routine `{name}`"
-                        if summary:
-                            desc += f" — {summary}"
-                    elif kind == "tool_result":
-                        tool = payload.get("tool", "?")
-                        step = payload.get("step_id", "?")
-                        data = str(payload.get("data", ""))[:120].replace("\n", " ")
-                        desc = f"tool result `{tool}/{step}`: {data}"
-                    elif kind == "hypothesis":
-                        text = (payload.get("text") or "")[:160]
-                        status = payload.get("status", "?")
-                        desc = f"hypothesis ({status}): {text}"
-                    else:
-                        # Generic fallback: show kind + first 160 chars of payload
-                        preview = json.dumps(payload, default=str)[:160]
-                        desc = f"{kind} ({src}): {preview}"
-
-                    lines.append(f"- `{s}` — {desc}")
-                    continue
-            except Exception:  # noqa: BLE001
-                pass
-
-        # Unknown ID or no store — show raw
-        lines.append(f"- `{s}`")
-
-    return "\n".join(lines) if lines else "_none recorded_"
+    return format_evidence_markdown(evidence, store)
 
 
 def write_report(state: C64State) -> dict[str, Any]:
@@ -1089,6 +1066,30 @@ def write_report(state: C64State) -> dict[str, Any]:
     if state.get("kb_handle"):
         store = get_store(state["kb_handle"])
     s = store.stats() if store else {}
+
+    completed_at = datetime.now(timezone.utc)
+    started_at_raw = str(state.get("run_started_at") or "").strip()
+    elapsed_s: float | None = None
+    if started_at_raw:
+        try:
+            started_at = datetime.fromisoformat(started_at_raw.replace("Z", "+00:00"))
+            if started_at.tzinfo is None:
+                started_at = started_at.replace(tzinfo=timezone.utc)
+            elapsed_s = max(0.0, (completed_at - started_at).total_seconds())
+        except ValueError:
+            elapsed_s = None
+
+    run_id = str(state.get("run_id") or "").strip()
+    if not run_id:
+        # Direct/legacy callers that bypass load_inputs still get idempotent
+        # reporting. Normal CLI/UI/Studio runs always carry a UUID.
+        run_id = "legacy-" + _stable_content_hash({
+            "game": game,
+            "question": state.get("question", ""),
+            "verdict": verdict,
+            "iteration": state.get("iteration", 0),
+            "answer": answer,
+        })[:24]
 
     tr_lines = []
     for r in state.get("tool_results", [])[-20:]:
@@ -1224,7 +1225,7 @@ def write_report(state: C64State) -> dict[str, Any]:
 
 **Question:** {state.get("question", "")}
 
-**Verdict:** `{verdict}`  ·  **Confidence:** {confidence}  ·  **Iterations:** {state.get("iteration", 0)}
+**Run:** `{run_id}`  ·  **Verdict:** `{verdict}`  ·  **Confidence:** {confidence}  ·  **Iterations:** {state.get("iteration", 0)}
 
 ## Answer
 
@@ -1265,14 +1266,91 @@ def write_report(state: C64State) -> dict[str, Any]:
 ```
 
 ---
-_generated {datetime.now(timezone.utc).isoformat()}_
+_generated {completed_at.isoformat()}_
 """
 
-    report_path = out_dir / "report.md"
-    report_path.write_text(report)
+    from tools.research_notebook import (
+        append_turn,
+        versioned_report_path,
+    )
+    from memory.evidence import resolve_evidence
 
+    report_path = out_dir / "report.md"
+    report_version_path = versioned_report_path(
+        out_dir, started_at=started_at_raw, run_id=run_id,
+    )
+    report_version_path.write_text(report)
+    report_path.write_text(report)
+    append_turn(out_dir, {
+        "run_id": run_id,
+        "completed_at": completed_at.isoformat(),
+        "question": str(state.get("question") or ""),
+        "answer": str(answer),
+        "confidence": confidence,
+        "elapsed_s": elapsed_s,
+        "verdict": str(verdict),
+        "critique": str(critique or ""),
+        "evidence": [str(item) for item in evidence],
+        "resolved_evidence": resolve_evidence(evidence, store),
+        "open_questions": [str(item) for item in open_qs],
+        "addresses": sorted({
+            int(address) for address in extract_hex_addresses(
+                str(answer) + "\n" + "\n".join(map(str, evidence)),
+            )
+        }),
+        "report_path": str(report_version_path),
+    })
+
+    summary_event_id: str | None = None
+    summary_error: str | None = None
+    if store is not None:
+        try:
+            try:
+                summary_confidence = float(confidence)
+            except (TypeError, ValueError):
+                summary_confidence = 0.0
+            usage_entries = state.get("llm_usage") or []
+            total_tokens = int(state.get("tokens_used") or 0) or sum(
+                int(e.get("input_tokens") or 0)
+                + int(e.get("output_tokens") or 0)
+                for e in usage_entries
+            )
+            summary_event_id = store.record_run_summary({
+                "run_id": run_id,
+                "completed_at": completed_at.isoformat(),
+                "question": str(state.get("question") or ""),
+                "verdict": str(verdict),
+                "confidence": summary_confidence,
+                "iterations": int(state.get("iteration") or 0),
+                "cost_usd": float(state.get("budget_used") or 0.0),
+                "tokens": total_tokens,
+                "llm_calls": len(usage_entries),
+                "tool_calls": len(state.get("tool_results") or []),
+                "elapsed_s": elapsed_s,
+                "termination_reason": state.get("termination_reason"),
+                "answer_excerpt": str(answer)[:1_000],
+                "report_path": str(report_path),
+            })
+        except Exception as e:  # noqa: BLE001
+            # The report is the primary user artifact; telemetry failure must
+            # not turn a successfully completed research run into a graph error.
+            summary_error = f"{type(e).__name__}: {e}"
+            print(
+                f"[write_report] could not persist run summary: {summary_error}",
+                file=sys.stderr,
+            )
+
+    message = (
+        f"Wrote report → {report_path} "
+        f"(version={report_version_path.name})"
+    )
+    if summary_event_id:
+        message += f" (run_summary={summary_event_id})"
+    elif summary_error:
+        message += " (run_summary failed; see stderr)"
     return {
-        "messages": [AIMessage(content=f"Wrote report → {report_path}")],
+        "run_completed_at": completed_at.isoformat(),
+        "messages": [AIMessage(content=message)],
     }
 
 
@@ -1985,14 +2063,27 @@ def synthesizer_node(state: C64State) -> dict[str, Any]:
             try:
                 from code_kb import get_code_store as _get_code_store
                 from code_kb.schema import (
+                    ANN_HYPOTHESIS as _ANN_HYPOTHESIS,
                     ANN_LABEL as _ANN_LABEL,
                     ANN_ROUTINE as _ANN_ROUTINE,
-                    ANN_XREF as _ANN_XREF,
                 )
                 from code_kb.store import Annotation as _Ann
                 _code_store = _get_code_store(state["code_kb_handle"])
             except Exception:  # noqa: BLE001
                 pass
+
+        def _layer0_window(start: int, end: int | None = None) -> dict[str, Any] | None:
+            if _code_store is None:
+                return None
+            end = start if end is None else end
+            rows = _code_store.query(
+                "SELECT id, start_addr, end_addr, payload_json"
+                " FROM annotations WHERE layer = 0 AND kind = ?"
+                " AND start_addr <= ? AND end_addr >= ?"
+                " ORDER BY (end_addr - start_addr) ASC LIMIT 1",
+                (_ANN_ROUTINE, start, end),
+            )
+            return rows[0] if rows else None
 
         for lab in out.get("labels") or []:
             addr = _addr_to_int(lab.get("addr") or lab.get("address"))
@@ -2010,18 +2101,43 @@ def synthesizer_node(state: C64State) -> dict[str, Any]:
             })
             # Mirror into code_kb so node labels appear in the call graph.
             if _code_store is not None:
-                _code_store.append_annotation(
-                    _Ann(
-                        layer=1,
-                        kind=_ANN_LABEL,
-                        start_addr=addr,
-                        end_addr=addr,
-                        producer="synthesizer",
-                        confidence=confidence,
-                        payload={"name": name, "source_file": "llm_synthesizer"},
-                    ),
-                    source="synthesizer",
-                )
+                l0 = _layer0_window(addr)
+                if l0 is not None:
+                    _code_store.append_annotation(
+                        _Ann(
+                            layer=1,
+                            kind=_ANN_LABEL,
+                            start_addr=addr,
+                            end_addr=addr,
+                            producer="synthesizer",
+                            confidence=confidence,
+                            payload={
+                                "name": name,
+                                "source_file": "llm_synthesizer",
+                            },
+                            evidence=[str(lab.get("evidence") or "")],
+                        ),
+                        source="synthesizer",
+                    )
+                else:
+                    _code_store.append_annotation(
+                        _Ann(
+                            layer=1,
+                            kind=_ANN_HYPOTHESIS,
+                            start_addr=addr,
+                            end_addr=addr,
+                            producer="synthesizer",
+                            confidence=confidence,
+                            payload={
+                                "text": f"Unverified label suggestion: {name}",
+                                "name_suggestion": name,
+                                "source_file": "llm_synthesizer",
+                            },
+                            evidence=[str(lab.get("evidence") or "")],
+                            flags=["unverified_llm"],
+                        ),
+                        source="synthesizer",
+                    )
             extracted_counts["labels"] += 1
 
         for rt in out.get("routines") or []:
@@ -2038,80 +2154,99 @@ def synthesizer_node(state: C64State) -> dict[str, Any]:
             ]
             called_by = [c for c in called_by if c is not None]
             confidence = float(rt.get("confidence", 0.5))
-            store.append_event(EVT_ROUTINE, "synthesizer", {
-                "start": start,
-                "end": end,
-                "name": rt.get("name"),
-                "summary": rt.get("summary"),
-                "calls_to": calls_to,
-                "called_by": called_by,
-                "confidence": confidence,
-                "provenance": "llm",
-            })
+            l0 = _layer0_window(start, end)
+            if l0 is not None:
+                store.append_event(EVT_ROUTINE, "synthesizer", {
+                    "start": start,
+                    "end": end,
+                    "name": rt.get("name"),
+                    "summary": rt.get("summary"),
+                    "calls_to": calls_to,
+                    "called_by": called_by,
+                    "confidence": confidence,
+                    "provenance": "llm_with_layer0_window",
+                    "layer0_routine_id": str(l0["id"]),
+                })
+            else:
+                # A semantic routine guess without deterministic bounds must
+                # not materialise as parent-KB routine/call-graph truth.
+                store.append_event(EVT_HYPOTHESIS, "synthesizer", {
+                    "id": f"h_unverified_routine_{start:04x}",
+                    "text": rt.get("summary") or (
+                        f"Possible routine {rt.get('name') or 'purpose unknown'} "
+                        f"at ${start:04X}-${end:04X}."
+                    ),
+                    "status": "open",
+                    "evidence": [f"${start:04X}-${end:04X}"],
+                    "name_suggestion": rt.get("name"),
+                    "start": start,
+                    "end": end,
+                    "provenance": "unverified_llm",
+                })
 
-            # Mirror into code_kb so the call graph + routines panel in
-            # the web GUI see LLM-discovered routines, not only parser output.
+            # Mirror semantic claims into Code-KB Layer 1, but never invent
+            # call-graph ground truth. Claims with no enclosing deterministic
+            # Layer-0 routine remain queryable and carry `unverified_llm`.
+            existing_conf = 0.0
+            if _code_store is not None and l0 is not None:
+                # Capture the prior semantic confidence before appending this
+                # turn's hypothesis; otherwise the new row suppresses its own
+                # eligible annotation candidate below.
+                prior = _code_store.query(
+                    "SELECT confidence FROM hypotheses"
+                    " WHERE start_addr = ? AND layer = 1"
+                    " ORDER BY confidence DESC LIMIT 1",
+                    (int(l0["start_addr"]),),
+                )
+                existing_conf = float(prior[0]["confidence"]) if prior else 0.0
             if _code_store is not None:
+                if l0 is not None:
+                    l0_start = int(l0["start_addr"])
+                    l0_end = int(l0["end_addr"])
+                    flags: list[str] = []
+                    routine_id = str(l0["id"])
+                else:
+                    l0_start = start
+                    l0_end = end
+                    flags = ["unverified_llm"]
+                    routine_id = None
                 _code_store.append_annotation(
                     _Ann(
                         layer=1,
-                        kind=_ANN_ROUTINE,
-                        start_addr=start,
-                        end_addr=end,
+                        kind=_ANN_HYPOTHESIS,
+                        start_addr=l0_start,
+                        end_addr=l0_end,
                         producer="synthesizer",
                         confidence=confidence,
                         payload={
-                            "name": rt.get("name"),
-                            "summary": rt.get("summary"),
+                            "text": rt.get("summary") or (
+                                f"Possible routine {rt.get('name') or 'purpose unknown'}"
+                            ),
+                            "name_suggestion": rt.get("name"),
+                            "routine_id": routine_id,
                             "source_file": "llm_synthesizer",
-                            "entries": [start],
-                            "exits": [],
-                            "size_bytes": max(1, end - start + 1),
                         },
                         evidence=[rt.get("summary") or ""],
+                        flags=flags,
                     ),
                     source="synthesizer",
                 )
-                # Write call edges so local_dot can traverse the graph.
-                for callee in calls_to:
-                    _code_store.append_annotation(
-                        _Ann(
-                            layer=1,
-                            kind=_ANN_XREF,
-                            start_addr=start,
-                            end_addr=start,
-                            producer="synthesizer",
-                            confidence=confidence,
-                            payload={
-                                "src_addr": start,
-                                "dst_addr": callee,
-                                "xref_kind": "jsr",
-                            },
-                        ),
-                        source="synthesizer",
-                    )
 
             extracted_counts["routines"] += 1
 
             # Queue Layer-1 annotation candidates instead of firing a
             # hidden LLM call per routine (tracker 1.3). Candidates are
             # prioritised and capped after the extraction loops.
-            if _code_store is not None and confidence >= 0.50:
+            if _code_store is not None and l0 is not None and confidence >= 0.50:
                 try:
-                    existing = _code_store.query(
-                        "SELECT confidence FROM hypotheses"
-                        " WHERE start_addr = ? AND layer = 1"
-                        " ORDER BY confidence DESC LIMIT 1",
-                        (start,),
-                    )
-                    existing_conf = float(existing[0]["confidence"]) if existing else 0.0
+                    candidate_start = int(l0["start_addr"])
                     if confidence > existing_conf:
                         relevance = _question_relevance(
                             state.get("question", "") or "",
                             f"{rt.get('name') or ''} {rt.get('summary') or ''}",
                         )
                         annotate_candidates.append(
-                            (confidence * (1.0 + relevance), start),
+                            (confidence * (1.0 + relevance), candidate_start),
                         )
                 except Exception:
                     pass
@@ -2504,6 +2639,7 @@ def critic_node(state: C64State) -> dict[str, Any]:
     critique = out.get("critique") or fallback["critique"]
     suggested = out.get("suggested_steps") or []
     optional_followups = list(out.get("optional_followups") or [])
+    refuted_hypotheses = list(out.get("refuted_hypotheses") or [])
 
     # `suggested_steps` are BLOCKING tool work by contract; non-blocking
     # ideas belong in `optional_followups` (which accompanies `accept`
@@ -2551,6 +2687,7 @@ def critic_node(state: C64State) -> dict[str, Any]:
         "decision": decision,
         "critique": critique,
         "suggested_steps": suggested,
+        "refuted_hypotheses": refuted_hypotheses,
         "optional_followups": optional_followups,
         "_role_used": out.get("_role_used"),
     }
@@ -2567,6 +2704,20 @@ def critic_node(state: C64State) -> dict[str, Any]:
         new_count = _substantive_event_count(store)
         verdict["kb_grew_since_last_verdict"] = new_count > prev_count
         store.append_event(EVT_VERDICT, "critic", verdict)
+        if decision == "accept":
+            store.transition_hypotheses(
+                candidate.get("evidence") or [],
+                status="supported",
+                source="critic_accept",
+                evidence=candidate.get("evidence") or [],
+            )
+        if refuted_hypotheses:
+            store.transition_hypotheses(
+                refuted_hypotheses,
+                status="refuted",
+                source="critic_contrary_evidence",
+                evidence=candidate.get("evidence") or [],
+            )
     else:
         # Unknown growth must never terminate a possibly-productive replan.
         verdict["kb_grew_since_last_verdict"] = True
@@ -2656,6 +2807,15 @@ def _vice_normalize_method(raw_method: str) -> str:
         "memory.read": "vice.memory.read",
         "memory_read": "vice.memory.read",
         "vice.memory.read": "vice.memory.read",
+        "write_memory": "vice.memory.write",
+        "memory.write": "vice.memory.write",
+        "memory_write": "vice.memory.write",
+        "poke": "vice.memory.write",
+        "vice.memory.write": "vice.memory.write",
+        "fill_memory": "vice.memory.fill",
+        "memory.fill": "vice.memory.fill",
+        "memory_fill": "vice.memory.fill",
+        "vice.memory.fill": "vice.memory.fill",
         # ---- agent-side memory composites ----
         "snapshot": "vice.memory.snapshot",
         "memory.snapshot": "vice.memory.snapshot",
@@ -2682,9 +2842,55 @@ def _vice_normalize_method(raw_method: str) -> str:
         "execution.run": "vice.execution.run",
         "step": "vice.execution.step",
         "execution.step": "vice.execution.step",
+        "execution.reset": "vice.execution.reset",
+        "vice.execution.reset": "vice.execution.reset",
+        # ---- machine/media mutation ----
+        "reset": "vice.machine.reset",
+        "machine.reset": "vice.machine.reset",
+        "vice.reset": "vice.machine.reset",
+        "vice.machine.reset": "vice.machine.reset",
+        "autostart": "vice.autostart",
+        "machine.autostart": "vice.autostart",
+        "vice.autostart": "vice.autostart",
+        "attach_disk": "vice.disk.attach",
+        "disk.attach": "vice.disk.attach",
+        "disk_attach": "vice.disk.attach",
+        "vice.disk.attach": "vice.disk.attach",
+        "detach_disk": "vice.disk.detach",
+        "disk.detach": "vice.disk.detach",
+        "disk_detach": "vice.disk.detach",
+        "vice.disk.detach": "vice.disk.detach",
+        "attach_tape": "vice.tape.attach",
+        "tape.attach": "vice.tape.attach",
+        "vice.tape.attach": "vice.tape.attach",
+        "detach_tape": "vice.tape.detach",
+        "tape.detach": "vice.tape.detach",
+        "vice.tape.detach": "vice.tape.detach",
+        "attach_cartridge": "vice.cartridge.attach",
+        "cartridge.attach": "vice.cartridge.attach",
+        "vice.cartridge.attach": "vice.cartridge.attach",
+        "detach_cartridge": "vice.cartridge.detach",
+        "cartridge.detach": "vice.cartridge.detach",
+        "vice.cartridge.detach": "vice.cartridge.detach",
+        "snapshot.load": "vice.snapshot.load",
+        "vice.snapshot.load": "vice.snapshot.load",
+        "resources.set": "vice.resources.set",
+        "vice.resources.set": "vice.resources.set",
         # ---- breakpoints ----
         "checkpoint_add": "vice.checkpoint.add",
         "breakpoint": "vice.checkpoint.add",
+        "checkpoint.add": "vice.checkpoint.add",
+        "vice.checkpoint.add": "vice.checkpoint.add",
+        "checkpoint_delete": "vice.checkpoint.delete",
+        "checkpoint.delete": "vice.checkpoint.delete",
+        "vice.checkpoint.delete": "vice.checkpoint.delete",
+        # ---- injected input ----
+        "keyboard.type": "vice.keyboard.type",
+        "keyboard_type": "vice.keyboard.type",
+        "vice.keyboard.type": "vice.keyboard.type",
+        "joystick.set": "vice.joystick.set",
+        "joystick_set": "vice.joystick.set",
+        "vice.joystick.set": "vice.joystick.set",
         # ---- screenshots ----
         "screenshot": "vice.display.screenshot",
         "display.screenshot": "vice.display.screenshot",
@@ -2706,6 +2912,48 @@ def _vice_normalize_method(raw_method: str) -> str:
         return m
     # Last resort: treat as vice.<name>.
     return f"vice.{m}" if m else "vice.ping"
+
+
+_MUTATING_VICE_METHODS = frozenset({
+    "vice.trace",
+    "vice.memory.write",
+    "vice.memory.fill",
+    "vice.execution.run",
+    "vice.execution.step",
+    "vice.execution.pause",
+    "vice.execution.reset",
+    "vice.machine.reset",
+    "vice.autostart",
+    "vice.disk.attach",
+    "vice.disk.detach",
+    "vice.tape.attach",
+    "vice.tape.detach",
+    "vice.tape.control",
+    "vice.cartridge.attach",
+    "vice.cartridge.detach",
+    "vice.cartridge.freeze",
+    "vice.snapshot.load",
+    "vice.resources.set",
+    "vice.checkpoint.add",
+    "vice.checkpoint.delete",
+    "vice.keyboard.type",
+    "vice.joystick.set",
+})
+
+
+def vice_method_requires_approval(method: str) -> bool:
+    """True when a VICE method can change emulator state."""
+    canonical = _vice_normalize_method(method)
+    return canonical in _MUTATING_VICE_METHODS or canonical.startswith((
+        "vice.memory.write", "vice.memory.poke", "vice.keyboard.",
+        "vice.joystick.",
+    ))
+
+
+def vice_step_requires_approval(step: dict[str, Any]) -> bool:
+    args = step.get("args") or {}
+    method = args.get("method") or step.get("method") or step.get("action") or ""
+    return vice_method_requires_approval(str(method))
 
 
 # Address-key aliases the planner LLM keeps inventing: shared constant
@@ -3751,11 +3999,33 @@ def _load_named_snapshot(state: C64State, name: str) -> bytes | None:
             except Exception:  # noqa: BLE001
                 return None
         return None
-    d = _snapshot_dir(state)
-    if d is None:
+    try:
+        from tools.research_notebook import normalize_dump_state_name
+
+        safe_name = normalize_dump_state_name(str(name))
+    except ValueError:
         return None
-    p = d / f"{_slug(str(name))}.bin"
-    return p.read_bytes() if p.exists() else None
+    d = _snapshot_dir(state)
+    if d is not None:
+        p = d / f"{safe_name}.bin"
+        if p.exists():
+            return p.read_bytes()
+    handle = state.get("kb_handle")
+    if handle:
+        try:
+            from tools.research_notebook import dump_state_path, load_dump_catalog
+
+            rows = load_dump_catalog(Path(handle).parent)
+            match = next(
+                (row for row in rows if row.get("name") == safe_name), None,
+            )
+            if match:
+                path = dump_state_path(Path(handle).parent, match)
+                if path.exists():
+                    return path.read_bytes()
+        except Exception:  # noqa: BLE001
+            pass
+    return None
 
 
 def _vice_read_full_ram(address: int = 0x0000, size: int = 0x10000) -> bytes:
@@ -3800,6 +4070,15 @@ def _vice_composite(
 
     if m == "snapshot":
         name = str(args.get("name") or "snap").strip()
+        from tools.research_notebook import normalize_dump_state_name
+
+        try:
+            safe_name = normalize_dump_state_name(name)
+        except ValueError as exc:
+            return _record_result(
+                "vice", step_id, False, str(exc),
+                extra={"method": "vice.memory.snapshot", "retryable": False},
+            )
         d = _snapshot_dir(state)
         if d is None:
             return _record_result(
@@ -3815,11 +4094,23 @@ def _vice_composite(
                 f"vice.memory.snapshot failed: {type(e).__name__}: {e}",
                 extra={"method": "vice.memory.snapshot"},
             )
-        (d / f"{_slug(name)}.bin").write_bytes(buf)
+        snapshot_path = d / f"{safe_name}.bin"
+        snapshot_path.write_bytes(buf)
+        try:
+            from tools.research_notebook import freeze_dump_state
+
+            freeze_dump_state(
+                d.parent,
+                name=name,
+                source_path=snapshot_path,
+                description="VICE live snapshot",
+            )
+        except Exception:  # noqa: BLE001
+            pass
         return _record_result(
             "vice", step_id, True,
             f"Saved snapshot '{name}' ({len(buf)} bytes) → "
-            f"snapshots/{_slug(name)}.bin. Diff it against another "
+            f"snapshots/{safe_name}.bin. Diff it against another "
             "snapshot (or the reserved name 'dump') to find changed state.",
             extra={"method": "vice.memory.snapshot", "snapshot": name,
                    "size": len(buf)},
@@ -4142,6 +4433,26 @@ def vice_mcp_node(state: C64State) -> dict[str, Any]:
             args[_top_key] = step[_top_key]
     step_id = step.get("id", "?")
 
+    if (
+        state.get("require_vice_approval")
+        and vice_method_requires_approval(method)
+        and not state.get("approve_all_vice_mutations")
+        and str(step_id) not in {
+            str(item) for item in state.get("approved_mutation_steps") or []
+        }
+    ):
+        return _record_result(
+            "vice", step_id, False,
+            f"{method} can mutate emulator state and requires explicit "
+            "human approval before execution.",
+            extra={
+                "method": method,
+                "args": args,
+                "rejection": "human_approval_required",
+                "retryable": False,
+            },
+        )
+
     if not os.getenv("VICE_MCP_URL", "").strip():
         return _record_result(
             "vice", step_id, False,
@@ -4261,7 +4572,7 @@ KB_SCHEMA_HINT = (
     "  events(id TEXT PK, ts TEXT, kind TEXT, source TEXT, payload_json TEXT)\n"
     "    kind ∈ {ingest_dump, ingest_partial_asm, ingest_text, tool_result,\n"
     "            label, routine, hypothesis, analysis, verdict,\n"
-    "            data_structure, consolidated_observation}\n"
+    "            data_structure, consolidated_observation, run_summary}\n"
     "  labels(addr INTEGER, name TEXT, kind TEXT, confidence REAL,\n"
     "         source_event_id TEXT)\n"
     "    NOTE: the column is `addr`, NOT `address` / `address_hex` /\n"
@@ -4276,6 +4587,10 @@ KB_SCHEMA_HINT = (
     "  hypotheses(id TEXT PK, text, status, evidence_json)\n"
     "  text_docs(path TEXT PK, ts, size, mtime, content TEXT,\n"
     "            source_event_id) -- user notes from --text-dir\n"
+    "  run_summaries(run_id TEXT PK, event_id, completed_at, question,\n"
+    "                verdict, confidence, iterations, cost_usd, tokens,\n"
+    "                llm_calls, tool_calls, elapsed_s, termination_reason,\n"
+    "                answer_excerpt, report_path)\n"
     "  meta(key TEXT PK, value TEXT)\n"
     "Useful queries:\n"
     "  - addresses near a label:\n"

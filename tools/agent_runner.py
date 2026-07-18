@@ -19,6 +19,7 @@ import time
 import traceback
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -48,6 +49,17 @@ def _compiled_graph() -> Any:
     return g
 
 
+def _compiled_hitl_graph() -> Any:
+    """Graph paused after every planner pass for human plan review."""
+    graph = _GRAPH_CACHE.get("hitl")
+    if graph is None:
+        graph = build_graph().compile(
+            checkpointer=MemorySaver(), interrupt_after=["planner"],
+        )
+        _GRAPH_CACHE["hitl"] = graph
+    return graph
+
+
 @dataclass
 class TurnResult:
     """Everything one chat turn produced — handed back to the UI."""
@@ -59,9 +71,22 @@ class TurnResult:
     evidence: list[str]
     open_questions: list[str]
     addresses: list[int]            # parsed out of answer + evidence
+    resolved_evidence: list[str] = field(default_factory=list)
     raw_state: dict[str, Any] = field(default_factory=dict)
     elapsed_s: float = 0.0
     thread_id: str = ""
+
+
+@dataclass
+class PlanReview:
+    """Checkpointed run waiting for plan edits/approval."""
+
+    question: str
+    thread_id: str
+    plan: list[dict[str, Any]]
+    mutating_step_ids: list[str]
+    seen_messages: int
+    started_monotonic: float
 
 
 # --------------------------------------------------------------------------- #
@@ -105,6 +130,74 @@ def parse_addresses(text: str) -> list[int]:
 # --------------------------------------------------------------------------- #
 
 
+def _initial_state(
+    *, game: str, question: str, dump_path: str | Path,
+    asm_dir: str | Path | None = None,
+    asm_files: list[str | Path] | None = None,
+    partial_asm: str | Path | None = None,
+    text_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    return {
+        "run_id": uuid.uuid4().hex,
+        "run_started_at": datetime.now(timezone.utc).isoformat(),
+        "game": game,
+        "question": question,
+        "dump_path": str(dump_path),
+        "partial_asm_path": str(partial_asm) if partial_asm else None,
+        "text_dir": str(text_dir) if text_dir else None,
+        "asm_dir": str(asm_dir) if asm_dir else None,
+        "asm_files": [str(path) for path in asm_files] if asm_files else None,
+        "plan": [],
+        "tool_results": [],
+        "history": [],
+        "messages": [],
+        "require_vice_approval": True,
+        "approved_mutation_steps": [],
+        "approve_all_vice_mutations": False,
+    }
+
+
+def _turn_result_from_state(
+    final: dict[str, Any], *, question: str, thread_id: str,
+    started: float,
+) -> TurnResult:
+    candidate = final.get("candidate_answer") or {}
+    verdict_obj = final.get("verdict") or {}
+    answer = str(candidate.get("answer") or "(no answer produced)")
+    evidence = [str(item) for item in (candidate.get("evidence") or [])]
+    addresses = parse_addresses(answer + "\n" + "\n".join(evidence))
+    try:
+        from memory import get_store
+        from memory.evidence import resolve_evidence
+
+        evidence_store = (
+            get_store(final["kb_handle"]) if final.get("kb_handle") else None
+        )
+        resolved_evidence = resolve_evidence(evidence, evidence_store)
+    except Exception:  # noqa: BLE001
+        resolved_evidence = evidence
+    return TurnResult(
+        question=question,
+        answer=answer,
+        confidence=(
+            float(candidate["confidence"])
+            if isinstance(candidate.get("confidence"), (int, float))
+            else None
+        ),
+        verdict=str(verdict_obj.get("decision") or "n/a"),
+        critique=verdict_obj.get("critique"),
+        evidence=evidence,
+        open_questions=[
+            str(item) for item in (candidate.get("open_questions") or [])
+        ],
+        addresses=addresses,
+        resolved_evidence=resolved_evidence,
+        raw_state=final,
+        elapsed_s=time.monotonic() - started,
+        thread_id=thread_id,
+    )
+
+
 def run_question(
     *,
     game: str,
@@ -130,21 +223,15 @@ def run_question(
     started = time.monotonic()
     graph = _compiled_graph()
 
-    initial_state = {
-        "game": game,
-        "question": question,
-        "dump_path": str(dump_path),
-        "partial_asm_path": str(partial_asm) if partial_asm else None,
-        "text_dir": str(text_dir) if text_dir else None,
-        "asm_dir": str(asm_dir) if asm_dir else None,
-        "asm_files": (
-            [str(p) for p in asm_files] if asm_files else None
-        ),
-        "plan": [],
-        "tool_results": [],
-        "history": [],
-        "messages": [],
-    }
+    initial_state = _initial_state(
+        game=game,
+        question=question,
+        dump_path=dump_path,
+        asm_dir=asm_dir,
+        asm_files=asm_files,
+        partial_asm=partial_asm,
+        text_dir=text_dir,
+    )
 
     tid = thread_id or f"webui-{uuid.uuid4().hex[:8]}"
     # LangGraph defaults to 25 super-steps — one 7-step plan iteration.
@@ -207,33 +294,229 @@ def run_question(
         final = truncated
     else:
         final = graph.get_state(config).values or last_state
-    candidate = final.get("candidate_answer") or {}
-    verdict_obj = final.get("verdict") or {}
-    answer = str(candidate.get("answer") or "(no answer produced)")
-    evidence = [str(e) for e in (candidate.get("evidence") or [])]
-    blob = answer + "\n" + "\n".join(evidence)
-    addrs = parse_addresses(blob)
+    yield ("done", _turn_result_from_state(
+        final, question=question, thread_id=tid, started=started,
+    ))
 
-    result = TurnResult(
-        question=question,
-        answer=answer,
-        confidence=(
-            float(candidate["confidence"])
-            if isinstance(candidate.get("confidence"), (int, float))
-            else None
-        ),
-        verdict=str(verdict_obj.get("decision") or "n/a"),
-        critique=verdict_obj.get("critique"),
-        evidence=evidence,
-        open_questions=[
-            str(q) for q in (candidate.get("open_questions") or [])
-        ],
-        addresses=addrs,
-        raw_state=final,
-        elapsed_s=time.monotonic() - started,
-        thread_id=tid,
+
+def mutating_step_ids(plan: list[dict[str, Any]]) -> list[str]:
+    from graph.nodes import vice_step_requires_approval
+
+    return [
+        str(step.get("id") or "?") for step in plan
+        if str(step.get("tool") or "").lower() == "vice"
+        and vice_step_requires_approval(step)
+    ]
+
+
+def validate_review_plan(plan: Any) -> list[dict[str, Any]]:
+    """Validate a user-edited planner JSON array before checkpoint resume."""
+    if not isinstance(plan, list) or not plan:
+        raise ValueError("reviewed plan must be a non-empty JSON array")
+    allowed_tools = {"vice", "capstone", "tavily", "kb", "code_kb"}
+    out: list[dict[str, Any]] = []
+    ids: set[str] = set()
+    for index, raw in enumerate(plan, start=1):
+        if not isinstance(raw, dict):
+            raise ValueError(f"plan row {index} must be an object")
+        step = dict(raw)
+        step_id = str(step.get("id") or "").strip()
+        tool = str(step.get("tool") or "").strip().lower()
+        if not step_id or not tool:
+            raise ValueError(f"plan row {index} requires id and tool")
+        if tool not in allowed_tools:
+            raise ValueError(
+                f"plan row {step_id} has unsupported tool {tool!r}",
+            )
+        if step_id in ids:
+            raise ValueError(f"duplicate reviewed plan id: {step_id}")
+        ids.add(step_id)
+        if not isinstance(step.get("args") or {}, dict):
+            raise ValueError(f"plan row {step_id} args must be an object")
+        dependencies = step.get("depends_on") or []
+        if not isinstance(dependencies, list):
+            raise ValueError(f"plan row {step_id} depends_on must be an array")
+        step["args"] = dict(step.get("args") or {})
+        step["depends_on"] = [str(item) for item in dependencies]
+        step["tool"] = tool
+        out.append(step)
+    unknown = sorted({
+        dependency for step in out for dependency in step["depends_on"]
+        if dependency not in ids
+    })
+    if unknown:
+        raise ValueError("unknown reviewed plan dependencies: " + ", ".join(unknown))
+
+    dependencies_by_id = {
+        str(step["id"]): set(step["depends_on"]) for step in out
+    }
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(step_id: str) -> None:
+        if step_id in visiting:
+            raise ValueError("reviewed plan dependencies contain a cycle")
+        if step_id in visited:
+            return
+        visiting.add(step_id)
+        for dependency in dependencies_by_id[step_id]:
+            visit(dependency)
+        visiting.remove(step_id)
+        visited.add(step_id)
+
+    for step_id in dependencies_by_id:
+        visit(step_id)
+    return out
+
+
+def _plan_review_from_state(
+    state: dict[str, Any], *, thread_id: str, seen_messages: int,
+    started: float,
+) -> PlanReview:
+    plan = validate_review_plan(state.get("plan") or [])
+    return PlanReview(
+        question=str(state.get("question") or ""),
+        thread_id=thread_id,
+        plan=plan,
+        mutating_step_ids=mutating_step_ids(plan),
+        seen_messages=seen_messages,
+        started_monotonic=started,
     )
-    yield ("done", result)
+
+
+def begin_question(
+    *, game: str, question: str, dump_path: str | Path,
+    asm_dir: str | Path | None = None,
+    asm_files: list[str | Path] | None = None,
+    partial_asm: str | Path | None = None,
+    text_dir: str | Path | None = None,
+    thread_id: str | None = None,
+) -> Iterator[tuple[str, Any]]:
+    """Run through planning, then pause at a durable human-review point."""
+    graph = _compiled_hitl_graph()
+    started = time.monotonic()
+    tid = thread_id or f"webui-hitl-{uuid.uuid4().hex[:8]}"
+    config = {
+        "recursion_limit": RECURSION_LIMIT,
+        "configurable": {"thread_id": tid},
+    }
+    yield ("status", f"thread_id={tid} · planning")
+    seen_messages = 0
+    try:
+        for event in graph.stream(
+            _initial_state(
+                game=game,
+                question=question,
+                dump_path=dump_path,
+                asm_dir=asm_dir,
+                asm_files=asm_files,
+                partial_asm=partial_asm,
+                text_dir=text_dir,
+            ),
+            config,
+            stream_mode="values",
+        ):
+            messages = event.get("messages") or []
+            new_messages = messages[seen_messages:]
+            seen_messages = len(messages)
+            if new_messages:
+                yield ("step", {
+                    "messages": [
+                        getattr(message, "content", str(message))
+                        for message in new_messages
+                    ],
+                    "iteration": event.get("iteration", 0),
+                })
+    except Exception as exc:  # noqa: BLE001
+        yield ("error", f"{type(exc).__name__}: {exc}")
+        return
+    state = graph.get_state(config).values or {}
+    try:
+        review = _plan_review_from_state(
+            state,
+            thread_id=tid,
+            seen_messages=seen_messages,
+            started=started,
+        )
+    except ValueError as exc:
+        yield ("error", f"planner produced an unreviewable plan: {exc}")
+        return
+    yield ("plan_review", review)
+
+
+def resume_question(
+    review: PlanReview, *, plan: Any,
+    approved_mutation_steps: list[str] | None = None,
+) -> Iterator[tuple[str, Any]]:
+    """Apply a reviewed plan and resume until completion or the next replan."""
+    graph = _compiled_hitl_graph()
+    reviewed_plan = validate_review_plan(plan)
+    config = {
+        "recursion_limit": RECURSION_LIMIT,
+        "configurable": {"thread_id": review.thread_id},
+    }
+    approved = [str(item) for item in approved_mutation_steps or []]
+    graph.update_state(config, {
+        "plan": reviewed_plan,
+        "approved_mutation_steps": approved,
+        "approve_all_vice_mutations": False,
+    }, as_node="planner")
+    yield ("status", f"thread_id={review.thread_id} · approved plan resumed")
+    seen_messages = review.seen_messages
+    last_state: dict[str, Any] = {}
+    truncated: dict[str, Any] | None = None
+    try:
+        for event in graph.stream(None, config, stream_mode="values"):
+            last_state = event
+            messages = event.get("messages") or []
+            new_messages = messages[seen_messages:]
+            seen_messages = len(messages)
+            if new_messages:
+                yield ("step", {
+                    "messages": [
+                        getattr(message, "content", str(message))
+                        for message in new_messages
+                    ],
+                    "iteration": event.get("iteration", 0),
+                })
+    except GraphRecursionError:
+        raw = graph.get_state(config).values or last_state
+        truncated = normalize_truncated_state(
+            raw,
+            reason="recursion_exhausted",
+            detail="the reviewed run exhausted its super-step budget",
+        )
+        try:
+            from graph.nodes import write_report
+
+            write_report(truncated)
+        except Exception:  # noqa: BLE001
+            log.warning("best-effort HITL write_report failed", exc_info=True)
+    except Exception as exc:  # noqa: BLE001
+        yield ("error", f"{type(exc).__name__}: {exc}")
+        return
+
+    snapshot = graph.get_state(config)
+    final = truncated or snapshot.values or last_state
+    if final.get("run_completed_at") or truncated is not None:
+        yield ("done", _turn_result_from_state(
+            final,
+            question=review.question,
+            thread_id=review.thread_id,
+            started=review.started_monotonic,
+        ))
+        return
+    try:
+        next_review = _plan_review_from_state(
+            final,
+            thread_id=review.thread_id,
+            seen_messages=seen_messages,
+            started=review.started_monotonic,
+        )
+    except ValueError as exc:
+        yield ("error", f"replanner produced an unreviewable plan: {exc}")
+        return
+    yield ("plan_review", next_review)
 
 
 # --------------------------------------------------------------------------- #
@@ -366,6 +649,18 @@ def code_kb_summary(game: str) -> dict[str, Any] | None:
     if store is None:
         return None
     return store.stats()
+
+
+def symbol_map_for_game(
+    game: str, *, min_confidence: float = 0.75,
+) -> str | None:
+    """Render a VICE monitor label map from trustworthy Code-KB names."""
+    store = _resolve_code_store(game)
+    if store is None:
+        return None
+    from code_kb import export_vice_symbols
+
+    return export_vice_symbols(store, min_confidence=min_confidence)
 
 
 def reset_code_kb(game: str) -> bool:

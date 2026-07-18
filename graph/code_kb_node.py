@@ -39,6 +39,7 @@ from code_kb import (
     disasm_capstone,
     disasm_vice,
     export_commented_asm,
+    export_vice_symbols,
     fetch_routines,
     get_code_store,
     render_user_prompt,
@@ -459,15 +460,24 @@ def _mode_export(store, args, step_id):
     # path + a head excerpt.
     from pathlib import Path
     out_path_raw = args.get("path")
+    export_format = str(args.get("format") or "asm").strip().lower()
     if out_path_raw:
         out_path = Path(out_path_raw)
+    elif export_format in {"symbols", "labels", "vice"}:
+        out_path = store.root.parent / "code_kb.labels"
     else:
         out_path = store.root.parent / "code_kb_annotated.asm"
-    text = export_commented_asm(
-        store,
-        game_name=args.get("game"),
-        min_confidence=float(args.get("min_confidence") or 0.0),
-    )
+    if export_format in {"symbols", "labels", "vice"}:
+        text = export_vice_symbols(
+            store,
+            min_confidence=float(args.get("min_confidence") or 0.75),
+        )
+    else:
+        text = export_commented_asm(
+            store,
+            game_name=args.get("game"),
+            min_confidence=float(args.get("min_confidence") or 0.0),
+        )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(text)
     head = "\n".join(text.splitlines()[:40])
@@ -475,7 +485,8 @@ def _mode_export(store, args, step_id):
         "code_kb", step_id, True,
         f"Wrote {len(text)} bytes to {out_path}\n\n--- head ---\n{head}",
         extra={
-            "mode": "export", "path": str(out_path),
+            "mode": "export", "format": export_format,
+            "path": str(out_path),
             "bytes": len(text),
         },
     )
