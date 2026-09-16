@@ -28,20 +28,22 @@ Knowledge is persisted across runs — restart the agent on the same game and it
 ```
 load_inputs
     └─▶ planner ──▶ executor ──▶ [vice | capstone | tavily | kb | code_kb]
-                       ▲               └──────────────────────────────────▶ synthesizer
-                       │                                                          │
-                       │◀──── (more steps pending) ───────────────────────────────┤
-                       │                                                          │
-                    curator ◀─── (KB too large) ─────────────────────────────────▶│
-                                                                                  ▼
-                                                                               analyst
-                                                                                  │
-                                                                               critic
-                                                                          ┌───────┴────────┐
-                                                                       accept           replan/revise
-                                                                          │                  │
-                                                                     write_report         planner
+                                    └─▶ synthesizer
+                                            ├─ compaction needed ─▶ curator
+                                            │                         ├─ more steps ─▶ executor
+                                            │                         └─ done ───────▶ analyst
+                                            ├─ more steps ─────────▶ executor
+                                            └─ done ───────────────▶ analyst
+
+analyst ──▶ critic
+                ├─ accept ──────────▶ write_report
+                ├─ revise ──────────▶ analyst
+                ├─ replan ──────────▶ planner
+                └─ budget/loop stop ▶ write_report
 ```
+
+The compaction gate takes priority over pending steps. A blocked executor
+plan can also return directly to the planner, within the iteration limit.
 
 ### Sub-agents
 
@@ -52,7 +54,7 @@ load_inputs
 | **Synthesizer** | Extracts structured facts (labels, routines, data structures, hypotheses) from raw tool results and writes them to the KB |
 | **Analyst** | Answers the question using only KB-backed evidence; emits confidence score and open questions |
 | **Critic** | Adversarially reviews the answer; decides `accept` / `revise` / `replan` |
-| **Curator** | Compacts the KB when it grows beyond the token budget of the cheapest model |
+| **Curator** | Summarises uncompacted tool results when their estimated token count exceeds 40,000; original evidence stays in the append-only KB |
 | **Vision** | Describes an explicitly requested VICE screenshot for downstream evidence extraction |
 
 ### Tools
@@ -90,9 +92,13 @@ cp .env.example .env             # edit .env with your keys
 
 The package also builds as a standard wheel (`uv build --wheel`) and installs a
 `c64re` command. By default, writable data is relative to the directory where
-the command is launched. Set `C64RE_WORKSPACE_DIR` to relocate all default
-workspace data, `C64RE_SESSIONS_DIR` to relocate only durable sessions, or
+the command is launched. Set `C64RE_WORKSPACE_DIR` to relocate the default
+session root and the UI's default input directories, `C64RE_SESSIONS_DIR` to
+relocate only durable sessions, or
 `C64RE_CONFIG_DIR` to use an external `llm.json`/`kb_semantic.json` directory.
+The CLI's default `./asm_dir` and `./text_dir` still resolve relative to the
+current working directory; pass `--asm-dir` and `--text-dir` explicitly to
+use input directories elsewhere.
 Set these overrides before starting/importing the CLI, Streamlit UI, graph, or
 semantic configuration modules. Those application modules deliberately
 snapshot paths at import so a running process cannot silently switch its
@@ -121,7 +127,12 @@ LANGSMITH_PROJECT=c64re
 
 ### LLM configuration
 
-Edit `config/llm.json` to choose which model each sub-agent uses. Any sub-agent can use a different provider:
+Edit `config/llm.json` to choose which model each sub-agent uses. Any sub-agent
+can use a different provider. The following is an illustrative `agents`
+section, not a snapshot of the current configuration; preserve the file's
+`providers` section and select models available to your accounts. Configure
+credentials for the selected providers, or assign all roles to the provider
+you intend to use:
 
 ```json
 {
@@ -183,14 +194,16 @@ arguments.
 --asm-dir       Directory of .asm/.txt disassembly files (default: ./asm_dir)
 --asm-files     Explicit asm file list (overrides filename-token scoping)
 --text-dir      Directory of human-written notes .txt/.md (default: ./text_dir)
---thread-id     Resume a previous session (default: derived from game name)
+--thread-id     Checkpoint thread (default: <game-slug>-<question-hash>)
 --reset-code-kb Wipe the code KB before running (use if a prior run loaded wrong files)
 --approve-vice-mutations
                 Explicitly allow VICE steps that change emulator state
 --no-trace      Disable LangSmith tracing for this run
 ```
 
-**Resume a previous run** — just re-run with the same `--game` and a new `--question`. The KB from prior sessions is loaded automatically:
+**Continue researching the same game** — re-run with the same `--game` and a
+new `--question`. The KB from prior sessions is loaded automatically, while
+the new question gets a separate checkpoint thread:
 
 ```bash
 python main.py \
@@ -198,6 +211,12 @@ python main.py \
   --question "How does the maze generation work?" \
   --dump memdump_dir/wizofwor.dump
 ```
+
+**Reuse a checkpoint thread** — repeat the same game and question, or pass
+the previous `--thread-id`. Checkpoints persist in
+`sessions/<game-slug>/checkpoint.sqlite`. Re-invocation starts graph
+processing again over the saved state; it does not resume an interrupted
+node in place.
 
 ### LangGraph Studio / LangSmith
 
@@ -304,9 +323,17 @@ a disposable session and review the generated plan before approval.
 The normal test suite validates deterministic analysis, persistence, and the
 golden manifest without making paid model calls. Its offline dump-anchor gate
 checks every expected address for dump-backed bytes or 6502 references and
-rejects exact-address assembly bytes that disagree with the selected dump:
+rejects exact-address assembly bytes that disagree with the selected dump.
+
+Install the development extra to obtain `pytest` (use `.[ui,dev]` if you also
+want the GUI). Before running the full suite, supply the dump and assembly
+files at the paths listed in `evals/golden.jsonl`. The `memdump_dir/` and
+`asm_dir/` corpus directories are Git-ignored and are not included in a fresh
+clone; the golden-manifest and dump-anchor tests require those local files
+even when live evaluation is disabled.
 
 ```bash
+pip install -e ".[dev]"
 pytest -q
 ```
 
@@ -318,7 +345,7 @@ unbaselined (`vultures_lives_initial`, `vultures_lives_decrement`,
 remain the required offline gate. The end-to-end golden suite is opt-in. It runs the real graph,
 stores its temporary KBs under `evals/.sessions/`, and writes per-case quality,
 token, cost, tool-call, and wall-time metrics under `evals/results/`. VICE and
-Tavily are disabled by default so the checked-in dumps/asm remain the stable
+Tavily are disabled by default so the locally supplied corpus files remain the stable
 inputs:
 
 ```bash
