@@ -319,6 +319,50 @@ def _has_value(args: dict[str, Any], *keys: str) -> bool:
     )
 
 
+def is_resolved_address(value: Any) -> bool:
+    """True when *value* is a usable ``$0000``-``$FFFF`` address.
+
+    Planner and executor LLMs sometimes write a symbolic forward
+    reference where a concrete address belongs — ``"$DC00_REF_FROM_s5"``,
+    ``"$C000_ROUTINE_START_FROM_s4"``. Those are non-empty strings, so
+    the null check in `step_is_concrete` reads them as answered, the step
+    skips enrichment, and the tool rejects the arg it can't parse.
+    Requiring the value to actually parse keeps such steps on the
+    enrichment path, where the KB can resolve what the reference meant.
+    """
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return 0 <= value <= 0xFFFF
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    if not text:
+        return False
+    if text.startswith("$"):
+        candidates = ((text[1:], 16),)
+    elif text.lower().startswith("0x"):
+        candidates = ((text[2:], 16),)
+    else:
+        # `graph.nodes._hex_to_int` reads a bare token as decimal while
+        # `_coerce_vice_address` reads it as hex. Accept either, so this
+        # never rejects a value the tool itself would have parsed.
+        candidates = ((text, 10), (text, 16))
+    for body, base in candidates:
+        try:
+            parsed = int(body, base)
+        except ValueError:
+            continue
+        if 0 <= parsed <= 0xFFFF:
+            return True
+    return False
+
+
+def _has_address(args: dict[str, Any], *keys: str) -> bool:
+    """`_has_value`, but the value must be a resolved address."""
+    return any(is_resolved_address(args.get(k)) for k in keys)
+
+
 def step_is_concrete(step: dict[str, Any]) -> bool:
     """True when a plan step can be dispatched without LLM enrichment.
 
@@ -361,7 +405,7 @@ def step_is_concrete(step: dict[str, Any]) -> bool:
     if tool == "capstone":
         mode = str(args.get("mode") or "linear").strip().lower()
         if mode == "linear":
-            return _has_value(args, "start")
+            return _has_address(args, "start")
         return True  # recursive/find_* / vectors / polymorphic self-default
 
     if tool == "tavily":
@@ -384,25 +428,25 @@ def step_is_concrete(step: dict[str, Any]) -> bool:
             # `a` defaults to "dump"; `b` may be a live read — arg-free ok.
             return True
         if method.endswith("trace"):
-            return _has_value(args, *VICE_ADDRESS_ALIASES)
+            return _has_address(args, *VICE_ADDRESS_ALIASES)
         if method.endswith("poke_verify") or method.endswith("poke_and_peek"):
             return (
-                _has_value(args, *VICE_ADDRESS_ALIASES)
+                _has_address(args, *VICE_ADDRESS_ALIASES)
                 and _has_value(args, "value", "candidate")
                 and _has_value(args, "expect", "expectation")
             )
         if "disassemble" in method:
-            return _has_value(args, *VICE_ADDRESS_ALIASES)
+            return _has_address(args, *VICE_ADDRESS_ALIASES)
         if "memory" in method and ("read" in method or "search" in method):
             return (
-                _has_value(args, *VICE_ADDRESS_ALIASES)
+                _has_address(args, *VICE_ADDRESS_ALIASES)
                 and _has_value(args, "size", "length")
             )
         # Breakpoints/watchpoints are address-bearing too (review
         # finding 4 — the old blanket True let a checkpoint step with no
         # address bypass enrichment straight into a tool error).
         if "checkpoint" in method or "breakpoint" in method:
-            return _has_value(args, *VICE_ADDRESS_ALIASES)
+            return _has_address(args, *VICE_ADDRESS_ALIASES)
         if "execution" in method or method in (
             "vice.ping", "ping", "run", "step", "pause",
         ):
@@ -422,20 +466,20 @@ def step_is_concrete(step: dict[str, Any]) -> bool:
             return True
         if mode in ("routine", "pseudocode", "annotate"):
             # handlers read: start | addr | address
-            return _has_value(args, "start", "addr", "address")
+            return _has_address(args, "start", "addr", "address")
         if mode in ("xrefs_to", "writes_to", "refs_to"):
             # handlers read: addr | dst  (data-ref modes, tracker 3.4)
-            return _has_value(args, "addr", "dst")
+            return _has_address(args, "addr", "dst")
         if mode == "xrefs_from":
             # handler reads: addr | src
-            return _has_value(args, "addr", "src")
+            return _has_address(args, "addr", "src")
         if mode == "disasm":
             # handler reads (vice engine): address | addr;
             # (capstone/default engine): start | addr
             engine = str(args.get("engine") or "capstone").strip().lower()
             if engine == "vice":
-                return _has_value(args, "address", "addr")
-            return _has_value(args, "start", "addr")
+                return _has_address(args, "address", "addr")
+            return _has_address(args, "start", "addr")
         if mode == "search":
             return _has_value(args, "q", "query")
         if mode == "sql":

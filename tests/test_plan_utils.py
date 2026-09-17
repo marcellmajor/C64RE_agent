@@ -9,11 +9,13 @@ from graph.plan_utils import (
     TRUNCATED_CONFIDENCE_CAP,
     failed_step_notes,
     is_permanent_failure,
+    is_resolved_address,
     normalize_truncated_state,
     pending_steps,
     resolve_session_slug,
     runnable_steps,
     slugify,
+    step_is_concrete,
     step_status,
 )
 
@@ -262,3 +264,73 @@ def test_normalize_keeps_lower_confidence_and_handles_empty_state():
     assert out2["termination_reason"] == "recursion_exhausted"
     assert out2["candidate_answer"]["confidence"] == 0.0
     assert out2["candidate_answer"]["answer"]
+
+
+# ---------------------------------------------------------------------------
+# Unresolved address placeholders must not count as concrete args.
+#
+# Planner/executor LLMs write symbolic forward references where a concrete
+# address belongs ("$DC00_REF_FROM_s5_s6_s4"). Those are non-empty strings,
+# so the null check read them as answered, the executor's LLM-bypass
+# dispatched them verbatim, and the tool rejected the arg it could not parse.
+# ---------------------------------------------------------------------------
+
+def test_is_resolved_address_accepts_every_form_the_tools_parse():
+    for value in ("$C394", "0xC394", "c394", "C394", "49556", 0xC394, 0, 0xFFFF):
+        assert is_resolved_address(value), value
+
+
+def test_is_resolved_address_rejects_placeholders_and_junk():
+    for value in (
+        "$DC00_REF_FROM_s5_s6_s4",
+        "$DC00_REF_ROUTINE_START_FROM_s4",
+        "<address discovered in s4>",
+        "TBD",
+        "",
+        "   ",
+        None,
+        True,            # bool is not an address
+        0x10000,         # out of the 16-bit space
+        -1,
+    ):
+        assert not is_resolved_address(value), value
+
+
+def _cap(start):
+    return {"id": "s7", "tool": "capstone",
+            "args": {"mode": "linear", "start": start, "length": 64}}
+
+
+def test_capstone_placeholder_start_is_not_concrete():
+    assert step_is_concrete(_cap("$C394"))
+    assert not step_is_concrete(_cap("$DC00_REF_FROM_s5_s6_s4"))
+
+
+def test_vice_placeholder_address_is_not_concrete():
+    def _vice(addr):
+        return {"id": "s8", "tool": "vice",
+                "args": {"method": "vice.disassemble", "address": addr}}
+
+    assert step_is_concrete(_vice("$1135"))
+    assert not step_is_concrete(_vice("$1135_REF_FROM_s2"))
+
+
+def test_code_kb_placeholder_address_is_not_concrete():
+    def _ckb(mode, **args):
+        return {"id": "s9", "tool": "code_kb", "args": {"mode": mode, **args}}
+
+    assert step_is_concrete(_ckb("routine", start="$C394"))
+    assert not step_is_concrete(_ckb("routine", start="$DC00_REF_ROUTINE_START_FROM_s4"))
+    assert not step_is_concrete(_ckb("pseudocode", addr="$C000_FROM_s1"))
+    assert not step_is_concrete(_ckb("xrefs_to", addr="<from s3>"))
+    assert not step_is_concrete(_ckb("xrefs_from", src="TBD"))
+
+
+def test_non_address_args_are_still_judged_by_presence_only():
+    # `q`, `sql`, `value` etc. must not be forced through the address parser.
+    assert step_is_concrete(
+        {"id": "s1", "tool": "tavily", "args": {"q": "wizard of wor crack"}},
+    )
+    assert step_is_concrete(
+        {"id": "s2", "tool": "code_kb", "args": {"mode": "search", "q": "sprite"}},
+    )
