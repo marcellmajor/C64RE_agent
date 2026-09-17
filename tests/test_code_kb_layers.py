@@ -199,3 +199,51 @@ def test_layer2_without_verified_routines_does_not_call_llm(tmp_path, monkeypatc
     )["tool_results"][0]
     assert result["ok"] is False
     assert "at least two verified" in result["data"]
+
+
+# ---------------------------------------------------------------------------
+# A start-address miss should name the enclosing routine (tracker: plan
+# execution kept dead-ending on "no routine found with start_addr=$C394"
+# for addresses taken from a disassembly listing, which land inside a
+# routine rather than on its entry point).
+# ---------------------------------------------------------------------------
+
+def test_routine_miss_inside_a_known_routine_names_it(tmp_path):
+    handle = str(tmp_path / "code_kb")
+    store = get_code_store(handle)
+    store.append_annotation(_routine(0xC380, 0xC3F2, "score_update"), source="test")
+
+    res = code_node._mode_routine(store, {"start": "$C394"}, "s1")
+    result = res["tool_results"][0]
+
+    assert result["ok"] is False
+    assert "no routine found with start_addr=$C394" in result["data"]
+    assert "$C380-$C3F2" in result["data"]
+    assert "score_update" in result["data"]
+    assert 'start="$C380"' in result["data"]
+
+
+def test_routine_miss_outside_every_routine_keeps_the_generic_hint(tmp_path):
+    handle = str(tmp_path / "code_kb")
+    store = get_code_store(handle)
+    store.append_annotation(_routine(0xC380, 0xC3F2, "score_update"), source="test")
+
+    res = code_node._mode_routine(store, {"start": "$8000"}, "s1")
+    result = res["tool_results"][0]
+
+    assert result["ok"] is False
+    assert "Try mode='routines' first." in result["data"]
+    assert "lies inside" not in result["data"]
+
+
+def test_pseudocode_miss_uses_the_same_containment_hint(tmp_path):
+    handle = str(tmp_path / "code_kb")
+    store = get_code_store(handle)
+    store.append_annotation(_routine(0xC380, 0xC3F2, "score_update"), source="test")
+
+    res = code_node._mode_pseudocode(store, {"start": "$C3A0"}, "s1")
+    result = res["tool_results"][0]
+
+    assert result["ok"] is False
+    assert "mode='pseudocode'" in result["data"]
+    assert "$C380-$C3F2" in result["data"]

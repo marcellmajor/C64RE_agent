@@ -197,6 +197,41 @@ def _mode_routines(store, args, step_id):
     )
 
 
+def _containing_routine(store, addr: int):
+    """Smallest Layer-0 routine whose span covers *addr*, if any."""
+    rows = store.query(
+        "SELECT start_addr, end_addr, name FROM code_routines"
+        " WHERE start_addr <= ? AND end_addr >= ?"
+        " ORDER BY (end_addr - start_addr) ASC LIMIT 1",
+        (addr, addr),
+    )
+    return rows[0] if rows else None
+
+
+def _no_routine_message(store, addr: int, mode: str) -> str:
+    """Explain a start-address miss, naming the enclosing routine if there is one.
+
+    An address taken from a disassembly listing usually lands *inside* a
+    routine rather than on its entry point. Saying which routine that is
+    turns a dead end into a one-step retry, without this mode silently
+    answering about a routine the caller did not ask for.
+    """
+    base = f"no routine found with start_addr=${addr:04X}."
+    row = _containing_routine(store, addr)
+    if row is None:
+        return base + " Try mode='routines' first."
+    start = int(row["start_addr"])
+    end = int(row["end_addr"])
+    name = (row["name"] or "").strip()
+    named = f" ({name})" if name else ""
+    return (
+        f"{base} ${addr:04X} lies inside routine "
+        f"${start:04X}-${end:04X}{named}; re-run mode='{mode}' with "
+        f"start=\"${start:04X}\" for that routine, or mode='routines' "
+        "to list entry points."
+    )
+
+
 def _mode_routine(store, args, step_id):
     start_raw = args.get("start") or args.get("addr") or args.get("address")
     if start_raw is None:
@@ -221,7 +256,7 @@ def _mode_routine(store, args, step_id):
     if not rows:
         return _record_result(
             "code_kb", step_id, False,
-            f"no routine found with start_addr=${start:04X}. Try mode='routines' first.",
+            _no_routine_message(store, start, "routine"),
             extra={"mode": "routine"},
         )
     win = build_window(store, routine_row=rows[0])
@@ -261,8 +296,7 @@ def _mode_pseudocode(store, args, step_id):
     if not routines:
         return _record_result(
             "code_kb", step_id, False,
-            f"no routine found with start_addr=${start:04X}. "
-            "Try mode='routines' first.",
+            _no_routine_message(store, start, "pseudocode"),
             extra={"mode": "pseudocode"},
         )
     routine = routines[0]
