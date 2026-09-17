@@ -813,16 +813,49 @@ def _consume_agent_events(events, *, label: str) -> TurnResult | PlanReview | No
     return final
 
 
+def _missing_session_inputs() -> list[str]:
+    """Sidebar settings a run cannot start without.
+
+    One source of truth for the two presentations below: a modal before
+    the turn begins, and an inline error inside the assistant bubble if
+    `_run_turn` is ever reached without that pre-flight check.
+    """
+    problems: list[str] = []
+    if not str(st.session_state.game).strip():
+        problems.append(
+            "**Game** is empty — type the game name, or pick an existing "
+            "one from **Analyzed games**. The placeholder text in that "
+            "field is only a hint, not a value."
+        )
+    dump_path = str(st.session_state.dump_path).strip()
+    if not dump_path:
+        problems.append(
+            "**Dump path** is empty — choose a 64 KB memory dump."
+        )
+    elif not Path(dump_path).exists():
+        problems.append(f"**Dump file not found**: `{dump_path}`")
+    return problems
+
+
+@st.dialog("Finish the session setup first", width="small")
+def _warn_missing_inputs(problems: list[str]) -> None:
+    """Modal shown instead of starting a run with an unusable session."""
+    st.warning("Nothing was sent to the agent — the sidebar is incomplete:")
+    for problem in problems:
+        st.markdown(f"- {problem}")
+    st.caption(
+        "Your question is kept; fix the sidebar on the left and send it again."
+    )
+    if st.button("OK", key="dismiss_missing_inputs", type="primary"):
+        st.rerun()
+
+
 def _run_turn(question: str) -> TurnResult | PlanReview | None:
     """Run through the planner and stop for human plan review."""
-    if not st.session_state.game:
-        st.error("Set a game name in the sidebar first.")
-        return None
-    if not st.session_state.dump_path:
-        st.error("Set the dump path in the sidebar first.")
-        return None
-    if not Path(st.session_state.dump_path).exists():
-        st.error(f"Dump file not found: {st.session_state.dump_path}")
+    problems = _missing_session_inputs()
+    if problems:
+        for problem in problems:
+            st.error(problem.replace("**", ""))
         return None
 
     return _consume_agent_events(
@@ -875,6 +908,14 @@ def _store_turn_result(result: TurnResult) -> None:
     })
 
 
+# Streamlit refuses writes to a widget-backed key after that widget has been
+# instantiated in the same run, so the handlers below stage the next textarea
+# contents under `_pending_plan_json` and it is applied here on the rerun that
+# follows (same pattern as `_pending_text_dir` in the sidebar).
+_pending_plan_json = st.session_state.pop("_pending_plan_json", None)
+if _pending_plan_json is not None:
+    st.session_state.pending_plan_json = _pending_plan_json
+
 pending_review = st.session_state.pending_plan_review
 if isinstance(pending_review, PlanReview):
     with st.container(border=True):
@@ -908,7 +949,7 @@ if isinstance(pending_review, PlanReview):
         )
         if cancel_clicked:
             st.session_state.pending_plan_review = None
-            st.session_state.pending_plan_json = ""
+            st.session_state["_pending_plan_json"] = ""
             st.session_state.pending_question = ""
             st.toast("Research run cancelled before tool execution.", icon="🛑")
             st.rerun()
@@ -946,14 +987,14 @@ if isinstance(pending_review, PlanReview):
                     st.session_state.running = False
                     if isinstance(outcome, PlanReview):
                         st.session_state.pending_plan_review = outcome
-                        st.session_state.pending_plan_json = json.dumps(
+                        st.session_state["_pending_plan_json"] = json.dumps(
                             outcome.plan, indent=2,
                         )
                         st.rerun()
                     elif isinstance(outcome, TurnResult):
                         _store_turn_result(outcome)
                         st.session_state.pending_plan_review = None
-                        st.session_state.pending_plan_json = ""
+                        st.session_state["_pending_plan_json"] = ""
                         st.session_state.pending_question = ""
                         st.rerun()
 
@@ -964,20 +1005,30 @@ question = st.chat_input(
 if not question and not isinstance(pending_review, PlanReview):
     question = st.session_state.pop("queued_question", "") or None
 if question:
+    # Keep the question either way, so a blocked run loses nothing.
     st.session_state.pending_question = question
-    st.session_state.running = True
-    with st.chat_message("user"):
-        st.markdown(question)
-    with st.chat_message("assistant"):
-        result = _run_turn(question)
-    st.session_state.running = False
-    if isinstance(result, PlanReview):
-        st.session_state.pending_plan_review = result
-        st.session_state.pending_plan_json = json.dumps(result.plan, indent=2)
-        st.rerun()
-    elif isinstance(result, TurnResult):
-        _store_turn_result(result)
-        st.rerun()
+    blockers = _missing_session_inputs()
+    if blockers:
+        # Checked here rather than inside the assistant bubble: the modal
+        # is unmissable, and no empty chat turn is rendered for a run that
+        # never started.
+        _warn_missing_inputs(blockers)
+    else:
+        st.session_state.running = True
+        with st.chat_message("user"):
+            st.markdown(question)
+        with st.chat_message("assistant"):
+            result = _run_turn(question)
+        st.session_state.running = False
+        if isinstance(result, PlanReview):
+            st.session_state.pending_plan_review = result
+            st.session_state["_pending_plan_json"] = json.dumps(
+                result.plan, indent=2,
+            )
+            st.rerun()
+        elif isinstance(result, TurnResult):
+            _store_turn_result(result)
+            st.rerun()
 
 
 # --------------------------------------------------------------------------- #
