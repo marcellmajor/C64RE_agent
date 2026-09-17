@@ -9,6 +9,14 @@ import graph.nodes as nodes
 from memory import get_store
 
 
+@pytest.fixture(autouse=True)
+def _fast_trace_polling(monkeypatch):
+    """Keep the watchpoint wait loop's real logic, without its real sleeps."""
+    monkeypatch.setattr(nodes, "_TRACE_POLL_INTERVAL_S", 0.001)
+    monkeypatch.setattr(nodes, "_TRACE_MIN_BUDGET_S", 0.05)
+    monkeypatch.setattr(nodes, "_TRACE_MAX_BUDGET_S", 0.20)
+
+
 @pytest.fixture()
 def kb_state(tmp_path, monkeypatch):
     monkeypatch.setenv("VICE_MCP_URL", "http://localhost:3000")
@@ -125,6 +133,9 @@ def test_trace_resolves_writer_and_cleans_up(kb_state, monkeypatch):
 
     def fake_call(method, args):
         calls.append(method)
+        if method == "vice.ping":
+            # The watchpoint parks the machine; the composite waits for this.
+            return {"data": {"status": "ok", "execution": "paused"}}
         if method == "vice.checkpoint.add":
             return {"data": {"number": 7}}
         if method == "vice.registers.get":
@@ -150,6 +161,8 @@ def test_trace_confirms_hit_via_checkpoint_list(kb_state, monkeypatch):
     state, _ = kb_state
 
     def fake_call(method, args):
+        if method == "vice.ping":
+            return {"data": {"status": "ok", "execution": "paused"}}
         if method == "vice.checkpoint.add":
             return {"data": {"number": 3}}
         if method == "vice.checkpoint.list":
@@ -175,6 +188,9 @@ def test_trace_no_checkpoint_id_ignores_unrelated_hit(kb_state, monkeypatch):
 
     def fake_call(method, args):
         calls.append(method)
+        if method == "vice.ping":
+            # The watchpoint parks the machine; the composite waits for this.
+            return {"data": {"status": "ok", "execution": "paused"}}
         if method == "vice.checkpoint.add":
             return {"data": "watchpoint set"}          # no id parseable
         if method == "vice.checkpoint.list":
@@ -204,6 +220,9 @@ def test_trace_no_hit_is_failure_but_cleans_up(kb_state, monkeypatch):
 
     def fake_call(method, args):
         calls.append(method)
+        if method == "vice.ping":
+            # The watchpoint parks the machine; the composite waits for this.
+            return {"data": {"status": "ok", "execution": "paused"}}
         if method == "vice.checkpoint.add":
             return {"data": {"number": 9}}
         if method == "vice.checkpoint.list":
@@ -229,6 +248,9 @@ def test_trace_cleans_up_even_when_run_raises(kb_state, monkeypatch):
 
     def fake_call(method, args):
         calls.append(method)
+        if method == "vice.ping":
+            # The watchpoint parks the machine; the composite waits for this.
+            return {"data": {"status": "ok", "execution": "paused"}}
         if method == "vice.checkpoint.add":
             return {"data": {"number": 1}}
         if method == "vice.execution.run":
@@ -656,6 +678,8 @@ def test_trace_sends_a_schema_valid_arm_payload_to_the_transport(
 
     def fake_transport(tool_name, tool_args):
         sent.append((tool_name, tool_args))
+        if tool_name == "vice_ping":
+            return {"data": {"status": "ok", "execution": "paused"}}
         if tool_name == "vice_checkpoint_add":
             return {"data": {"number": 7}}
         if tool_name == "vice_registers_get":
@@ -722,3 +746,198 @@ def test_checkpoint_hit_still_ignores_someone_elses_checkpoint():
 
 def test_checkpoint_hit_compares_numbers_across_string_and_int_ids():
     assert nodes._checkpoint_hit(_live_list_row(hit_count=2), "1") is True
+
+
+# ---------------------------------------------------------------------------
+# Memory-read decoding. vice-mcp answers `encoding: "array"` with per-byte
+# HEX strings; parsing them with base-10 int() raised
+# "invalid literal for int() with base 10: '2F'" on the first byte holding
+# A-F, and — worse — silently mangled every byte that looked decimal
+# ("48" -> 48 rather than 0x48). Payloads below are from a live VICE 3.10.
+# ---------------------------------------------------------------------------
+
+def test_array_encoding_bytes_are_read_as_hex_not_decimal():
+    live = {
+        "address": 1024, "size": 8, "encoding": "array",
+        "data": ["08", "48", "08", "AD", "58", "57", "40", "40"],
+    }
+    assert nodes._vice_bytes_from_read(live) == bytes(
+        [0x08, 0x48, 0x08, 0xAD, 0x58, 0x57, 0x40, 0x40],
+    )
+
+
+def test_hex_encoding_blob_is_decoded():
+    live = {"address": 1024, "size": 8, "encoding": "hex",
+            "data_hex": "084808AD58574040"}
+    assert nodes._vice_bytes_from_read(live) == bytes.fromhex("084808AD58574040")
+
+
+def test_read_decoding_still_accepts_raw_bytes_and_int_lists():
+    assert nodes._vice_bytes_from_read(b"\x01\x02") == b"\x01\x02"
+    assert nodes._vice_bytes_from_read([1, 2, 255]) == bytes([1, 2, 255])
+
+
+def test_full_ram_read_covers_all_65536_bytes(monkeypatch):
+    """A single read is capped at 65535, so $FFFF used to come back zeroed."""
+    seen = []
+
+    def fake_call(method, args):
+        seen.append((args["address"], args["size"]))
+        size = args["size"]
+        start = int(args["address"].lstrip("$"), 16)
+        blob = bytes((start + i) & 0xFF for i in range(size))
+        return {"data": {"encoding": "hex", "data_hex": blob.hex()}}
+
+    monkeypatch.setattr(nodes, "_vice_call", fake_call)
+    buf = nodes._vice_read_full_ram()
+
+    assert len(buf) == 0x10000
+    assert buf[0xFFFF] == 0xFF          # was 0x00 before: the lost last byte
+    assert all(size <= 65535 for _, size in seen)
+
+
+# ---------------------------------------------------------------------------
+# The trace composite must WAIT for the watchpoint to park the machine.
+# It used to resume and read registers ~1ms later, so the PC was arbitrary
+# and both proofs failed unless the write happened inside that window.
+# ---------------------------------------------------------------------------
+
+def test_trace_waits_for_the_checkpoint_hit_before_reading_registers(
+    kb_state, monkeypatch,
+):
+    """`vice.ping` reports "running" even while the monitor holds the CPU,
+    so the wait has to poll the checkpoint's hit count instead."""
+    state, _ = kb_state
+    order = []
+    polls = {"n": 0}
+
+    def fake_call(method, args):
+        order.append(method)
+        if method == "vice.ping":
+            return {"data": {"execution": "running"}}   # always lies
+        if method == "vice.checkpoint.add":
+            return {"data": {"checkpoint_num": 1}}
+        if method == "vice.checkpoint.list":
+            polls["n"] += 1
+            hits = 0 if polls["n"] < 3 else 1
+            return {"data": {"checkpoints": [
+                {"checkpoint_num": 1, "hit_count": hits},
+            ]}}
+        if method == "vice.registers.get":
+            return {"data": {"PC": 0xC143, "A": 0}}
+        if method == "vice.disassemble":
+            return {"data": {"lines": [
+                {"text": "$C140: EE C0 00  INC $00C0"},
+            ]}}
+        return {"data": "ok"}
+
+    monkeypatch.setattr(nodes, "_vice_call", fake_call)
+    out = _run(state, {"method": "vice.trace", "address": "$00C0", "frames": 4})
+    r = out["tool_results"][0]
+
+    assert r["ok"] and r["hit_confirmed"] is True
+    assert "watchpoint hit after" in r["data"]
+    assert polls["n"] >= 3                      # it really waited
+    # Registers are read only after the hit was observed.
+    assert order.index("vice.registers.get") > order.index("vice.checkpoint.list")
+
+
+def test_trace_reads_the_pc_from_the_servers_json_registers(
+    kb_state, monkeypatch,
+):
+    """The live server answers registers as JSON, so the writing
+    instruction must still be resolved and proven."""
+    state, _ = kb_state
+
+    def fake_call(method, args):
+        if method == "vice.checkpoint.add":
+            return {"data": {"checkpoint_num": 1}}
+        if method == "vice.checkpoint.list":
+            return {"data": {"checkpoints": [
+                {"checkpoint_num": 1, "hit_count": 1},
+            ]}}
+        if method == "vice.registers.get":
+            # Verbatim shape from a live VICE 3.10 session.
+            return {"data": {"PC": 37349, "A": 155, "X": 0, "Y": 78,
+                             "SP": 239, "N": True, "Z": False}}
+        if method == "vice.disassemble":
+            return {"data": {"lines": [
+                {"address": 37347, "text": "$91E3: 85 06       STA $06"},
+                {"address": 37349, "text": "$91E5: 29 0F       AND #$0F"},
+            ]}}
+        return {"data": "ok"}
+
+    monkeypatch.setattr(nodes, "_vice_call", fake_call)
+    out = _run(state, {"method": "vice.trace", "address": "$0006"})
+    r = out["tool_results"][0]
+
+    assert r["writer_pc"] == "$91E5"
+    assert r["writer_proven"] is True        # STA $06 writes the watched byte
+    assert r["ok"]
+
+
+def test_vice_pc_reads_json_hex_and_monitor_text():
+    assert nodes._vice_pc({"PC": 37349}) == 0x91E5
+    assert nodes._vice_pc({"PC": "$C143"}) == 0xC143
+    assert nodes._vice_pc("A:00 X:01 SP:F8 PC:$C143 NV-BDIZC") == 0xC143
+    assert nodes._vice_pc({"A": 1}) is None
+
+
+def test_trace_reports_honestly_when_nothing_writes_the_address(
+    kb_state, monkeypatch,
+):
+    state, _ = kb_state
+
+    def fake_call(method, args):
+        if method == "vice.ping":
+            return {"data": {"execution": "running"}}
+        if method == "vice.checkpoint.add":
+            return {"data": {"checkpoint_num": 1}}
+        if method == "vice.checkpoint.list":
+            return {"data": {"checkpoints": [
+                {"checkpoint_num": 1, "hit_count": 0},      # never fires
+            ]}}
+        if method == "vice.registers.get":
+            return {"data": {"PC": 0x0800}}
+        if method == "vice.disassemble":
+            return {"data": {"lines": [{"text": "$07F0: EA  NOP"}]}}
+        return {"data": "ok"}
+
+    monkeypatch.setattr(nodes, "_vice_call", fake_call)
+    out = _run(state, {"method": "vice.trace", "address": "$00C0", "frames": 2})
+    r = out["tool_results"][0]
+
+    assert not r["ok"]
+    assert r["hit_confirmed"] is False
+    assert "no write seen within" in r["data"]
+
+
+def test_trace_restores_the_execution_state_it_found(kb_state, monkeypatch):
+    """A diagnostic must not leave a paused session running, or vice versa."""
+    state, _ = kb_state
+    calls = []
+    phase = {"parked": False}
+
+    def fake_call(method, args):
+        calls.append(method)
+        if method == "vice.ping":
+            # Paused before the run; parked by the watchpoint afterwards.
+            return {"data": {"execution": "paused" if not phase["parked"]
+                             else "paused"}}
+        if method == "vice.execution.run":
+            phase["parked"] = True
+            return {"data": "ok"}
+        if method == "vice.checkpoint.add":
+            return {"data": {"checkpoint_num": 1}}
+        if method == "vice.registers.get":
+            return {"data": "PC:$C143"}
+        if method == "vice.disassemble":
+            return {"data": "$C140  EE C0 00  INC $00C0"}
+        return {"data": "ok"}
+
+    monkeypatch.setattr(nodes, "_vice_call", fake_call)
+    _run(state, {"method": "vice.trace", "address": "$00C0"})
+
+    # It found the machine paused and it is paused at the end: no stray resume.
+    assert calls.count("vice.execution.run") == 1     # only the trace's own run
+    assert "vice.checkpoint.delete" in calls

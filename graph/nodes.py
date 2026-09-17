@@ -18,6 +18,7 @@ import json
 import os
 import re
 import sys
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -3658,9 +3659,10 @@ def _vice_normalize_args(method: str, args: dict[str, Any]) -> dict[str, Any]:
         out: dict[str, Any] = {
             "address": address,
             "size": int(max(1, min(65535, int(size)))),
-            # The live vice-mcp server can return a compact hex string; the
-            # agent's deterministic formatter needs explicit byte values.
-            "encoding": "array",
+            # The agent's deterministic formatter needs explicit byte
+            # values, so per-byte "array" stays the default; bulk readers
+            # ask for the compact "hex" blob instead.
+            "encoding": str(a.get("encoding") or "array"),
         }
         if a.get("bank"):
             out["bank"] = str(a["bank"])
@@ -4850,24 +4852,74 @@ def _load_named_snapshot(state: C64State, name: str) -> bytes | None:
     return None
 
 
+def _vice_byte_value(raw: Any) -> int:
+    """One memory byte from a vice-mcp array element.
+
+    Elements arrive as HEX strings ("08", "AD"), so they must never be
+    read as decimal: "48" is 0x48, not 48.
+    """
+    if isinstance(raw, bool):
+        raise RuntimeError(f"unexpected boolean in memory payload: {raw!r}")
+    if isinstance(raw, int):
+        return raw & 0xFF
+    if isinstance(raw, str):
+        text = raw.strip()
+        if text.startswith("$"):
+            text = text[1:]
+        elif text.lower().startswith("0x"):
+            text = text[2:]
+        return int(text, 16) & 0xFF
+    raise RuntimeError(f"unexpected memory byte: {raw!r}")
+
+
+def _vice_bytes_from_read(data: Any) -> bytes:
+    """Decode a `vice.memory.read` payload into raw bytes.
+
+    vice-mcp answers either `{"encoding": "array", "data": ["08", "AD"]}`
+    — per-byte HEX strings — or `{"encoding": "hex", "data_hex": "08AD"}`.
+    Parsing the array form with base-10 `int()` silently mangled every
+    byte that looked decimal and raised ValueError on the first byte
+    containing A-F ("invalid literal for int() with base 10: '2F'").
+    """
+    if isinstance(data, (bytes, bytearray)):
+        return bytes(data)
+    if isinstance(data, dict):
+        blob = data.get("data_hex")
+        if isinstance(blob, str):
+            return bytes.fromhex(blob.strip())
+        if data.get("data") is not None:
+            return _vice_bytes_from_read(data["data"])
+    if isinstance(data, list):
+        return bytes(_vice_byte_value(x) for x in data)
+    if isinstance(data, str):
+        return bytes.fromhex(data.strip())
+    raise RuntimeError(
+        f"vice.memory.read returned an unparseable shape: {type(data)}"
+    )
+
+
+# A single vice-mcp read is capped at 65535 bytes, so a full 64 KB image
+# needs more than one call; the old single 0x10000 request was clamped and
+# silently lost $FFFF.
+_VICE_READ_CHUNK = 0x8000
+
+
 def _vice_read_full_ram(address: int = 0x0000, size: int = 0x10000) -> bytes:
     """Read a RAM range from the live emulator into a bytes buffer."""
-    out = _vice_call(
-        "vice.memory.read",
-        {"address": f"${address:04X}", "size": size},
-    )
-    data = out.get("data")
-    # vice-mcp returns bytes / list[int] / {"data":[...]} shapes.
-    if isinstance(data, (bytes, bytearray)):
-        buf = bytes(data)
-    elif isinstance(data, list):
-        buf = bytes(int(x) & 0xFF for x in data)
-    elif isinstance(data, dict) and isinstance(data.get("data"), list):
-        buf = bytes(int(x) & 0xFF for x in data["data"])
-    else:
-        raise RuntimeError(
-            f"vice.memory.read returned an unparseable shape: {type(data)}"
-        )
+    chunks: list[bytes] = []
+    cursor, remaining = address, size
+    while remaining > 0:
+        want = min(remaining, _VICE_READ_CHUNK)
+        out = _vice_call("vice.memory.read", {
+            "address": f"${cursor:04X}", "size": want, "encoding": "hex",
+        })
+        chunk = _vice_bytes_from_read(out.get("data"))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        cursor += len(chunk)
+        remaining -= len(chunk)
+    buf = b"".join(chunks)
     # Zero-pad to a full 64 KB image so region classification lines up.
     if address == 0 and len(buf) < 0x10000:
         buf = buf + bytes(0x10000 - len(buf))
@@ -5337,6 +5389,51 @@ def _same_checkpoint(candidate: Any, checkpoint_id: Any) -> bool:
         return candidate == checkpoint_id
 
 
+# Watchpoint wait cadence. vice-mcp's run verb is not frame-bounded, so a
+# requested `frames` count can only be honoured as a time budget.
+_TRACE_POLL_INTERVAL_S = 0.05
+_TRACE_MIN_BUDGET_S = 1.0
+_TRACE_MAX_BUDGET_S = 10.0
+
+
+def _vice_pc(reg_data: Any) -> int | None:
+    """Program counter from a `vice.registers.get` payload.
+
+    vice-mcp answers with JSON (`{"PC": 37349, "A": 155, ...}`), not the
+    classic monitor line. The old text regex needed four hex digits right
+    after "PC", so it never matched and the trace composite could never
+    resolve the writing instruction — even when the machine had parked on
+    exactly the right one.
+    """
+    if isinstance(reg_data, dict):
+        for key in ("PC", "pc"):
+            value = reg_data.get(key)
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, int):
+                return value & 0xFFFF
+            if isinstance(value, str):
+                try:
+                    return int(value.strip().lstrip("$"), 16) & 0xFFFF
+                except ValueError:
+                    pass
+    match = re.search(r"\bPC[:=\s]*\$?([0-9A-Fa-f]{4})\b", _vice_text(reg_data))
+    return int(match.group(1), 16) if match else None
+
+
+def _vice_execution_state() -> str | None:
+    """'running' | 'paused' from vice.ping, or None when unavailable."""
+    try:
+        data = _vice_call("vice.ping", {}).get("data")
+    except Exception:  # noqa: BLE001
+        return None
+    if isinstance(data, dict):
+        state = data.get("execution")
+        if isinstance(state, str):
+            return state.strip().lower()
+    return None
+
+
 def _extract_checkpoint_id(add_result: dict[str, Any]) -> Any:
     """Best-effort checkpoint id from a `vice.checkpoint.add` result."""
     data = add_result.get("data")
@@ -5381,6 +5478,10 @@ def _vice_trace(args: dict[str, Any], step_id: str) -> dict[str, Any]:
     frames = int(args.get("frames", 2))
     steps: list[str] = []
     checkpoint_id: Any = None
+    # A stop-on-hit watchpoint parks the machine, and resuming a machine
+    # the user had paused is a side effect of its own — remember the state
+    # so `finally` can put it back.
+    state_before = _vice_execution_state()
 
     # 1. Arm a write watchpoint.
     try:
@@ -5402,28 +5503,47 @@ def _vice_trace(args: dict[str, Any], step_id: str) -> dict[str, Any]:
         )
 
     try:
-        # 2. Run (bounded by frames).
+        # 2. Resume, then WAIT for the watchpoint to park the machine.
+        #    vice-mcp's run verb takes no arguments and is not frame-bounded,
+        #    so `frames` can only be honoured as a time budget. Querying
+        #    registers immediately after resuming (as this did) read an
+        #    arbitrary PC, because the write had not happened yet.
         try:
-            _vice_call("vice.execution.run", {"frames": frames})
-            steps.append(f"ran up to {frames} frame(s)")
+            _vice_call("vice.execution.run", {})
+            steps.append("resumed execution (run is not frame-bounded)")
         except Exception as e:  # noqa: BLE001
             steps.append(f"run failed ({type(e).__name__}) — checking state anyway")
+
+        # `vice.ping` reports "running" even while the monitor holds the
+        # CPU, so it cannot answer "has the watchpoint fired?". The
+        # checkpoint's own hit count can, so poll that.
+        budget_s = max(
+            _TRACE_MIN_BUDGET_S, min(_TRACE_MAX_BUDGET_S, frames * 0.05),
+        )
+        waited = 0.0
+        hit_confirmed = False
+        while waited < budget_s:
+            if checkpoint_id is not None:
+                try:
+                    lst = _vice_call("vice.checkpoint.list", {})
+                    if _checkpoint_hit(lst.get("data"), checkpoint_id):
+                        hit_confirmed = True
+                        break
+                except Exception:  # noqa: BLE001
+                    pass
+            time.sleep(_TRACE_POLL_INTERVAL_S)
+            waited = round(waited + _TRACE_POLL_INTERVAL_S, 4)
+        steps.append(
+            f"watchpoint hit after ~{waited:.2f}s" if hit_confirmed else
+            f"no write seen within {budget_s:.2f}s"
+        )
 
         # 3. Confirm a hit via the checkpoint list (hit_count > 0), if the
         #    server exposes it. Only trusted when we captured OUR
         #    checkpoint id — without one, a hit_count on some other
         #    breakpoint could be misattributed to our watchpoint, so we
         #    fall back to the PC/disasm proof below instead (review nit).
-        hit_confirmed = False
-        if checkpoint_id is not None:
-            try:
-                lst = _vice_call("vice.checkpoint.list", {})
-                hit_confirmed = _checkpoint_hit(lst.get("data"), checkpoint_id)
-                if hit_confirmed:
-                    steps.append(f"checkpoint id={checkpoint_id} reports a hit")
-            except Exception:  # noqa: BLE001
-                pass  # optional verb
-        else:
+        if checkpoint_id is None:
             steps.append(
                 "no checkpoint id returned — relying on PC/disasm proof, "
                 "not the checkpoint list; the watchpoint cannot be removed "
@@ -5436,10 +5556,11 @@ def _vice_trace(args: dict[str, Any], step_id: str) -> dict[str, Any]:
         try:
             regs = _vice_call("vice.registers.get", {})
             reg_text = _vice_text(regs.get("data"))
-            m = re.search(r"\bPC[:=\s]*\$?([0-9A-Fa-f]{4})", reg_text)
-            if m:
-                pc = int(m.group(1), 16)
-            steps.append("read registers")
+            pc = _vice_pc(regs.get("data"))
+            steps.append(
+                f"read registers (PC=${pc:04X})" if pc is not None
+                else "read registers (no PC in payload)"
+            )
         except Exception as e:  # noqa: BLE001
             steps.append(f"registers.get failed ({type(e).__name__})")
 
@@ -5499,6 +5620,18 @@ def _vice_trace(args: dict[str, Any], step_id: str) -> dict[str, Any]:
                 )
             except Exception:  # noqa: BLE001
                 pass
+        # Leave the machine as we found it: a diagnostic read should not
+        # silently resume a paused session, nor park a running one.
+        if state_before in ("running", "paused"):
+            now = _vice_execution_state()
+            if now is not None and now != state_before:
+                try:
+                    _vice_call(
+                        "vice.execution.run" if state_before == "running"
+                        else "vice.execution.pause", {},
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
 
 
 def _checkpoint_hit(data: Any, checkpoint_id: Any) -> bool:
