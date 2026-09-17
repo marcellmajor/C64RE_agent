@@ -3690,6 +3690,53 @@ def _vice_normalize_args(method: str, args: dict[str, Any]) -> dict[str, Any]:
             )
         return {"address": address, "data": values}
 
+    if method == "vice.checkpoint.add":
+        # vice-mcp names the address `start` (not `address`) and the
+        # stop flag `stop` (not `stop_when_hit`); sending our own spelling
+        # made the server reject the call with "start address required".
+        address = _extract_vice_address(a)
+        if address is None:
+            raise ViceArgsError(
+                "vice.checkpoint.add requires a `start` address "
+                "(e.g. \"$D000\")."
+            )
+        out_cp: dict[str, Any] = {"start": address}
+        if a.get("end") is not None:
+            end = _coerce_vice_address(a.get("end"))
+            if end is None:
+                raise ViceArgsError(
+                    f"vice.checkpoint.add got an unparseable `end`: "
+                    f"{a.get('end')!r}"
+                )
+            out_cp["end"] = end
+        for canonical, aliases in (
+            ("exec", ("exec", "execute", "on_exec")),
+            ("load", ("load", "read", "on_read")),
+            ("store", ("store", "write", "on_write")),
+            ("stop", ("stop", "stop_when_hit", "stop_on_hit")),
+        ):
+            for alias in aliases:
+                if a.get(alias) is not None:
+                    out_cp[canonical] = bool(a[alias])
+                    break
+        return out_cp
+
+    if method == "vice.checkpoint.delete":
+        # The server deletes by number only — there is no address form.
+        num = None
+        for alias in ("checkpoint_num", "checkpoint_id", "id", "number", "num"):
+            if a.get(alias) is not None:
+                num = a[alias]
+                break
+        try:
+            num_int = int(num)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            raise ViceArgsError(
+                "vice.checkpoint.delete requires the numeric "
+                "`checkpoint_num` returned by vice.checkpoint.add."
+            ) from None
+        return {"checkpoint_num": num_int}
+
     if method == "vice.execution.run":
         # Current vice-mcp's run verb has an empty schema. Watchpoint-based
         # bounds are enforced by the checkpoint itself; unsupported planner
@@ -5272,11 +5319,29 @@ _TRACE_WRITE_MNEMONICS = frozenset({
 })
 
 
+# vice-mcp calls the checkpoint number `checkpoint_num`, in both the
+# `checkpoint.add` response and every `checkpoint.list` row (verified
+# against VICE 3.10 / C64SC). The older spellings stay as fallbacks.
+_CHECKPOINT_ID_KEYS = (
+    "checkpoint_num", "checkpoint_id", "checkpointId", "number", "id",
+)
+
+
+def _same_checkpoint(candidate: Any, checkpoint_id: Any) -> bool:
+    """True when *candidate* denotes the same checkpoint number."""
+    if candidate is None or checkpoint_id is None:
+        return False
+    try:
+        return int(candidate) == int(checkpoint_id)
+    except (TypeError, ValueError):
+        return candidate == checkpoint_id
+
+
 def _extract_checkpoint_id(add_result: dict[str, Any]) -> Any:
     """Best-effort checkpoint id from a `vice.checkpoint.add` result."""
     data = add_result.get("data")
     if isinstance(data, dict):
-        for k in ("checkpoint_id", "checkpointId", "number", "id"):
+        for k in _CHECKPOINT_ID_KEYS:
             if data.get(k) is not None:
                 return data[k]
     text = _vice_text(data)
@@ -5320,7 +5385,7 @@ def _vice_trace(args: dict[str, Any], step_id: str) -> dict[str, Any]:
     # 1. Arm a write watchpoint.
     try:
         add_out = _vice_call("vice.checkpoint.add", {
-            "address": address, "stop_when_hit": True,
+            "start": address, "stop": True,
             "load": False, "store": True, "exec": False,
         })
         checkpoint_id = _extract_checkpoint_id(add_out)
@@ -5361,7 +5426,8 @@ def _vice_trace(args: dict[str, Any], step_id: str) -> dict[str, Any]:
         else:
             steps.append(
                 "no checkpoint id returned — relying on PC/disasm proof, "
-                "not the checkpoint list"
+                "not the checkpoint list; the watchpoint cannot be removed "
+                "automatically and may still be armed in VICE"
             )
 
         # 4. Read registers (allowed — a checkpoint is armed) + resolve PC.
@@ -5423,12 +5489,16 @@ def _vice_trace(args: dict[str, Any], step_id: str) -> dict[str, Any]:
         )
     finally:
         # Always disarm the watchpoint we added, even on early returns.
-        try:
-            del_args = ({"id": checkpoint_id} if checkpoint_id is not None
-                        else {"address": address})
-            _vice_call("vice.checkpoint.delete", del_args)
-        except Exception:  # noqa: BLE001
-            pass
+        # Deletion is by checkpoint number only; without an id there is
+        # nothing the server can act on, and the body above says so.
+        if checkpoint_id is not None:
+            try:
+                _vice_call(
+                    "vice.checkpoint.delete",
+                    {"checkpoint_num": checkpoint_id},
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def _checkpoint_hit(data: Any, checkpoint_id: Any) -> bool:
@@ -5450,8 +5520,11 @@ def _checkpoint_hit(data: Any, checkpoint_id: Any) -> bool:
     for it in items:
         if not isinstance(it, dict):
             continue
-        cid = it.get("id") if it.get("id") is not None else it.get("number")
-        if cid != checkpoint_id:
+        cid = next(
+            (it[k] for k in _CHECKPOINT_ID_KEYS if it.get(k) is not None),
+            None,
+        )
+        if not _same_checkpoint(cid, checkpoint_id):
             continue
         hits = it.get("hit_count", it.get("hits", it.get("hit", 0)))
         if (isinstance(hits, bool) and hits) or (

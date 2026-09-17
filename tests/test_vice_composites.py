@@ -191,7 +191,11 @@ def test_trace_no_checkpoint_id_ignores_unrelated_hit(kb_state, monkeypatch):
     r = out["tool_results"][0]
     assert not r["ok"]                                   # not a false hit
     assert r["hit_confirmed"] is False
-    assert "vice.checkpoint.delete" in calls            # cleanup by address
+    # No id means no cleanup is possible: vice-mcp deletes by
+    # `checkpoint_num` only, so the old address-keyed delete could never
+    # have worked. The result has to admit the watchpoint may still be armed.
+    assert "vice.checkpoint.delete" not in calls
+    assert "may still be armed" in r["data"]
 
 
 def test_trace_no_hit_is_failure_but_cleans_up(kb_state, monkeypatch):
@@ -597,3 +601,124 @@ def test_poke_verify_vision_reservation_denial_skips_provider(monkeypatch):
     assert text == "[before/after vision comparison unavailable]"
     assert meta["vision_status"] == "cost_reservation"
     assert usage[0]["rejection"] == "cost_reservation"
+
+
+# ---------------------------------------------------------------------------
+# Client ↔ vice-mcp argument contract.
+#
+# The trace composite used to send `{address, stop_when_hit}` to
+# `vice.checkpoint.add`, but the server's schema requires `start` and names
+# the flag `stop` — so arming failed with "McpError: start address required".
+# Deletion is by `checkpoint_num` only. The composite tests above mock
+# `_vice_call`, which sits ABOVE `_vice_normalize_args`, so they could not
+# catch it; these assert on the payload that actually leaves the process.
+# ---------------------------------------------------------------------------
+
+def test_checkpoint_add_uses_the_servers_start_and_stop_names():
+    out = nodes._vice_normalize_args(
+        "vice.checkpoint.add",
+        {"address": "$D000", "stop_when_hit": True, "store": True, "exec": False},
+    )
+    assert out == {"start": "$D000", "exec": False, "store": True, "stop": True}
+    assert "address" not in out and "stop_when_hit" not in out
+
+
+def test_checkpoint_add_accepts_planner_address_aliases_and_end():
+    out = nodes._vice_normalize_args(
+        "vice.checkpoint.add", {"addr": "D000", "end": "$D010"},
+    )
+    assert out == {"start": "$D000", "end": "$D010"}
+
+
+def test_checkpoint_add_without_an_address_is_a_clear_arg_error():
+    with pytest.raises(nodes.ViceArgsError, match="requires a `start` address"):
+        nodes._vice_normalize_args("vice.checkpoint.add", {"store": True})
+
+
+def test_checkpoint_delete_maps_every_id_alias_to_checkpoint_num():
+    for args in ({"id": 3}, {"checkpoint_id": 3}, {"number": 3},
+                 {"num": 3}, {"checkpoint_num": "3"}):
+        assert nodes._vice_normalize_args("vice.checkpoint.delete", args) == {
+            "checkpoint_num": 3,
+        }
+
+
+def test_checkpoint_delete_without_a_number_is_a_clear_arg_error():
+    with pytest.raises(nodes.ViceArgsError, match="checkpoint_num"):
+        nodes._vice_normalize_args("vice.checkpoint.delete", {"address": "$D000"})
+
+
+def test_trace_sends_a_schema_valid_arm_payload_to_the_transport(
+    kb_state, monkeypatch,
+):
+    """End-to-end through `_vice_call`, so normalisation is exercised."""
+    sent = []
+
+    def fake_transport(tool_name, tool_args):
+        sent.append((tool_name, tool_args))
+        if tool_name == "vice_checkpoint_add":
+            return {"data": {"number": 7}}
+        if tool_name == "vice_registers_get":
+            return {"data": "PC:$C143"}
+        if tool_name == "vice_disassemble":
+            return {"data": "$C140  EE C0 00  INC $00C0"}
+        return {"data": "ok"}
+
+    import tools.vice_mcp as vice_mcp
+    monkeypatch.setattr(vice_mcp, "call_tool", fake_transport)
+
+    state, _ = kb_state
+    _run(state, {"method": "vice.trace", "address": "$00C0"})
+
+    by_tool = dict(sent)
+    assert by_tool["vice_checkpoint_add"]["start"] == "$00C0"
+    assert by_tool["vice_checkpoint_add"]["stop"] is True
+    assert by_tool["vice_checkpoint_add"]["store"] is True
+    assert by_tool["vice_checkpoint_delete"] == {"checkpoint_num": 7}
+    # `vice_execution_run` declares additionalProperties:false upstream.
+    assert by_tool["vice_execution_run"] == {}
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint identity. The payload shapes below are copied verbatim from a
+# live vice-mcp (VICE 3.10 / C64SC): the number is `checkpoint_num` in both
+# the add response and every list row. `_checkpoint_hit` previously looked
+# only at `id`/`number`, so it never matched our own checkpoint and hit
+# confirmation silently always failed.
+# ---------------------------------------------------------------------------
+
+_LIVE_ADD_RESPONSE = {
+    "data": {
+        "status": "ok", "checkpoint_num": 1, "start": 53280, "end": 53280,
+        "stop": True, "load": False, "store": True, "exec": False,
+    },
+}
+
+
+def _live_list_row(num=1, hit_count=0):
+    return {
+        "checkpoints": [{
+            "checkpoint_num": num, "start": 53280, "end": 53280,
+            "hit_count": hit_count, "ignore_count": 0, "stop": True,
+            "enabled": True, "check_load": False, "check_store": True,
+            "check_exec": False, "temporary": False,
+        }],
+        "count": 1,
+    }
+
+
+def test_checkpoint_id_is_read_from_the_live_add_response():
+    assert nodes._extract_checkpoint_id(_LIVE_ADD_RESPONSE) == 1
+
+
+def test_checkpoint_hit_matches_our_checkpoint_num_in_a_live_list():
+    assert nodes._checkpoint_hit(_live_list_row(hit_count=3), 1) is True
+    assert nodes._checkpoint_hit(_live_list_row(hit_count=0), 1) is False
+
+
+def test_checkpoint_hit_still_ignores_someone_elses_checkpoint():
+    assert nodes._checkpoint_hit(_live_list_row(num=5, hit_count=9), 1) is False
+
+
+def test_checkpoint_hit_compares_numbers_across_string_and_int_ids():
+    assert nodes._checkpoint_hit(_live_list_row(hit_count=2), "1") is True
