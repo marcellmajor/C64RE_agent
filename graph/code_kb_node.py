@@ -91,6 +91,8 @@ CODE_KB_SCHEMA_HINT = (
     "                confidence)\n"
     "  code_xrefs(src_addr, dst_addr, via_vector, kind, source_file,\n"
     "             annotation_id)  -- one row per (edge, source)\n"
+    "    src_addr is the instruction address; dst_addr is the target.\n"
+    "    Use these exact names, not source_addr / target_addr.\n"
     "    kind ∈ {jsr, jmp, branch, jmp_indirect, fallthrough}\n"
     "  code_smc_sites(src_addr, dst_addr, mnemonic, operand, smc_kind)\n"
     "  code_data_refs(src_addr, dst_addr, access, index_reg, indirect,\n"
@@ -120,6 +122,9 @@ _CODE_KB_SQL_FORBIDDEN = re.compile(
 
 
 _CODE_KB_SQL_REWRITES: tuple[tuple[str, str], ...] = (
+    # Reference tables use src/dst, while planners often spell out source/target.
+    (r"\bsource_addr\b", "src_addr"),
+    (r"\btarget_addr\b", "dst_addr"),
     (r"\baddress\b",     "addr"),
     (r"\baddr_hex\b",    "addr"),
     (r"\bstart\b(?!_addr)",  "start_addr"),

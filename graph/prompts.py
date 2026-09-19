@@ -207,6 +207,10 @@ Tool argument cheat-sheet:
       hardware -> {} : return the curated VIC-II/SID/CIA/KERNAL pack.
       schema   -> {} : print the SQLite schema cheat-sheet.
       sql      -> {sql} : read-only SELECT against the code_kb tables.
+                  Control-flow references use code_xrefs(src_addr, dst_addr,
+                  kind, ...), not xrefs(source_addr, target_addr, ...).
+                  src_addr is the instruction address; dst_addr is the target.
+                  Use mode='schema' before querying unfamiliar tables.
 
     When code_kb is unavailable (no asm_dir/partial_asm provided),
     the tool returns a structured error — fall back to `capstone` and
