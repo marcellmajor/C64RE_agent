@@ -370,8 +370,7 @@ session roots, identical model/config versions, VICE/Tavily disabled, and
 compare quality, contract/fallback failures, tokens, estimated cost, calls, and
 wall time before changing the default. A separate semantic-search A/B should
 compare disabled, cold-cache, and warm-cache `text-embedding-3-small` runs
-before automatic embedding is enabled. The detailed future-validation ledger
-is maintained in `improvements_tracker.md`.
+before automatic embedding is enabled.
 
 Human ratings are recorded locally by the Streamlit UI. Preview the joined
 turn/rating examples without network access, or explicitly synchronize them to
