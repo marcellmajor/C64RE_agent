@@ -202,3 +202,60 @@ def test_retry_always_uses_the_llm(monkeypatch):
     assert len(calls) == 1
     assert "already FAILED 1 time(s)" in calls[0]
     assert out["current_step_id"] == "s1"
+
+
+@pytest.mark.parametrize("address_key", ["address", "addr"])
+@pytest.mark.parametrize("replacement,expected", [
+    ("", "$8700"),
+    ("   ", "$8700"),
+    ("unknown", "$8700"),
+    (False, "$8700"),
+    ({"address": "$8800"}, "$8700"),
+    (None, "$8700"),
+    ("$8800", "$8800"),
+    (0, "$0000"),
+])
+def test_trace_retry_preserves_usable_address(
+    monkeypatch, address_key, replacement, expected,
+):
+    """An inconclusive trace must not become a malformed call on retry."""
+    monkeypatch.setenv("VICE_MCP_URL", "http://unused.invalid")
+    monkeypatch.setattr(nodes, "_safe_invoke", lambda *a, **kw: {
+        "args": {address_key: replacement, "frames": 40},
+        "rationale": "Retry the trace for longer",
+    })
+    calls = []
+
+    def fake_vice_call(method, args):
+        calls.append((method, args))
+        if method == "vice.ping":
+            return {"data": {"execution": "paused"}}
+        if method == "vice.checkpoint.add":
+            return {"data": {"checkpoint_num": 1}}
+        if method == "vice.checkpoint.list":
+            return {"data": {"checkpoints": [
+                {"checkpoint_num": 1, "hit_count": 1},
+            ]}}
+        return {"data": "ok"}
+
+    monkeypatch.setattr(nodes, "_vice_call", fake_vice_call)
+    state = {
+        "plan": [{"id": "i1_s11", "tool": "vice", "args": {
+            "method": "vice.trace", address_key: "$8700", "frames": 2,
+        }}],
+        "tool_results": [{
+            "step_id": "i1_s11", "tool": "vice", "ok": False,
+            "data": "No confirmed write to $8700 within 1.00s",
+        }],
+        "kb_digest": "(digest)",
+    }
+    update = nodes.executor_node(state)
+    assert update["plan"][0]["args"]["frames"] == 40
+    assert state["plan"][0]["args"][address_key] == "$8700"
+    result = nodes.vice_mcp_node({**state, **update})["tool_results"][0]
+    assert result["ok"] is True
+    assert result["address"] == expected
+    arm_args = next(args for method, args in calls
+                    if method == "vice.checkpoint.add")
+    assert arm_args["start"] == expected
+    assert ("vice.checkpoint.delete", {"checkpoint_num": 1}) in calls

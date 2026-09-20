@@ -2206,9 +2206,21 @@ def executor_node(state: C64State) -> dict[str, Any]:
         updated_plan = []
         for s in plan:
             if s.get("id") == step_id:
-                merged = {**(s.get("args") or {}), **{
-                    k: v for k, v in enriched_args.items() if v is not None
-                }}
+                merged = dict(s.get("args") or {})
+                for key, value in enriched_args.items():
+                    if value is None:
+                        continue
+                    # A retry may extend a trace's observation window, but
+                    # must not erase its known address with an LLM placeholder.
+                    # Use the tool's parser for every supported address alias;
+                    # valid replacements (including address zero) still apply.
+                    if (
+                        s.get("tool") == "vice"
+                        and key in _VICE_ADDRESS_ALIASES
+                        and _coerce_vice_address(value) is None
+                    ):
+                        continue
+                    merged[key] = value
                 s = {**s, "args": merged}
             updated_plan.append(s)
     else:
