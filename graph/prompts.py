@@ -113,14 +113,27 @@ Tool argument cheat-sheet:
                         : decode screen RAM to strings — answers "what does
                         the HUD/score display say?" without vision.
       bank       -> {} : interpret $0001 (which ROMs/RAM/IO were mapped).
-  vice: {method: "vice.disassemble" | "vice.memory.read"
-                 | "vice.registers.get" | "vice.ping" | ...,
+  vice: {method: "vice.disassemble" | "vice.memory.read" | "vice.trace" | ...,
          address: "$XXXX", count: 1..100, size?: bytes, ...}
     REQUIRED args:
       vice.disassemble  -> address ($XXXX), count (1..100)
-      vice.memory.read  -> address ($XXXX), size (bytes, 1..65535)
-      vice.registers.get / vice.ping  -> (no required args)
+      vice.memory.read  -> address ($XXXX), size (bytes, 1..65535),
+                           encoding optional: "array" or "hex" ONLY (never base64)
+      vice.memory.search -> start ($XXXX), end ($XXXX), pattern ([byte, ...]);
+                            optional mask (same length), max_results (1..10000)
+      vice.checkpoint.delete -> checkpoint_num (returned by checkpoint.add)
+      All address strings are hexadecimal; numeric JSON addresses are decimal.
+      Use JSON booleans, not strings. Unresolved addresses must be filled before execution.
     COMPOSITE verbs (agent-side; prefer these for in-game quantities):
+      vice.execution.advance -> {frames: 1..300} : advance by a measured
+                        PAL/NTSC frame-equivalent cycle budget using CPU
+                        stepping; leave the emulator paused for a snapshot.
+                        Reports actual cycles (the final instruction may
+                        overshoot slightly). To sample changes, plan snapshot
+                        -> advance -> snapshot -> diff with explicit depends_on.
+                        Do not use vice.execute or invent a frames argument
+                        for native vice.execution.run: native run is unbounded.
+                        Advancement does not guarantee a particular game event.
       vice.memory.snapshot -> {name} : save the live 64 KB RAM image.
       vice.memory.diff     -> {a, b?} : changed bytes classified by region,
                         old→new. `a`/`b` are snapshot names; the reserved
@@ -131,9 +144,14 @@ Tool argument cheat-sheet:
       vice.memory.monotonic_scan -> {snapshots: [names], delta?: -1} :
                         addresses that changed by `delta` across EVERY
                         snapshot — the lives-counter finder.
-      vice.trace -> {address: "$XXXX", frames?} : watchpoint on address →
-                        run → resolve the writing instruction + disasm it.
-                        One call answers "how is $XXXX updated?".
+      vice.trace -> {address: "$XXXX", timeout_s?: 0.1..10} : arm a write
+                        watchpoint and observe until hit or wall-clock timeout.
+                        It does not advance an exact number of frames or inject input.
+                        Only a checkpoint hit confirms a write; stopped PC is not
+                        automatically the writer. Reconstructed writers are candidates.
+                        Watch an actual cave-cell address to prove a tile write;
+                        watching coordinates/pointers alone does not prove soil removal.
+                        Arrange any needed input as a separately approved experiment.
       vice.poke_verify -> {address: "$XXXX", value: 0..255,
                         expect: "visible change", frames?: 0..60, bank?} : explicit
                         single-byte visual experiment. Captures before/after,
@@ -170,10 +188,13 @@ Tool argument cheat-sheet:
       stats    -> {} : counts (routines, xrefs, smc, instructions, ...)
       routines -> {limit?, offset?, like?} : list code routines
       routine  -> {start: "$XXXX"} : full per-routine window incl.
-                  callers, callees, SMC sites, hardware refs
+                  callers, callees, SMC sites, hardware refs. An interior
+                  address resolves to the smallest containing stored routine;
+                  the result reports both requested and resolved addresses.
       pseudocode -> {start: "$XXXX"} : conservative one-instruction-to-one-line
                   Layer-0 transliteration. Addresses stay attached; treat it
-                  as a reading aid, not inferred high-level source.
+                  as a reading aid, not inferred high-level source. Interior
+                  addresses resolve to their containing stored routine.
       layer2   -> {limit?, role?, backup_roles?} : explicitly run a bounded
                   global behaviour-grouping pass over verified routines.
       groups   -> {limit?} : list stored Layer-2 groups (read-only).
@@ -201,6 +222,11 @@ Tool argument cheat-sheet:
       annotate -> {start: "$XXXX", role?, backup_roles?} :
                   run Layer-1 LLM annotation on one routine — adds a
                   hypothesis row with idiom/hardware/motivation tags.
+                  Interior addresses resolve to their containing routine.
+                  If none is indexed, auto-disassembly provides a bounded
+                  window explicitly marked as having unverified routine
+                  boundaries. A decode failure needs a known instruction
+                  boundary; do not guess by shifting the address a few bytes.
                   Cheap to call; budget 1-3 per iteration.
       export   -> {path?, game?, min_confidence?} : write the entire
                   code KB to a commented .asm file under sessions/.
@@ -273,9 +299,9 @@ Tool-selection principles (apply in order):
 5. For **broad** exploration WITHOUT a pinned address window first
    (`find_loops`, `vectors`, huge `recursive` sweeps): capstone-first is
    still fine — do not force vice on every exploratory step.
-6. For vice beyond disassembly (`vice.memory.read`, breakpoints,
-   `vice.registers.get`): keep using them when proving dynamic/runtime
-   behaviour or banked/live RAM.
+6. Use vice.memory.read and vice.trace for dynamic/runtime evidence.
+   Never plan standalone vice.registers.get; trace reads registers internally.
+   Do not infer that a timeout disproves a movement-triggered write.
 7. Avoid duplicate steps — if the KB digest below already answers the
    question, shorten the plan; keep the vice→capstone confirm pair only
    where it still raises confidence for unverified addresses.

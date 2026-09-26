@@ -58,6 +58,36 @@ def _normalize_capstone_insns(rec: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
+def _decode_failure(store, start: int, engine: str, detail: str = "") -> dict[str, Any]:
+    """Return actionable decode diagnostics without guessing a new entry point."""
+    hint = ""
+    rows = store.query(
+        "SELECT addr, bytes_hex, size_bytes FROM instructions"
+        " WHERE addr < ? AND addr + size_bytes > ? ORDER BY addr DESC LIMIT 1",
+        (start, start),
+    )
+    if rows:
+        row = rows[0]
+        addr, size = int(row["addr"]), int(row["size_bytes"])
+        # Only describe a dump boundary when the indexed bytes still match it.
+        if (engine == "capstone" and row.get("bytes_hex")
+                and store.read_bytes(addr, size).hex() == row["bytes_hex"].lower()):
+            hint = (
+                f" ${start:04X} is inside the indexed instruction at ${addr:04X}"
+                f" (${addr:04X}-${addr + size - 1:04X}); use its start address."
+            )
+    return {
+        "ok": False, "start": start, "error_code": "disassembly_failed",
+        "error": (
+            f"{engine} could not decode instructions at ${start:04X}."
+            + (f" {detail}." if detail else "") + hint
+            + " The address may be mid-instruction, data, or an unsupported opcode."
+            " Use a known routine/instruction boundary or explicitly verify live bytes"
+            " with the VICE disassembly engine."
+        ),
+    }
+
+
 def disasm_capstone(
     store: CodeKnowledgeStore,
     *,
@@ -92,9 +122,12 @@ def disasm_capstone(
         listing = rec.get("listing", "")
         stats_dict = rec.get("stats", {})
     else:
-        text = c64_disasm.linear_disasm(
-            mem, start, length=length, max_lines=length // 2,
-        )
+        try:
+            text = c64_disasm.linear_disasm(
+                mem, start, length=length, max_lines=max(1, length),
+            )
+        except (RuntimeError, ValueError) as exc:
+            return _decode_failure(store, start, "capstone", str(exc))
         # Re-parse the textual listing to extract structured rows.
         rows = []
         for line in text.splitlines():
@@ -118,6 +151,9 @@ def disasm_capstone(
             })
         listing = text
         stats_dict = {"instructions": len(rows)}
+
+    if not rows or not any(row["addr"] == start for row in rows):
+        return _decode_failure(store, start, "capstone", "No instruction at the requested start")
 
     l0_stats: Layer0Stats = build_from_disasm_window(
         rows, store, source_file=note or f"capstone:${start:04X}+{length}",
@@ -221,7 +257,7 @@ def disasm_vice(
     cnt = max(1, min(100, int(count)))
     try:
         out = vice_mcp.call_tool(
-            "vice.disassemble",
+            "vice_disassemble",
             {"address": f"${addr:04X}", "count": cnt, "show_symbols": True},
         )
     except Exception as e:  # noqa: BLE001
@@ -253,6 +289,8 @@ def disasm_vice(
         text = str(raw)
 
     rows = _parse_vice_text(text)
+    if not rows or not any(row["addr"] == addr for row in rows):
+        return _decode_failure(store, addr, "vice", "No instruction at the requested start")
     l0_stats = build_from_disasm_window(
         rows, store, source_file=note or f"vice:${addr:04X}+{cnt}",
     )

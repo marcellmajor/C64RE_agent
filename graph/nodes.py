@@ -63,6 +63,12 @@ from memory.schema import (
     EVT_VERDICT,
 )
 from tools import c64_disasm
+from tools.arguments import address as parse_address, address_arg, integer, ToolArgsError
+from tools.vice_contract import (
+    _vice_normalize_method, _vice_normalize_args, _coerce_vice_address,
+    _extract_vice_address, _coerce_vice_byte, ViceArgsError,
+    vice_method_requires_approval,
+)
 
 SESSIONS_DIR = sessions_dir()
 
@@ -3380,392 +3386,22 @@ def _record_result(
 
 
 def _hex_to_int(v: Any, default: int = 0) -> int:
-    if isinstance(v, int):
-        return v
-    if isinstance(v, str):
-        v = v.strip()
-        try:
-            if v.startswith("$"):
-                return int(v[1:], 16)
-            if v.lower().startswith("0x"):
-                return int(v, 16)
-            return int(v)
-        except ValueError:
-            pass
-    return default
-
-
-def _vice_normalize_method(raw_method: str) -> str:
-    """Map common aliases to real vice-mcp tool names."""
-    m = (raw_method or "").strip().lower()
-    aliases = {
-        # ---- ping ----
-        "ping": "vice.ping",
-        # ---- disassemble ----
-        "disassemble": "vice.disassemble",
-        "vice.disassemble": "vice.disassemble",
-        # ---- memory ----
-        "read_memory": "vice.memory.read",
-        "memory.read": "vice.memory.read",
-        "memory_read": "vice.memory.read",
-        "vice.memory.read": "vice.memory.read",
-        "write_memory": "vice.memory.write",
-        "memory.write": "vice.memory.write",
-        "memory_write": "vice.memory.write",
-        "poke": "vice.memory.write",
-        "vice.memory.write": "vice.memory.write",
-        "fill_memory": "vice.memory.fill",
-        "memory.fill": "vice.memory.fill",
-        "memory_fill": "vice.memory.fill",
-        "vice.memory.fill": "vice.memory.fill",
-        # ---- agent-side memory composites ----
-        "snapshot": "vice.memory.snapshot",
-        "memory.snapshot": "vice.memory.snapshot",
-        "vice.memory.snapshot": "vice.memory.snapshot",
-        "diff": "vice.memory.diff",
-        "memory.diff": "vice.memory.diff",
-        "vice.memory.diff": "vice.memory.diff",
-        "monotonic_scan": "vice.memory.monotonic_scan",
-        "memory.monotonic_scan": "vice.memory.monotonic_scan",
-        "vice.memory.monotonic_scan": "vice.memory.monotonic_scan",
-        "trace": "vice.trace",
-        "vice.trace": "vice.trace",
-        "poke_verify": "vice.poke_verify",
-        "poke_and_peek": "vice.poke_verify",
-        "vice.poke_verify": "vice.poke_verify",
-        # ---- registers ----
-        "registers": "vice.registers.get",
-        "registers_get": "vice.registers.get",
-        "registers.get": "vice.registers.get",
-        "get_registers": "vice.registers.get",
-        "vice.registers": "vice.registers.get",
-        "vice.registers.get": "vice.registers.get",
-        # ---- execution ----
-        "pause": "vice.execution.pause",
-        "execution.pause": "vice.execution.pause",
-        "run": "vice.execution.run",
-        "execution.run": "vice.execution.run",
-        "step": "vice.execution.step",
-        "execution.step": "vice.execution.step",
-        "execution.reset": "vice.execution.reset",
-        "vice.execution.reset": "vice.execution.reset",
-        # ---- machine/media mutation ----
-        "reset": "vice.machine.reset",
-        "machine.reset": "vice.machine.reset",
-        "vice.reset": "vice.machine.reset",
-        "vice.machine.reset": "vice.machine.reset",
-        "autostart": "vice.autostart",
-        "machine.autostart": "vice.autostart",
-        "vice.autostart": "vice.autostart",
-        "attach_disk": "vice.disk.attach",
-        "disk.attach": "vice.disk.attach",
-        "disk_attach": "vice.disk.attach",
-        "vice.disk.attach": "vice.disk.attach",
-        "detach_disk": "vice.disk.detach",
-        "disk.detach": "vice.disk.detach",
-        "disk_detach": "vice.disk.detach",
-        "vice.disk.detach": "vice.disk.detach",
-        "attach_tape": "vice.tape.attach",
-        "tape.attach": "vice.tape.attach",
-        "vice.tape.attach": "vice.tape.attach",
-        "detach_tape": "vice.tape.detach",
-        "tape.detach": "vice.tape.detach",
-        "vice.tape.detach": "vice.tape.detach",
-        "attach_cartridge": "vice.cartridge.attach",
-        "cartridge.attach": "vice.cartridge.attach",
-        "vice.cartridge.attach": "vice.cartridge.attach",
-        "detach_cartridge": "vice.cartridge.detach",
-        "cartridge.detach": "vice.cartridge.detach",
-        "vice.cartridge.detach": "vice.cartridge.detach",
-        "snapshot.load": "vice.snapshot.load",
-        "vice.snapshot.load": "vice.snapshot.load",
-        "resources.set": "vice.resources.set",
-        "vice.resources.set": "vice.resources.set",
-        # ---- breakpoints ----
-        "checkpoint_add": "vice.checkpoint.add",
-        "breakpoint": "vice.checkpoint.add",
-        "checkpoint.add": "vice.checkpoint.add",
-        "vice.checkpoint.add": "vice.checkpoint.add",
-        "checkpoint_delete": "vice.checkpoint.delete",
-        "checkpoint.delete": "vice.checkpoint.delete",
-        "vice.checkpoint.delete": "vice.checkpoint.delete",
-        # ---- injected input ----
-        "keyboard.type": "vice.keyboard.type",
-        "keyboard_type": "vice.keyboard.type",
-        "vice.keyboard.type": "vice.keyboard.type",
-        "joystick.set": "vice.joystick.set",
-        "joystick_set": "vice.joystick.set",
-        "vice.joystick.set": "vice.joystick.set",
-        # ---- screenshots ----
-        "screenshot": "vice.display.screenshot",
-        "display.screenshot": "vice.display.screenshot",
-        "vice.screenshot": "vice.display.screenshot",
-        # ---- VIC-II / SID / CIA state ----
-        "vice.vicii": "vice.vicii.get_state",
-        "vice.vic": "vice.vicii.get_state",
-        "vice.sid": "vice.sid.get_state",
-        "vice.cia": "vice.cia.get_state",
-        "vice.cia1": "vice.cia.get_state",
-        # ---- memory search/compare ----
-        "vice.memory.search": "vice.memory.search",
-        "memory.search": "vice.memory.search",
-        "vice.memory_search": "vice.memory.search",
-    }
-    if m in aliases:
-        return aliases[m]
-    if m.startswith("vice."):
-        return m
-    # Last resort: treat as vice.<name>.
-    return f"vice.{m}" if m else "vice.ping"
-
-
-_MUTATING_VICE_METHODS = frozenset({
-    "vice.trace",
-    "vice.poke_verify",
-    "vice.memory.write",
-    "vice.memory.fill",
-    "vice.execution.run",
-    "vice.execution.step",
-    "vice.execution.pause",
-    "vice.execution.reset",
-    "vice.machine.reset",
-    "vice.autostart",
-    "vice.disk.attach",
-    "vice.disk.detach",
-    "vice.tape.attach",
-    "vice.tape.detach",
-    "vice.tape.control",
-    "vice.cartridge.attach",
-    "vice.cartridge.detach",
-    "vice.cartridge.freeze",
-    "vice.snapshot.load",
-    "vice.resources.set",
-    "vice.checkpoint.add",
-    "vice.checkpoint.delete",
-    "vice.keyboard.type",
-    "vice.joystick.set",
-})
-
-
-def vice_method_requires_approval(method: str) -> bool:
-    """True when a VICE method can change emulator state."""
-    canonical = _vice_normalize_method(method)
-    return canonical in _MUTATING_VICE_METHODS or canonical.startswith((
-        "vice.memory.write", "vice.memory.poke", "vice.keyboard.",
-        "vice.joystick.",
-    ))
+    """Compatibility helper for optional addresses; all strings use hex."""
+    try:
+        return parse_address(v)
+    except ToolArgsError:
+        return default
 
 
 def vice_step_requires_approval(step: dict[str, Any]) -> bool:
     args = step.get("args") or {}
     method = args.get("method") or step.get("method") or step.get("action") or ""
-    return vice_method_requires_approval(str(method))
+    return vice_method_requires_approval(str(method), args)
 
 
 # Address-key aliases the planner LLM keeps inventing: shared constant
 # `plan_utils.VICE_ADDRESS_ALIASES` (imported above as
 # `_VICE_ADDRESS_ALIASES`) — `step_is_concrete` uses the same list.
-
-
-def _coerce_vice_address(raw: Any) -> str | None:
-    """Normalise an address-like value to ``$XXXX`` (or return None).
-
-    Accepts: int, ``"$XXXX"``, ``"0xXXXX"``, ``"XXXX"`` (hex), or a
-    decimal string that fits in 16 bits. The previous helper silently
-    coerced ``0`` and empty strings into ``$0801``; we no longer do that
-    — the caller decides how to react to a missing address.
-    """
-    if raw is None:
-        return None
-    if isinstance(raw, bool):
-        return None  # True/False shouldn't be treated as addresses
-    if isinstance(raw, int):
-        return f"${raw & 0xFFFF:04X}"
-    if isinstance(raw, str):
-        s = raw.strip()
-        if not s:
-            return None
-        if s.startswith("$"):
-            try:
-                return f"${int(s[1:], 16) & 0xFFFF:04X}"
-            except ValueError:
-                return None
-        if s.lower().startswith("0x"):
-            try:
-                return f"${int(s, 16) & 0xFFFF:04X}"
-            except ValueError:
-                return None
-        # Bare hex-looking strings (e.g. "1135") — accept as hex.
-        try:
-            return f"${int(s, 16) & 0xFFFF:04X}"
-        except ValueError:
-            pass
-        # Last resort: decimal.
-        try:
-            return f"${int(s) & 0xFFFF:04X}"
-        except ValueError:
-            return None
-    return None
-
-
-def _extract_vice_address(a: dict[str, Any]) -> str | None:
-    """Find the first non-empty address-like key in ``a`` and canonicalise it."""
-    for key in _VICE_ADDRESS_ALIASES:
-        if key in a:
-            canon = _coerce_vice_address(a[key])
-            if canon is not None:
-                return canon
-    return None
-
-
-class ViceArgsError(ValueError):
-    """Raised when a vice-mcp call is missing required arguments."""
-
-
-def _vice_normalize_args(method: str, args: dict[str, Any]) -> dict[str, Any]:
-    """Translate generic args into the current vice-mcp schema.
-
-    Raises ``ViceArgsError`` when a required arg is missing — previously
-    these silently defaulted to ``$0801`` / ``$0000``, which produced
-    plausible-looking but completely wrong tool results.
-    """
-    a = dict(args or {})
-
-    if method == "vice.disassemble":
-        address = _extract_vice_address(a)
-        if address is None:
-            raise ViceArgsError(
-                "vice.disassemble requires an `address` argument "
-                "(e.g. \"$1135\"). Accepted aliases: "
-                + ", ".join(_VICE_ADDRESS_ALIASES) + "."
-            )
-        if address == "$0000":
-            raise ViceArgsError(
-                "vice.disassemble was given address $0000 — this is almost "
-                "certainly a placeholder that was never resolved. "
-                "Check the KB for the real target address and retry."
-            )
-        count = a.get("count")
-        if count is None:
-            length = _hex_to_int(a.get("length", 0), 0)
-            count = max(1, min(100, (length // 2) if length else 16))
-        return {
-            "address": address,
-            "count": int(max(1, min(100, int(count)))),
-            "show_symbols": bool(a.get("show_symbols", True)),
-        }
-
-    if method == "vice.memory.read":
-        address = _extract_vice_address(a)
-        if address is None:
-            raise ViceArgsError(
-                "vice.memory.read requires an `address` argument "
-                "(e.g. \"$03F0\")."
-            )
-        size = a.get("size") if a.get("size") is not None else a.get("length")
-        if size is None:
-            raise ViceArgsError(
-                "vice.memory.read requires a `size` argument "
-                "(byte count, 1..65535)."
-            )
-        out: dict[str, Any] = {
-            "address": address,
-            "size": int(max(1, min(65535, int(size)))),
-            # The agent's deterministic formatter needs explicit byte
-            # values, so per-byte "array" stays the default; bulk readers
-            # ask for the compact "hex" blob instead.
-            "encoding": str(a.get("encoding") or "array"),
-        }
-        if a.get("bank"):
-            out["bank"] = str(a["bank"])
-        return out
-
-    if method == "vice.memory.write":
-        address = _extract_vice_address(a)
-        if address is None:
-            raise ViceArgsError(
-                "vice.memory.write requires an `address` argument."
-            )
-        raw_data = a.get("data")
-        if raw_data is None:
-            raw_data = a.get("values")
-        if raw_data is None and a.get("value") is not None:
-            raw_data = [a.get("value")]
-        if isinstance(raw_data, (bytes, bytearray)):
-            raw_data = list(raw_data)
-        if not isinstance(raw_data, list) or not raw_data:
-            raise ViceArgsError(
-                "vice.memory.write requires `data` bytes or one `value`."
-            )
-        values = [_coerce_vice_byte(value) for value in raw_data]
-        if any(value is None for value in values):
-            raise ViceArgsError(
-                "vice.memory.write data values must be bytes (0..255)."
-            )
-        return {"address": address, "data": values}
-
-    if method == "vice.checkpoint.add":
-        # vice-mcp names the address `start` (not `address`) and the
-        # stop flag `stop` (not `stop_when_hit`); sending our own spelling
-        # made the server reject the call with "start address required".
-        address = _extract_vice_address(a)
-        if address is None:
-            raise ViceArgsError(
-                "vice.checkpoint.add requires a `start` address "
-                "(e.g. \"$D000\")."
-            )
-        out_cp: dict[str, Any] = {"start": address}
-        if a.get("end") is not None:
-            end = _coerce_vice_address(a.get("end"))
-            if end is None:
-                raise ViceArgsError(
-                    f"vice.checkpoint.add got an unparseable `end`: "
-                    f"{a.get('end')!r}"
-                )
-            out_cp["end"] = end
-        for canonical, aliases in (
-            ("exec", ("exec", "execute", "on_exec")),
-            ("load", ("load", "read", "on_read")),
-            ("store", ("store", "write", "on_write")),
-            ("stop", ("stop", "stop_when_hit", "stop_on_hit")),
-        ):
-            for alias in aliases:
-                if a.get(alias) is not None:
-                    out_cp[canonical] = bool(a[alias])
-                    break
-        return out_cp
-
-    if method == "vice.checkpoint.delete":
-        # The server deletes by number only — there is no address form.
-        num = None
-        for alias in ("checkpoint_num", "checkpoint_id", "id", "number", "num"):
-            if a.get(alias) is not None:
-                num = a[alias]
-                break
-        try:
-            num_int = int(num)  # type: ignore[arg-type]
-        except (TypeError, ValueError):
-            raise ViceArgsError(
-                "vice.checkpoint.delete requires the numeric "
-                "`checkpoint_num` returned by vice.checkpoint.add."
-            ) from None
-        return {"checkpoint_num": num_int}
-
-    if method == "vice.execution.run":
-        # Current vice-mcp's run verb has an empty schema. Watchpoint-based
-        # bounds are enforced by the checkpoint itself; unsupported planner
-        # hints such as `frames` must not make the MCP request invalid.
-        return {}
-
-    if method == "vice.display.screenshot":
-        # Always return base64 so the agent sees the image without needing
-        # a filesystem path. Accept an explicit path if the caller provided one.
-        result: dict[str, Any] = {"return_base64": True, "format": "PNG"}
-        if a.get("path"):
-            result["path"] = str(a["path"])
-        return result
-
-    return a
 
 
 _VICE_FIRST_ADDR_RE = re.compile(r"\$([0-9A-Fa-f]{4})")
@@ -3862,7 +3498,7 @@ def _capstone_linear(
 def _capstone_recursive(
     mem: bytes, args: dict[str, Any], step_id: str
 ) -> dict[str, Any]:
-    entry = _hex_to_int(args.get("entry", args.get("start", "0x0801")), 0x0801)
+    entry = address_arg(args, "entry", "start", default=0x0801)
     max_insns = int(args.get("max_insns", 600))
     seed_vectors = bool(args.get("seed_vectors", True))
     extra_seeds = _normalize_seeds(args.get("seeds"))
@@ -3938,7 +3574,7 @@ def _capstone_find_entry(
     mem: bytes, args: dict[str, Any], step_id: str
 ) -> dict[str, Any]:
     hint = args.get("hint")
-    hint_int = _hex_to_int(hint, 0) if hint else None
+    hint_int = parse_address(hint) if hint is not None else None
     info = c64_disasm.find_entry(mem, hint=hint_int)
     return _record_result(
         "capstone", step_id, True, json.dumps(info, indent=2),
@@ -3983,7 +3619,7 @@ def _capstone_bank(
 def _capstone_polymorphic(
     mem: bytes, args: dict[str, Any], step_id: str
 ) -> dict[str, Any]:
-    entry = _hex_to_int(args.get("entry", args.get("start", "0x0801")), 0x0801)
+    entry = address_arg(args, "entry", "start", default=0x0801)
     max_insns = int(args.get("max_insns", 1000))
     rec = c64_disasm.recursive_disasm(mem, entry, max_insns=max_insns)
     insns_int_keyed = {
@@ -4021,8 +3657,7 @@ def _recursive_insns_int_keyed(
 ) -> dict[int, dict[str, Any]]:
     """Shared helper: recursive-disassemble from a resolved entry and
     return the int-keyed insns dict the 3.3/3.5 analysers consume."""
-    entry = _hex_to_int(args.get("entry", args.get("start", default_entry)),
-                        default_entry)
+    entry = address_arg(args, "entry", "start", default=default_entry)
     if entry == 0x0801:
         sys_target = c64_disasm.detect_basic_sys(mem)
         if sys_target and 0x0800 < sys_target <= 0xCFFF:
@@ -4087,8 +3722,8 @@ def _capstone_screen_text(
     mem: bytes, args: dict[str, Any], step_id: str
 ) -> dict[str, Any]:
     """Decode screen + colour RAM to PETSCII strings (tracker 3.7)."""
-    screen_base = _hex_to_int(args.get("screen_base", "0x0400"), 0x0400)
-    color_base = _hex_to_int(args.get("color_base", "0xD800"), 0xD800)
+    screen_base = address_arg(args, "screen_base", default=0x0400)
+    color_base = address_arg(args, "color_base", default=0xD800)
     min_run = int(args.get("min_run", 3))
     res = c64_disasm.decode_screen_ram(
         mem, screen_base=screen_base, color_base=color_base, min_run=min_run,
@@ -4611,29 +4246,6 @@ def _compare_screenshot_pair(
     return "[before/after vision comparison unavailable]", meta
 
 
-def _coerce_vice_byte(value: Any) -> int | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value if 0 <= value <= 0xFF else None
-    if isinstance(value, str):
-        s = value.strip()
-        try:
-            if s.startswith("$"):
-                n = int(s[1:], 16)
-            elif s.lower().startswith("0x"):
-                n = int(s, 16)
-            else:
-                n = int(s, 10)
-        except ValueError:
-            try:
-                n = int(s, 16)
-            except ValueError:
-                return None
-        return n if 0 <= n <= 0xFF else None
-    return None
-
-
 def _extract_vice_bytes(data: Any) -> tuple[list[int], Any | None]:
     """Return (byte values, payload address) from common vice-mcp shapes."""
     address = None
@@ -4806,6 +4418,7 @@ def _vice_disassemble_fallback(
 # --------------------------------------------------------------------------- #
 
 _VICE_COMPOSITE_METHODS = {
+    "vice.execution.advance",
     "snapshot", "memory.snapshot", "vice.memory.snapshot",
     "diff", "memory.diff", "vice.memory.diff",
     "monotonic_scan", "memory.monotonic_scan", "vice.memory.monotonic_scan",
@@ -4955,6 +4568,15 @@ def _vice_composite(
     from tools import mem_diff
 
     m = method.lower().rsplit(".", 1)[-1]  # normalise to the verb
+
+    if m == "advance":
+        from tools.vice_execution import advance_frames
+
+        result = advance_frames(_vice_call, args.get("frames"))
+        return _record_result(
+            "vice", step_id, result.pop("ok"), result.pop("message"),
+            extra={"method": "vice.execution.advance", **result},
+        )
 
     if m == "snapshot":
         name = str(args.get("name") or "snap").strip()
@@ -5459,25 +5081,20 @@ def _extract_checkpoint_id(add_result: dict[str, Any]) -> Any:
 
 
 def _disasm_writes_addr(disasm_text: str, addr_int: int) -> bool:
-    """True iff a line disassembles to a write/RMW targeting *addr_int*."""
-    for line in (disasm_text or "").splitlines():
-        toks = line.lower().split()
-        if not any(t in _TRACE_WRITE_MNEMONICS for t in toks):
-            continue
-        for m in re.finditer(r"\$([0-9a-fA-F]{2,4})", line):
-            if int(m.group(1), 16) == addr_int:
-                return True
-    return False
+    """Static direct-operand match, not proof that this instruction executed."""
+    from tools.vice_trace import literal_write_in_listing
+    return literal_write_in_listing(disasm_text, addr_int)
 
 
 def _vice_trace(args: dict[str, Any], step_id: str) -> dict[str, Any]:
     """Watchpoint → run → resolve-writer composite (tracker 3.2, hardened).
 
     One tool call turns "candidate address" into "the routine that writes
-    it". Success is claimed ONLY when a hit is actually confirmed — via
-    the checkpoint's hit count, or by the resolved PC's instruction
-    demonstrably writing the watched address — never merely because a PC
-    was read. The armed watchpoint is always cleaned up (try/finally).
+    it". Success requires this checkpoint's hit count. Nearby code and the
+    stopped PC are never treated as evidence of an executed write. Writer
+    reconstruction is labelled as candidate evidence, including indexed
+    and indirect addressing when the required state is available. The armed
+    watchpoint is always cleaned up (try/finally).
     """
     address = _extract_vice_address(args)
     if address is None:
@@ -5487,7 +5104,13 @@ def _vice_trace(args: dict[str, Any], step_id: str) -> dict[str, Any]:
             extra={"method": "vice.trace", "retryable": False},
         )
     addr_int = int(address.lstrip("$"), 16)
-    frames = int(args.get("frames", 2))
+    # Legacy plans used frames as a wait hint. Keep them usable, but explicitly
+    # distinguish this wall-clock observation window from measured advancement.
+    frames = integer(args.get("frames", 2), "frames", 1, 300)
+    timeout = args.get("timeout_s")
+    if timeout is not None:
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout <= 10:
+            raise ViceArgsError("vice.trace timeout_s must be a number greater than 0 and at most 10")
     steps: list[str] = []
     checkpoint_id: Any = None
     # A stop-on-hit watchpoint parks the machine, and resuming a machine
@@ -5529,12 +5152,14 @@ def _vice_trace(args: dict[str, Any], step_id: str) -> dict[str, Any]:
         # `vice.ping` reports "running" even while the monitor holds the
         # CPU, so it cannot answer "has the watchpoint fired?". The
         # checkpoint's own hit count can, so poll that.
-        budget_s = max(
+        budget_s = float(timeout) if timeout is not None else max(
             _TRACE_MIN_BUDGET_S, min(_TRACE_MAX_BUDGET_S, frames * 0.05),
         )
+        started_wait = time.monotonic()
+        deadline = started_wait + budget_s
         waited = 0.0
         hit_confirmed = False
-        while waited < budget_s:
+        while time.monotonic() < deadline:
             if checkpoint_id is not None:
                 try:
                     lst = _vice_call("vice.checkpoint.list", {})
@@ -5544,7 +5169,8 @@ def _vice_trace(args: dict[str, Any], step_id: str) -> dict[str, Any]:
                 except Exception:  # noqa: BLE001
                     pass
             time.sleep(_TRACE_POLL_INTERVAL_S)
-            waited = round(waited + _TRACE_POLL_INTERVAL_S, 4)
+            waited = time.monotonic() - started_wait
+        waited = time.monotonic() - started_wait
         steps.append(
             f"watchpoint hit after ~{waited:.2f}s" if hit_confirmed else
             f"no write seen within {budget_s:.2f}s"
@@ -5553,20 +5179,22 @@ def _vice_trace(args: dict[str, Any], step_id: str) -> dict[str, Any]:
         # 3. Confirm a hit via the checkpoint list (hit_count > 0), if the
         #    server exposes it. Only trusted when we captured OUR
         #    checkpoint id — without one, a hit_count on some other
-        #    breakpoint could be misattributed to our watchpoint, so we
-        #    fall back to the PC/disasm proof below instead (review nit).
+        #    breakpoint could be misattributed to our watchpoint. Without
+        #    our id, the result must remain unconfirmed.
         if checkpoint_id is None:
             steps.append(
-                "no checkpoint id returned — relying on PC/disasm proof, "
-                "not the checkpoint list; the watchpoint cannot be removed "
+                "no checkpoint id returned — unable to confirm our hit; "
+                "the watchpoint cannot be removed "
                 "automatically and may still be armed in VICE"
             )
 
         # 4. Read registers (allowed — a checkpoint is armed) + resolve PC.
         pc = None
         reg_text = ""
+        reg_data = {}
         try:
             regs = _vice_call("vice.registers.get", {})
+            reg_data = regs.get("data") if isinstance(regs.get("data"), dict) else {}
             reg_text = _vice_text(regs.get("data"))
             pc = _vice_pc(regs.get("data"))
             steps.append(
@@ -5576,26 +5204,27 @@ def _vice_trace(args: dict[str, Any], step_id: str) -> dict[str, Any]:
         except Exception as e:  # noqa: BLE001
             steps.append(f"registers.get failed ({type(e).__name__})")
 
-        # 5. Disasm around PC and check it actually writes the address.
+        # A nearby write is not evidence of execution. Only our checkpoint's
+        # hit count establishes a write; stopped PC is not the writer address.
         writer_disasm = ""
-        writer_proven = False
-        if pc is not None:
-            win_start = max(0, pc - 16)
+        candidates = []
+        if hit_confirmed and pc is not None:
             try:
-                out = _vice_call("vice.disassemble", {
-                    "address": f"${win_start:04X}", "count": 16,
-                })
-                writer_disasm = _vice_text(out.get("data"))
-                writer_proven = _disasm_writes_addr(writer_disasm, addr_int)
-                steps.append(
-                    f"disasm around ${pc:04X}"
-                    + (" confirms a write to the address"
-                       if writer_proven else " (no write to the address seen)")
-                )
-            except Exception as e:  # noqa: BLE001
-                steps.append(f"disasm around ${pc:04X} failed ({type(e).__name__})")
-
-        ok = bool(hit_confirmed or writer_proven)
+                from tools.vice_trace import writer_candidates
+                def read_bytes(addr, size):
+                    data = _vice_call("vice.memory.read", {
+                        "address": f"${addr:04X}", "size": size, "encoding": "hex",
+                    }).get("data")
+                    return _vice_bytes_from_read(data)
+                candidates = writer_candidates(pc, addr_int, reg_data, read_bytes)
+                if candidates:
+                    writer_disasm = json.dumps(candidates, indent=2)
+                    steps.append("reconstructed possible writers ending at the stopped PC")
+                else:
+                    steps.append("write confirmed; writing instruction remains unresolved")
+            except Exception as exc:
+                steps.append(f"write confirmed; writer reconstruction unavailable ({type(exc).__name__})")
+        ok = hit_confirmed
         body = [
             f"vice.trace of write watchpoint on {address}:",
             "steps: " + "; ".join(steps),
@@ -5604,21 +5233,26 @@ def _vice_trace(args: dict[str, Any], step_id: str) -> dict[str, Any]:
             body.append("registers:\n" + reg_text[:1_000])
         if writer_disasm:
             body.append(
-                f"writing instruction context (±16 bytes around ${pc:04X}):\n"
+                f"writer candidates (not execution proof; stopped PC=${pc:04X}):\n"
                 + writer_disasm[:2_000]
             )
         if not ok:
             body.append(
-                "No confirmed write to the address within the frame budget "
-                "(no hit reported and the PC's instruction does not write it). "
-                "The value may be updated elsewhere or not during this window."
+                "No confirmed write within the observation timeout. "
+                "This does not prove the address is never written or that any "
+                "particular number of frames elapsed. No player input was supplied; "
+                "a movement-dependent write may require a separate approved action."
             )
         return _record_result(
             "vice", step_id, ok, "\n".join(body),
             extra={"method": "vice.trace", "address": address,
-                   "writer_pc": f"${pc:04X}" if (ok and pc is not None) else None,
-                   "hit_confirmed": bool(hit_confirmed),
-                   "writer_proven": bool(writer_proven)},
+                   "writer_pc": None,
+                   "stop_pc": f"${pc:04X}" if pc is not None else None,
+                   "writer_candidates": candidates,
+                   "hit_confirmed": bool(hit_confirmed), "writer_proven": False,
+                   "observation_timeout_s": budget_s,
+                   "requested_frames": args.get("frames"),
+                   "frames_measured": False},
         )
     finally:
         # Always disarm the watchpoint we added, even on early returns.
@@ -5710,6 +5344,10 @@ def vice_mcp_node(state: C64State) -> dict[str, Any]:
     # `_vice_call` later normalises again defensively, but policy must never
     # inspect a raw alias (`ping`, `registers`, `get_registers`, …).
     method = _vice_normalize_method(str(raw_method))
+    # A planner-supplied frame count is a bounded advance request. Do not
+    # silently discard it through the argument-free native run method.
+    if method == "vice.execution.run" and "frames" in args:
+        method = "vice.execution.advance"
     # Absorb address / count / size at the step top level into args when
     # the LLM forgot to nest them (common with smaller models).
     for _top_key in ("address", "addr", "count", "size", "bank", "start"):
@@ -5719,7 +5357,7 @@ def vice_mcp_node(state: C64State) -> dict[str, Any]:
 
     if (
         state.get("require_vice_approval")
-        and vice_method_requires_approval(method)
+        and vice_method_requires_approval(method, args)
         and not state.get("approve_all_vice_mutations")
         and str(step_id) not in {
             str(item) for item in state.get("approved_mutation_steps") or []
@@ -5747,7 +5385,11 @@ def vice_mcp_node(state: C64State) -> dict[str, Any]:
     # Agent-side composites (tracker 3.1 / 3.2): snapshot / diff /
     # monotonic_scan / trace. Dispatch before the direct-call path.
     if method in _VICE_COMPOSITE_METHODS:
-        return _vice_composite(state, method, args, step_id)
+        try:
+            return _vice_composite(state, method, args, step_id)
+        except (ValueError, TypeError) as exc:
+            return _record_result("vice", step_id, False, f"vice argument error: {exc}",
+                                  extra={"method": method, "rejection": "invalid_arg"})
 
     # Reject low-value diagnostic calls that produce no code facts.
     # `vice.registers.get` is ALWAYS banned as a standalone step
@@ -5997,9 +5639,8 @@ def kb_query_node(state: C64State) -> dict[str, Any]:
     if mode == "text" and semantic_on:
         mode = "text_semantic"
 
-    limit = int(args.get("limit", 50))
-
     try:
+        limit = integer(args.get("limit", 50), "limit", 1, 10000)
         if mode == "schema":
             return _record_result(
                 "kb", step_id, True, KB_SCHEMA_HINT,

@@ -52,7 +52,7 @@ def _vice_gate_state(method, *, step_id="poke1", approved=None):
     ("tape.attach", "vice.tape.attach"),
     ("cartridge.attach", "vice.cartridge.attach"),
     ("snapshot.load", "vice.snapshot.load"),
-    ("resources.set", "vice.resources.set"),
+    ("resources.set", "vice.machine.config.set"),
     ("checkpoint_delete", "vice.checkpoint.delete"),
     ("keyboard.type", "vice.keyboard.type"),
 ])

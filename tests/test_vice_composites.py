@@ -138,6 +138,10 @@ def test_trace_resolves_writer_and_cleans_up(kb_state, monkeypatch):
             return {"data": {"status": "ok", "execution": "paused"}}
         if method == "vice.checkpoint.add":
             return {"data": {"number": 7}}
+        if method == "vice.checkpoint.list":
+            return {"data": {"checkpoints": [{"number": 7, "hit_count": 1}]}}
+        if method == "vice.memory.read":
+            return {"data": {"data_hex": "eec000"}}
         if method == "vice.registers.get":
             return {"data": "A:00 X:01 Y:02 SP:F8 PC:$C143 NV-BDIZC"}
         if method == "vice.disassemble":
@@ -148,11 +152,13 @@ def test_trace_resolves_writer_and_cleans_up(kb_state, monkeypatch):
     out = _run(state, {"method": "vice.trace", "address": "$00C0", "frames": 3})
     r = out["tool_results"][0]
     assert r["ok"]                                   # writer proven
-    assert r["writer_pc"] == "$C143"
-    assert r["writer_proven"] is True
+    assert r["writer_pc"] is None
+    assert r["stop_pc"] == "$C143"
+    assert r["writer_candidates"][0]["address"] == "$C140"
+    assert r["writer_proven"] is False
     assert "vice.checkpoint.add" in calls
     assert "vice.checkpoint.delete" in calls         # cleanup ran
-    assert "INC $00C0" in r["data"]
+    assert r["writer_candidates"][0]["mnemonic"] == "INC"
 
 
 def test_trace_confirms_hit_via_checkpoint_list(kb_state, monkeypatch):
@@ -263,8 +269,8 @@ def test_trace_cleans_up_even_when_run_raises(kb_state, monkeypatch):
 
     monkeypatch.setattr(nodes, "_vice_call", fake_call)
     out = _run(state, {"method": "vice.trace", "address": "$00C0"})
-    # Run raised but the writer is still proven from PC/disasm.
-    assert out["tool_results"][0]["ok"]
+    # Nearby code cannot prove a write when execution failed and no hit exists.
+    assert not out["tool_results"][0]["ok"]
     assert "vice.checkpoint.delete" in calls          # try/finally cleanup
 
 
@@ -856,6 +862,8 @@ def test_trace_reads_the_pc_from_the_servers_json_registers(
             return {"data": {"checkpoints": [
                 {"checkpoint_num": 1, "hit_count": 1},
             ]}}
+        if method == "vice.memory.read":
+            return {"data": {"data_hex": "ea8506"}}
         if method == "vice.registers.get":
             # Verbatim shape from a live VICE 3.10 session.
             return {"data": {"PC": 37349, "A": 155, "X": 0, "Y": 78,
@@ -871,8 +879,10 @@ def test_trace_reads_the_pc_from_the_servers_json_registers(
     out = _run(state, {"method": "vice.trace", "address": "$0006"})
     r = out["tool_results"][0]
 
-    assert r["writer_pc"] == "$91E5"
-    assert r["writer_proven"] is True        # STA $06 writes the watched byte
+    assert r["writer_pc"] is None
+    assert r["stop_pc"] == "$91E5"
+    assert r["writer_candidates"][0]["address"] == "$91E3"
+    assert r["writer_proven"] is False       # reconstruction is not execution proof
     assert r["ok"]
 
 

@@ -202,13 +202,10 @@ def test_layer2_without_verified_routines_does_not_call_llm(tmp_path, monkeypatc
 
 
 # ---------------------------------------------------------------------------
-# A start-address miss should name the enclosing routine (tracker: plan
-# execution kept dead-ending on "no routine found with start_addr=$C394"
-# for addresses taken from a disassembly listing, which land inside a
-# routine rather than on its entry point).
+# Interior addresses resolve to the enclosing routine and report the mapping.
 # ---------------------------------------------------------------------------
 
-def test_routine_miss_inside_a_known_routine_names_it(tmp_path):
+def test_routine_interior_address_resolves_to_known_routine(tmp_path):
     handle = str(tmp_path / "code_kb")
     store = get_code_store(handle)
     store.append_annotation(_routine(0xC380, 0xC3F2, "score_update"), source="test")
@@ -216,11 +213,12 @@ def test_routine_miss_inside_a_known_routine_names_it(tmp_path):
     res = code_node._mode_routine(store, {"start": "$C394"}, "s1")
     result = res["tool_results"][0]
 
-    assert result["ok"] is False
-    assert "no routine found with start_addr=$C394" in result["data"]
+    assert result["ok"] is True
+    assert result["requested_start_addr"] == 0xC394
+    assert result["start_addr"] == 0xC380
     assert "$C380-$C3F2" in result["data"]
     assert "score_update" in result["data"]
-    assert 'start="$C380"' in result["data"]
+    assert "using its entry $C380" in result["data"]
 
 
 def test_routine_miss_outside_every_routine_keeps_the_generic_hint(tmp_path):
@@ -236,14 +234,21 @@ def test_routine_miss_outside_every_routine_keeps_the_generic_hint(tmp_path):
     assert "lies inside" not in result["data"]
 
 
-def test_pseudocode_miss_uses_the_same_containment_hint(tmp_path):
+def test_pseudocode_interior_address_resolves_to_known_routine(tmp_path):
+    from code_kb.layer0 import build_from_disasm_window
     handle = str(tmp_path / "code_kb")
     store = get_code_store(handle)
     store.append_annotation(_routine(0xC380, 0xC3F2, "score_update"), source="test")
+    build_from_disasm_window([
+        {"addr": 0xC380, "bytes": b"\xea", "mnemonic": "nop"},
+        {"addr": 0xC3A0, "bytes": b"\x60", "mnemonic": "rts"},
+    ], store)
 
     res = code_node._mode_pseudocode(store, {"start": "$C3A0"}, "s1")
     result = res["tool_results"][0]
 
-    assert result["ok"] is False
-    assert "mode='pseudocode'" in result["data"]
+    assert result["ok"] is True
+    assert result["requested_start_addr"] == 0xC3A0
+    assert result["start_addr"] == 0xC380
     assert "$C380-$C3F2" in result["data"]
+    assert "$C380" in result["data"] and "$C3A0" in result["data"]

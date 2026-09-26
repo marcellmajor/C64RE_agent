@@ -17,6 +17,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from tools.arguments import address as parse_address, ToolArgsError
+from tools.vice_contract import (
+    VICE_ADDRESS_ALIASES, _vice_normalize_method, _vice_normalize_args,
+)
 
 # ---------------------------------------------------------------------------
 # Loop budgets (tracker 0.1 / 0.3 / 0.4)
@@ -101,10 +105,6 @@ _PERMANENT_REJECTIONS = {"banned_method", "dependency_unsatisfied"}
 
 # Address-key aliases planner LLMs keep inventing for vice calls. Shared
 # with graph.nodes (arg normalization) and `step_is_concrete` below.
-VICE_ADDRESS_ALIASES = (
-    "address", "addr", "start", "pc", "at", "from", "loc", "location",
-    "entry", "target", "where",
-)
 
 
 # ---------------------------------------------------------------------------
@@ -320,42 +320,11 @@ def _has_value(args: dict[str, Any], *keys: str) -> bool:
 
 
 def is_resolved_address(value: Any) -> bool:
-    """True when *value* is a usable ``$0000``-``$FFFF`` address.
-
-    Planner and executor LLMs sometimes write a symbolic forward
-    reference where a concrete address belongs — ``"$DC00_REF_FROM_s5"``,
-    ``"$C000_ROUTINE_START_FROM_s4"``. Those are non-empty strings, so
-    the null check in `step_is_concrete` reads them as answered, the step
-    skips enrichment, and the tool rejects the arg it can't parse.
-    Requiring the value to actually parse keeps such steps on the
-    enrichment path, where the KB can resolve what the reference meant.
-    """
-    if isinstance(value, bool):
+    try:
+        parse_address(value)
+        return True
+    except ToolArgsError:
         return False
-    if isinstance(value, int):
-        return 0 <= value <= 0xFFFF
-    if not isinstance(value, str):
-        return False
-    text = value.strip()
-    if not text:
-        return False
-    if text.startswith("$"):
-        candidates = ((text[1:], 16),)
-    elif text.lower().startswith("0x"):
-        candidates = ((text[2:], 16),)
-    else:
-        # `graph.nodes._hex_to_int` reads a bare token as decimal while
-        # `_coerce_vice_address` reads it as hex. Accept either, so this
-        # never rejects a value the tool itself would have parsed.
-        candidates = ((text, 10), (text, 16))
-    for body, base in candidates:
-        try:
-            parsed = int(body, base)
-        except ValueError:
-            continue
-        if 0 <= parsed <= 0xFFFF:
-            return True
-    return False
 
 
 def _has_address(args: dict[str, Any], *keys: str) -> bool:
@@ -406,17 +375,31 @@ def step_is_concrete(step: dict[str, Any]) -> bool:
         mode = str(args.get("mode") or "linear").strip().lower()
         if mode == "linear":
             return _has_address(args, "start")
-        return True  # recursive/find_* / vectors / polymorphic self-default
+        # Optional entries may default only when absent, never when unresolved.
+        return all(is_resolved_address(args[key]) for key in ("entry", "start", "hint", "screen_base", "color_base") if key in args)
 
     if tool == "tavily":
         return _has_value(args, "q", "query")
 
     if tool == "vice":
-        method = str(
-            args.get("method") or step.get("method") or "",
-        ).strip().lower()
+        raw_method = args.get("method") or step.get("method") or step.get("action")
+        if not raw_method:
+            return False
+        method = _vice_normalize_method(str(raw_method))
         if not method:
             return False
+        if method in {
+            "execute", "vice.execute", "advance", "vice.advance",
+            "execution.advance", "vice.execution.advance",
+        } or (method in {"run", "execution.run", "vice.execution.run"}
+              and "frames" in args):
+            frames = args.get("frames")
+            return (
+                not isinstance(frames, bool)
+                and isinstance(frames, (int, str))
+                and str(frames).strip().isdigit()
+                and 1 <= int(frames) <= 300
+            )
         if "screenshot" in method:
             return True
         # VICE composites (tracker 3.1 / 3.2).
@@ -435,23 +418,11 @@ def step_is_concrete(step: dict[str, Any]) -> bool:
                 and _has_value(args, "value", "candidate")
                 and _has_value(args, "expect", "expectation")
             )
-        if "disassemble" in method:
-            return _has_address(args, *VICE_ADDRESS_ALIASES)
-        if "memory" in method and ("read" in method or "search" in method):
-            return (
-                _has_address(args, *VICE_ADDRESS_ALIASES)
-                and _has_value(args, "size", "length")
-            )
-        # Breakpoints/watchpoints are address-bearing too (review
-        # finding 4 — the old blanket True let a checkpoint step with no
-        # address bypass enrichment straight into a tool error).
-        if "checkpoint" in method or "breakpoint" in method:
-            return _has_address(args, *VICE_ADDRESS_ALIASES)
-        if "execution" in method or method in (
-            "vice.ping", "ping", "run", "step", "pause",
-        ):
-            return True  # genuinely argument-free
-        return False  # unknown vice methods → enrich conservatively
+        try:
+            _vice_normalize_args(method, {k: v for k, v in args.items() if k != "method"})
+            return True
+        except (ValueError, TypeError):
+            return False
 
     if tool == "code_kb":
         mode = str(args.get("mode") or "").strip().lower()

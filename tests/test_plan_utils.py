@@ -276,7 +276,7 @@ def test_normalize_keeps_lower_confidence_and_handles_empty_state():
 # ---------------------------------------------------------------------------
 
 def test_is_resolved_address_accepts_every_form_the_tools_parse():
-    for value in ("$C394", "0xC394", "c394", "C394", "49556", 0xC394, 0, 0xFFFF):
+    for value in ("$C394", "0xC394", "c394", "C394", 0xC394, 0, 0xFFFF):
         assert is_resolved_address(value), value
 
 
@@ -290,6 +290,7 @@ def test_is_resolved_address_rejects_placeholders_and_junk():
         "   ",
         None,
         True,            # bool is not an address
+        "49556",        # address strings are hex; use a JSON integer for decimal
         0x10000,         # out of the 16-bit space
         -1,
     ):

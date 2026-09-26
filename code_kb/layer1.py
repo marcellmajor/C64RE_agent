@@ -124,6 +124,7 @@ def fetch_routines(
 def build_window(
     store: CodeKnowledgeStore, *, routine_row: dict[str, Any],
     max_listing_lines: int = 240,
+    focus_addr: int | None = None,
 ) -> RoutineWindow:
     """Assemble a Layer-1 context window for one routine."""
     start = int(routine_row["start_addr"])
@@ -139,8 +140,18 @@ def build_window(
         (start, end),
     )
     listing_lines: list[str] = []
+    first = 0
+    if focus_addr is not None and len(rows) > max_listing_lines:
+        focus_index = max(
+            (i for i, row in enumerate(rows) if row["addr"] <= focus_addr),
+            default=0,
+        )
+        first = min(max(0, focus_index - max_listing_lines // 2),
+                    len(rows) - max_listing_lines)
+    if first:
+        listing_lines.append(f"; ... {first} earlier instructions omitted")
     hw_hits: list[str] = []
-    for r in rows[:max_listing_lines]:
+    for r in rows[first:first + max_listing_lines]:
         addr = int(r["addr"])
         bytes_hex = (r.get("bytes_hex") or "").lower()
         bytes_col = " ".join(
@@ -158,9 +169,9 @@ def build_window(
                 hw_hits.append(
                     f"${int(tok, 16):04X} {hw.name} ({hw.chip}) — {hw.role}"
                 )
-    if len(rows) > max_listing_lines:
+    if len(rows) > first + max_listing_lines:
         listing_lines.append(
-            f"; ... {len(rows) - max_listing_lines} more instructions truncated"
+            f"; ... {len(rows) - first - max_listing_lines} more instructions truncated"
         )
 
     callers = store.query(

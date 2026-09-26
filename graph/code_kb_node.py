@@ -35,6 +35,7 @@ import os
 import re
 import sys
 from typing import Any
+from tools.arguments import address_arg, boolean
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
@@ -205,12 +206,24 @@ def _mode_routines(store, args, step_id):
 def _containing_routine(store, addr: int):
     """Smallest Layer-0 routine whose span covers *addr*, if any."""
     rows = store.query(
-        "SELECT start_addr, end_addr, name FROM code_routines"
+        "SELECT start_addr, end_addr, name, source_file, entries_json,"
+        " exits_json, annotation_id FROM code_routines"
         " WHERE start_addr <= ? AND end_addr >= ?"
-        " ORDER BY (end_addr - start_addr) ASC LIMIT 1",
-        (addr, addr),
+        " ORDER BY (start_addr = ?) DESC, (end_addr - start_addr) ASC,"
+        " start_addr ASC LIMIT 1",
+        (addr, addr, addr),
     )
     return rows[0] if rows else None
+
+
+def _routine_resolution_note(requested: int, routine: dict) -> str:
+    start, end = int(routine["start_addr"]), int(routine["end_addr"])
+    if start == requested:
+        return ""
+    return (
+        f"Requested ${requested:04X} lies inside stored routine "
+        f"${start:04X}-${end:04X}; using its entry ${start:04X}.\n\n"
+    )
 
 
 def _no_routine_message(store, addr: int, mode: str) -> str:
@@ -238,7 +251,7 @@ def _no_routine_message(store, addr: int, mode: str) -> str:
 
 
 def _mode_routine(store, args, step_id):
-    start_raw = args.get("start") or args.get("addr") or args.get("address")
+    start_raw = next((args[k] for k in ("start", "addr", "address") if k in args), None)
     if start_raw is None:
         return _record_result(
             "code_kb", step_id, False,
@@ -252,24 +265,20 @@ def _mode_routine(store, args, step_id):
             f"could not parse start={start_raw!r} as address",
             extra={"mode": "routine"},
         )
-    rows = store.query(
-        "SELECT start_addr, end_addr, name, source_file, entries_json,"
-        "       exits_json, annotation_id"
-        "  FROM code_routines WHERE start_addr = ? LIMIT 1",
-        (start,),
-    )
-    if not rows:
+    routine = _containing_routine(store, start)
+    if not routine:
         return _record_result(
             "code_kb", step_id, False,
             _no_routine_message(store, start, "routine"),
             extra={"mode": "routine"},
         )
-    win = build_window(store, routine_row=rows[0])
-    text = render_user_prompt(win)
+    win = build_window(store, routine_row=routine, focus_addr=start)
+    text = _routine_resolution_note(start, routine) + render_user_prompt(win)
     return _record_result(
         "code_kb", step_id, True, text,
         extra={
             "mode": "routine",
+            "requested_start_addr": start,
             "start_addr": win.start_addr, "end_addr": win.end_addr,
             "name": win.name, "callers": len(win.callers),
             "callees": len(win.callees), "smc_sites": len(win.smc_sites),
@@ -279,7 +288,7 @@ def _mode_routine(store, args, step_id):
 
 def _mode_pseudocode(store, args, step_id):
     """Address-preserving Layer-0 transliteration for one known routine."""
-    start_raw = args.get("start") or args.get("addr") or args.get("address")
+    start_raw = next((args[k] for k in ("start", "addr", "address") if k in args), None)
     if start_raw is None:
         return _record_result(
             "code_kb", step_id, False,
@@ -293,18 +302,15 @@ def _mode_pseudocode(store, args, step_id):
             f"could not parse start={start_raw!r} as address",
             extra={"mode": "pseudocode"},
         )
-    routines = store.query(
-        "SELECT start_addr, end_addr, name FROM code_routines"
-        " WHERE start_addr = ? LIMIT 1",
-        (start,),
-    )
-    if not routines:
+    routine = _containing_routine(store, start)
+    if not routine:
         return _record_result(
             "code_kb", step_id, False,
             _no_routine_message(store, start, "pseudocode"),
             extra={"mode": "pseudocode"},
         )
-    routine = routines[0]
+    requested = start
+    start = int(routine["start_addr"])
     end = int(routine["end_addr"])
     instructions = store.query(
         "SELECT addr, bytes_hex, mnemonic, operand, size_bytes"
@@ -318,13 +324,14 @@ def _mode_pseudocode(store, args, step_id):
             extra={"mode": "pseudocode", "start_addr": start,
                    "end_addr": end},
         )
-    text = render_mechanical_pseudocode(
+    text = _routine_resolution_note(requested, routine) + render_mechanical_pseudocode(
         instructions, routine_name=routine.get("name"),
     )
     return _record_result(
         "code_kb", step_id, True, text,
         extra={
             "mode": "pseudocode",
+            "requested_start_addr": requested,
             "start_addr": start,
             "end_addr": end,
             "instruction_count": len(instructions),
@@ -334,7 +341,7 @@ def _mode_pseudocode(store, args, step_id):
 
 
 def _mode_xrefs_to(store, args, step_id):
-    addr = _hex_to_int(args.get("addr") or args.get("dst") or 0, 0)
+    addr = address_arg(args, "addr", "dst")
     # DISTINCT: xref rows are per-source (Phase 2 hardening) — the same
     # edge asserted by several files must show once here.
     rows = store.query(
@@ -353,8 +360,8 @@ def _mode_xrefs_to(store, args, step_id):
 
 
 def _mode_xrefs_from(store, args, step_id):
-    src = _hex_to_int(args.get("addr") or args.get("src") or 0, 0)
-    end = _hex_to_int(args.get("end"), src)
+    src = address_arg(args, "addr", "src")
+    end = address_arg(args, "end", default=src)
     rows = store.query(
         "SELECT DISTINCT src_addr, dst_addr, kind, via_vector"
         "  FROM code_xrefs WHERE src_addr BETWEEN ? AND ?"
@@ -399,7 +406,7 @@ def _mode_smc(store, args, step_id):
 
 def _mode_writes_to(store, args, step_id):
     """Instructions that WRITE (or RMW) a target address (tracker 3.4)."""
-    addr = _hex_to_int(args.get("addr") or args.get("dst") or 0, 0)
+    addr = address_arg(args, "addr", "dst")
     limit = int(args.get("limit", 100))
     rows = store.query(
         "SELECT DISTINCT src_addr, access, index_reg, indirect"
@@ -419,7 +426,7 @@ def _mode_writes_to(store, args, step_id):
 
 def _mode_refs_to(store, args, step_id):
     """All references (read/write/rmw) to a target address (tracker 3.4)."""
-    addr = _hex_to_int(args.get("addr") or args.get("dst") or 0, 0)
+    addr = address_arg(args, "addr", "dst")
     limit = int(args.get("limit", 200))
     rows = store.query(
         "SELECT DISTINCT src_addr, access, index_reg, indirect"
@@ -454,8 +461,8 @@ def _mode_hardware_refs(store, args, step_id):
     if chip in ranges:
         lo, hi = ranges[chip]
     else:
-        lo = _hex_to_int(args.get("lo"), 0xD000)
-        hi = _hex_to_int(args.get("hi"), 0xDFFF)
+        lo = address_arg(args, "lo", default=0xD000)
+        hi = address_arg(args, "hi", default=0xDFFF)
     limit = int(args.get("limit", 300))
     rows = store.query(
         "SELECT DISTINCT src_addr, dst_addr, access, index_reg"
@@ -526,15 +533,17 @@ def _mode_search(store, args, step_id):
 
 
 def _mode_disasm(store, args, step_id):
-    engine = str(args.get("engine") or "capstone").lower()
+    engine = str(args.get("engine") or "capstone").strip().lower()
+    if engine not in {"capstone", "vice"}:
+        raise ValueError("engine must be capstone or vice")
     if engine == "vice":
-        addr = _hex_to_int(args.get("address") or args.get("addr") or 0, 0)
+        addr = address_arg(args, "address", "addr")
         count = int(args.get("count", 32))
         out = disasm_vice(store, address=addr, count=count, note=args.get("note"))
     else:
-        start = _hex_to_int(args.get("start") or args.get("addr") or 0, 0)
+        start = address_arg(args, "start", "addr")
         length = int(args.get("length", 256))
-        recursive = bool(args.get("recursive", False))
+        recursive = boolean(args.get("recursive", False), "recursive")
         max_insns = int(args.get("max_insns", 600))
         out = disasm_capstone(
             store,
@@ -708,129 +717,124 @@ def _normalize_layer_roles(
     return role, backups
 
 
-def _mode_annotate(state, store, args, step_id):
-    """Run Layer-1 LLM annotation on a routine.
+def _disasm_window_context(rows, start: int, source: str):
+    """Bound a provisional context to contiguous decoded instructions.
 
-    Args (planner):
-      start: "$XXXX"          (required) — routine start address
-      role:  "analyst"        (optional) — config/llm.json agent role
-      backup_roles: ["critic"]  (optional)
+    This is an annotation context, not a new Layer-0 routine assertion.
+    Stop at a gap or unconditional control transfer instead of merging
+    unrelated callees from a recursive disassembly into one routine.
     """
-    start_raw = args.get("start") or args.get("addr") or args.get("address")
+    cursor = start
+    for row in sorted(rows, key=lambda row: row["addr"]):
+        addr = int(row["addr"])
+        if addr < start:
+            continue
+        size = len(row.get("bytes_hex") or "") // 2
+        if addr != cursor or size < 1:
+            break
+        cursor += size
+        if str(row.get("mnemonic", "")).lower() in {"rts", "rti", "jmp", "brk"}:
+            break
+    if cursor == start:
+        return None
+    return {
+        "start_addr": start, "end_addr": cursor - 1,
+        "name": "unverified disassembly window", "source_file": source,
+        "entries_json": "[]", "exits_json": "[]",
+    }
+
+
+def _mode_annotate(state, store, args, step_id):
+    """Annotate a known routine or an explicitly provisional disassembly window."""
+    start_raw = next((args[k] for k in ("start", "addr", "address") if k in args), None)
     if start_raw is None:
         return _record_result(
             "code_kb", step_id, False,
             "code_kb mode='annotate' requires args.start (routine address).",
             extra={"mode": "annotate"},
         )
-    start = _hex_to_int(start_raw, -1)
-    if start < 0:
+    requested = _hex_to_int(start_raw, -1)
+    if requested < 0:
         return _record_result(
             "code_kb", step_id, False,
             f"could not parse start={start_raw!r}",
             extra={"mode": "annotate"},
         )
-    rows = store.query(
-        "SELECT start_addr, end_addr, name, source_file, entries_json,"
-        "       exits_json, annotation_id"
-        "  FROM code_routines WHERE start_addr = ? LIMIT 1",
-        (start,),
-    )
+    routine = _containing_routine(store, requested)
+    start = int(routine["start_addr"]) if routine else requested
+    context_kind = "routine"
+    resolution_note = _routine_resolution_note(requested, routine) if routine else ""
     auto_disasm = bool(args.get("auto_disasm_if_missing", True))
     auto_disasm_info: dict[str, Any] = {"attempted": False}
-    if not rows:
+    window = build_window(store, routine_row=routine, focus_addr=requested) if routine else None
+    if window is None or not window.listing:
         if not auto_disasm:
             return _record_result(
                 "code_kb", step_id, False,
-                f"no routine at ${start:04X}",
-                extra={"mode": "annotate", "auto_disasm": auto_disasm_info},
+                (f"routine ${start:04X} has no Layer-0 instructions" if routine
+                 else _no_routine_message(store, requested, "annotate")),
+                extra={"mode": "annotate", "requested_start_addr": requested,
+                       "auto_disasm": auto_disasm_info},
             )
-
         engine = str(args.get("disasm_engine") or "capstone").lower()
-        auto_disasm_info["attempted"] = True
-        auto_disasm_info["engine"] = engine
+        source = f"annotate-autodisasm:${start:04X}"
+        auto_disasm_info.update(
+            attempted=True, engine=engine,
+            reason="empty_listing" if routine else "missing_routine",
+        )
         if engine == "vice":
             d_out = disasm_vice(
-                store,
-                address=start,
-                count=int(args.get("disasm_count") or 64),
-                note=f"annotate-autodisasm:${start:04X}",
+                store, address=start,
+                count=int(args.get("disasm_count") or 64), note=source,
             )
         else:
+            length = int(routine["end_addr"]) - start + 1 if routine else 768
             d_out = disasm_capstone(
-                store,
-                start=start,
-                length=int(args.get("disasm_length") or 768),
+                store, start=start,
+                length=int(args.get("disasm_length") or length),
                 recursive=bool(args.get("disasm_recursive", False)),
-                max_insns=int(args.get("disasm_max_insns") or 800),
-                note=f"annotate-autodisasm:${start:04X}",
+                max_insns=int(args.get("disasm_max_insns") or 800), note=source,
             )
         auto_disasm_info["ok"] = bool(d_out.get("ok"))
         auto_disasm_info["stats"] = d_out.get("stats")
         if not d_out.get("ok"):
             return _record_result(
                 "code_kb", step_id, False,
-                f"no routine at ${start:04X}; auto-disasm failed: {d_out.get('error')}",
-                extra={"mode": "annotate", "auto_disasm": auto_disasm_info},
+                resolution_note + f"Cannot annotate ${start:04X}: {d_out.get('error')}",
+                extra={"mode": "annotate", "requested_start_addr": requested,
+                       "start_addr": start, "auto_disasm": auto_disasm_info,
+                       "error_code": d_out.get("error_code")},
             )
-
-        rows = store.query(
-            "SELECT start_addr, end_addr, name, source_file, entries_json,"
-            "       exits_json, annotation_id"
-            "  FROM code_routines WHERE start_addr = ? LIMIT 1",
-            (start,),
-        )
-        if not rows:
+        if routine is None:
+            routine = _disasm_window_context(d_out.get("rows") or [], start, source)
+            context_kind = "disassembly_window"
+            resolution_note = (
+                "No indexed routine covers this address. Analyzing a bounded "
+                "disassembly window; routine boundaries are unverified. "
+                "Do not claim that this window is a complete routine.\n\n"
+            )
+        if routine is None:
             return _record_result(
                 "code_kb", step_id, False,
-                f"no routine at ${start:04X} even after auto-disasm",
-                extra={"mode": "annotate", "auto_disasm": auto_disasm_info},
+                f"No decoded instruction starts at ${start:04X}; "
+                "choose a known instruction boundary or verify the bytes in VICE.",
+                extra={"mode": "annotate", "requested_start_addr": requested,
+                       "auto_disasm": auto_disasm_info},
             )
+        window = build_window(store, routine_row=routine, focus_addr=requested)
+    if not window.listing:
+        return _record_result(
+            "code_kb", step_id, False,
+            f"No instruction evidence available for annotation at ${start:04X}.",
+            extra={"mode": "annotate", "auto_disasm": auto_disasm_info},
+        )
     role, backup_roles = _normalize_layer_roles(
         args.get("role"), args.get("backup_roles"),
         default_role="analyst",
         default_backup_roles=["critic", "synthesizer"],
     )
-    window = build_window(store, routine_row=rows[0])
 
-    # If the routine exists in code_routines but has NO instructions indexed
-    # (e.g. it was mirrored from the LLM synthesizer without a Capstone scan),
-    # auto-disasm the address range now so the LLM gets a real listing.
-    if not window.listing and auto_disasm:
-        engine = str(args.get("disasm_engine") or "capstone").lower()
-        routine_len = max(1, window.end_addr - window.start_addr + 1)
-        auto_disasm_info["attempted"] = True
-        auto_disasm_info["engine"] = engine
-        auto_disasm_info["reason"] = "empty_listing"
-        if engine == "vice":
-            d_out = disasm_vice(
-                store,
-                address=window.start_addr,
-                count=int(args.get("disasm_count") or 64),
-                note=f"annotate-autodisasm:${window.start_addr:04X}",
-            )
-        else:
-            d_out = disasm_capstone(
-                store,
-                start=window.start_addr,
-                length=int(args.get("disasm_length") or routine_len),
-                recursive=bool(args.get("disasm_recursive", False)),
-                max_insns=int(args.get("disasm_max_insns") or 800),
-                note=f"annotate-autodisasm:${window.start_addr:04X}",
-            )
-        auto_disasm_info["ok"] = bool(d_out.get("ok"))
-        auto_disasm_info["stats"] = d_out.get("stats")
-        if d_out.get("ok"):
-            # Re-fetch the routine row (auto-disasm may have updated it)
-            refreshed = store.query(
-                "SELECT start_addr, end_addr, name, source_file, entries_json,"
-                "       exits_json, annotation_id"
-                "  FROM code_routines WHERE start_addr = ? LIMIT 1",
-                (window.start_addr,),
-            )
-            window = build_window(store, routine_row=(refreshed[0] if refreshed else rows[0]))
-
-    user_prompt = render_user_prompt(window, question=state.get("question"))
+    user_prompt = resolution_note + render_user_prompt(window, question=state.get("question"))
     system_prompt = (
         DEEP_RETRO_RE_PREAMBLE
         + "\n---\n## Hardware reference (keep nearby — do not paraphrase)\n"
@@ -853,6 +857,10 @@ def _mode_annotate(state, store, args, step_id):
         )
 
     ann = annotation_from_layer1_json(parsed, window, producer=f"layer1:{used_role}")
+    ann.payload["context_kind"] = context_kind
+    if context_kind == "disassembly_window":
+        ann.flags.append("unverified_routine_boundaries")
+        ann.payload["routine_id"] = None
     ann_id = store.append_annotation(ann, source="code_kb_node.layer1")
     store.append_event(
         EVT_LAYER_RUN, "code_kb_node",
@@ -860,7 +868,7 @@ def _mode_annotate(state, store, args, step_id):
     )
 
     text = (
-        f"Layer-1 annotation for ${window.start_addr:04X}-${window.end_addr:04X} "
+        resolution_note + f"Layer-1 annotation for ${window.start_addr:04X}-${window.end_addr:04X} "
         f"(producer={used_role}, conf={ann.confidence:.2f}):\n\n"
         f"{ann.payload.get('text', '')}\n\n"
         f"_idiom: {ann.payload.get('idiom_match')}_\n"
@@ -871,6 +879,8 @@ def _mode_annotate(state, store, args, step_id):
         extra={
             "mode": "annotate",
             "start_addr": window.start_addr, "end_addr": window.end_addr,
+            "requested_start_addr": requested,
+            "context_kind": context_kind,
             "annotation_id": ann_id,
             "producer": ann.producer, "confidence": ann.confidence,
             "idiom_match": ann.payload.get("idiom_match"),

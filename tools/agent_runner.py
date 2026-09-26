@@ -314,7 +314,7 @@ def mutating_step_ids(plan: list[dict[str, Any]]) -> list[str]:
     ]
 
 
-def validate_review_plan(plan: Any) -> list[dict[str, Any]]:
+def validate_review_plan(plan: Any, *, strict_args: bool = True) -> list[dict[str, Any]]:
     """Validate a user-edited planner JSON array before checkpoint resume."""
     if not isinstance(plan, list) or not plan:
         raise ValueError("reviewed plan must be a non-empty JSON array")
@@ -338,6 +338,15 @@ def validate_review_plan(plan: Any) -> list[dict[str, Any]]:
         ids.add(step_id)
         if not isinstance(step.get("args") or {}, dict):
             raise ValueError(f"plan row {step_id} args must be an object")
+        if strict_args:
+            from tools.arguments import integer
+            from tools.vice_contract import validate_literal_options
+            arguments = dict(step.get("args") or {})
+            if tool == "vice":
+                arguments.setdefault("method", step.get("method") or step.get("action"))
+                validate_literal_options(arguments)
+            elif tool in {"kb", "code_kb"} and "limit" in arguments:
+                integer(arguments["limit"], "limit", 1, 10000)
         dependencies = step.get("depends_on") or []
         if not isinstance(dependencies, list):
             raise ValueError(f"plan row {step_id} depends_on must be an array")
@@ -378,7 +387,7 @@ def _plan_review_from_state(
     state: dict[str, Any], *, thread_id: str, seen_messages: int,
     started: float,
 ) -> PlanReview:
-    plan = validate_review_plan(state.get("plan") or [])
+    plan = validate_review_plan(state.get("plan") or [], strict_args=False)
     return PlanReview(
         question=str(state.get("question") or ""),
         thread_id=thread_id,
