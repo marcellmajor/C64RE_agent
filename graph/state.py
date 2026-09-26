@@ -34,6 +34,8 @@ _STATUS_LEDGER_KEYS = frozenset({
     "step_id",
     "tool",
     "ok",
+    "outcome",
+    "summary",
     "retryable",
     "rejection",
     "mode",
@@ -96,7 +98,7 @@ def _compact_result(result: dict[str, Any], event_id: str) -> dict[str, Any]:
         "tool": result.get("tool"),
         "ok": bool(result.get("ok")),
     }
-    for key in ("retryable", "rejection", "mode", "method"):
+    for key in ("retryable", "rejection", "mode", "method", "outcome", "summary"):
         if key in result:
             compact[key] = result[key]
     if not result.get("ok"):
@@ -119,7 +121,7 @@ def _status_only_result(result: dict[str, Any]) -> dict[str, Any]:
         "retryable": result.get("retryable"),
         "rejection": result.get("rejection"),
     }
-    for key in ("mode", "method"):
+    for key in ("mode", "method", "outcome", "summary"):
         if key in result:
             compact[key] = result[key]
     return compact

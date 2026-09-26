@@ -592,7 +592,7 @@ def _esc_addrs(text: str) -> str:
         for part in parts
     )
 
-_TOOL_LINE_RE   = _re.compile(r'^\[tool:(?P<tool>\w+)\]\s*(?P<ok>[✓✗])\s*step=(?P<step>\S+)\s*[—–-]\s*(?P<rest>.*)', _re.DOTALL)
+_TOOL_LINE_RE   = _re.compile(r'^\[tool:(?P<tool>\w+)\]\s*(?P<ok>[✓✗⚠])\s*step=(?P<step>\S+)\s*[—–-]\s*(?P<rest>.*)', _re.DOTALL)
 _EXEC_RE        = _re.compile(r'^Executor selected step\s+(?P<step>\S+)\s+→\s+(?P<tool>\S+)\.\s+Rationale:\s*(?P<rat>.*)', _re.DOTALL)
 _SYNTH_RE       = _re.compile(r'^Synthesizer:\s*(?P<counts>[^·]+)·\s*KB events=(?P<events>\d+)\.\s*(?P<note>.*)', _re.DOTALL)
 _ANALYST_RE     = _re.compile(r'^Analyst confidence=(?P<conf>[0-9.]+)\.')
@@ -609,15 +609,18 @@ def _render_agent_msg(msg: str) -> None:
     if not msg:
         return
 
-    # Tool result: [tool:X] ✓/✗ step=Y — ...
+    # Tool result: [tool:X] ✓/✗/⚠ step=Y — summary, then optional diagnostics.
     m = _TOOL_LINE_RE.match(msg)
     if m:
-        ok_icon = "✅" if m.group("ok") == "✓" else "❌"
+        ok_icon = {"✓": "✅", "✗": "❌", "⚠": "⚠️"}[m.group("ok")]
         tool = m.group("tool")
         step = m.group("step")
-        rest = _esc_addrs(m.group("rest").strip())
-        first_line = rest.split("\n")[0][:300]
+        first_line, _, details = m.group("rest").strip().partition("\n")
+        first_line = _esc_addrs(first_line[:300])
         st.markdown(f"{ok_icon} **`{tool}`** `{step}` — {first_line}")
+        if details:
+            with st.expander(f"Diagnostics · {tool} · {step}"):
+                st.code(details, language="text", wrap_lines=True)
         return
 
     # Executor step selection
@@ -1221,7 +1224,7 @@ with tab_routines:
     if not st.session_state.game:
         st.info("Set a game name in the sidebar.")
     else:
-        rows = top_routines_by_xrefs(st.session_state.game, limit=25)
+        rows = top_routines_by_xrefs(st.session_state.game, limit=None)
         if not rows:
             st.info("No routines yet — run a question to populate the KB.")
         else:
@@ -1238,30 +1241,73 @@ with tab_routines:
                         if isinstance(r.get("layer1_confidence"), (int, float))
                         else ""
                     ),
-                    "hypothesis": (r.get("hypothesis_text") or "")[:140],
+                    "hypothesis": r.get("hypothesis_text") or "",
                 }
                 for r in rows
             ]
             analyzed_count = sum(1 for rr in display_rows if rr["analyzed"] == "yes")
             st.caption(
-                f"Layer-1 coverage in this table: {analyzed_count}/{len(display_rows)} routines. "
-                "Rows are prioritized to show analyzed routines first."
+                f"Layer-1 coverage: {analyzed_count}/{len(display_rows)} routines in the KB. "
+                "Sorted by analyzed first, then most callers, then address."
             )
+            c_search, c_filter, c_size = st.columns([3, 2, 1])
+            routine_search = c_search.text_input(
+                "Search routines", key="routine_search",
+                help="Search names, hexadecimal addresses, idioms, and hypothesis text across all routines.",
+            ).strip().casefold()
+            routine_filter = c_filter.selectbox(
+                "Analysis status", ["All", "Unanalyzed", "Analyzed"],
+                key="routine_filter",
+            )
+            page_size = c_size.selectbox(
+                "Rows per page", [25, 50, 100], key="routine_page_size",
+            )
+            filtered_rows = [
+                row for row in display_rows
+                if (routine_filter == "All"
+                    or row["analyzed"] == ("yes" if routine_filter == "Analyzed" else "no"))
+                and (not routine_search or routine_search in " ".join(
+                    str(row[key]) for key in ("start", "end", "name", "idiom", "hypothesis")
+                ).casefold())
+            ]
+            page_count = max(1, (len(filtered_rows) + page_size - 1) // page_size)
+            browser_context = (st.session_state.game, routine_search, routine_filter, page_size)
+            if st.session_state.get("_routine_browser_context") != browser_context:
+                st.session_state.routine_page = 1
+                st.session_state._routine_browser_context = browser_context
+            # Clamp before creating the widget when annotation or KB changes shrink the list.
+            st.session_state.routine_page = max(
+                1, min(st.session_state.get("routine_page", 1), page_count),
+            )
+            page = st.number_input(
+                "Page", min_value=1, max_value=page_count, step=1,
+                key="routine_page", disabled=page_count == 1,
+            )
+            page_start = (page - 1) * page_size
+            page_rows = filtered_rows[page_start:page_start + page_size]
+            if filtered_rows:
+                st.caption(
+                    f"Showing {page_start + 1}–{page_start + len(page_rows)} of "
+                    f"{len(filtered_rows)} matching routines · page {page}/{page_count}."
+                )
+            else:
+                st.info("No routines match these filters.")
             st.dataframe(
-                display_rows, hide_index=True, width='stretch',
+                [{**row, "hypothesis": row["hypothesis"][:140]} for row in page_rows],
+                hide_index=True, width='stretch',
             )
             choice = st.selectbox(
                 "Centre call graph on routine",
-                options=[f"{r['start']} — {r['name']}" for r in display_rows],
-                index=0,
+                options=[f"{r['start']} — {r['name']}" for r in page_rows],
+                index=0 if page_rows else None, disabled=not page_rows,
             )
             c_btn1, c_btn2 = st.columns([1, 1])
-            if c_btn1.button("Show call graph for selection"):
+            if c_btn1.button("Show call graph for selection", disabled=not page_rows):
                 addrs = parse_addresses(choice)
                 if addrs:
                     st.session_state.focus_addr = addrs[0]
                     st.rerun()
-            if c_btn2.button("Annotate selected routine"):
+            if c_btn2.button("Annotate selected routine", disabled=not page_rows):
                 addrs = parse_addresses(choice)
                 if not addrs:
                     st.error("Could not parse routine address from selection.")
@@ -1292,12 +1338,12 @@ with tab_routines:
             st.divider()
             c_bulk_n, c_bulk_only, c_bulk_run = st.columns([1, 1, 2])
             bulk_n = c_bulk_n.number_input(
-                "Top N",
+                "Batch size",
                 min_value=1,
                 max_value=20,
                 value=5,
                 step=1,
-                help="How many routines to annotate in one batch.",
+                help="Maximum routines to annotate from the matching list across all pages.",
                 key="bulk_annotate_n",
             )
             only_unanalyzed = c_bulk_only.checkbox(
@@ -1306,11 +1352,15 @@ with tab_routines:
                 help="When enabled, skips rows that already have Layer-1 data.",
                 key="bulk_annotate_only_unanalyzed",
             )
-            if c_bulk_run.button("Annotate top routines"):
-                candidates = [
-                    r for r in display_rows
-                    if (not only_unanalyzed or r.get("analyzed") != "yes")
-                ]
+            candidates = [
+                r for r in filtered_rows
+                if (not only_unanalyzed or r.get("analyzed") != "yes")
+            ]
+            c_bulk_run.caption(f"{len(candidates)} eligible routines across all pages.")
+            if c_bulk_run.button(
+                "Annotate matching routines", key="bulk_annotate_run",
+                disabled=not candidates,
+            ):
                 targets = candidates[: int(bulk_n)]
                 if not targets:
                     st.info("No routines match the current bulk-annotation filter.")

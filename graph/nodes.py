@@ -1583,7 +1583,7 @@ def write_report(state: C64State) -> dict[str, Any]:
 
     tr_lines = []
     for r in report_tool_results:
-        ok = "✓" if r.get("ok") else "✗"
+        ok = "⚠" if r.get("outcome") == "inconclusive" else ("✓" if r.get("ok") else "✗")
         tool = r.get("tool", "?")
         step_id = r.get("step_id", "?")
         raw = str(r.get("data", ""))
@@ -1592,7 +1592,11 @@ def write_report(state: C64State) -> dict[str, Any]:
         summary = ""
         body = ""
 
-        if tool == "kb":
+        if r.get("method") == "vice.trace":
+            summary = str(r.get("summary") or raw.split("\n")[0])
+            body = raw
+
+        elif tool == "kb":
             first_line = raw.split("\n")[0][:400]
             summary = first_line
             body = raw[:2_000]
@@ -1712,7 +1716,7 @@ def write_report(state: C64State) -> dict[str, Any]:
             t = str(r.get("tool") or "?")
             row = tool_counts.setdefault(t, [0, 0])
             row[0] += 1
-            if not r.get("ok"):
+            if not r.get("ok") and r.get("outcome") != "inconclusive":
                 row[1] += 1
     tool_lines = [
         f"- {t}: {n} call(s), {f} failure(s)"
@@ -2098,7 +2102,9 @@ def executor_node(state: C64State) -> dict[str, Any]:
                 d = str(d)
                 if d in status.succeeded:
                     continue
-                if d in status.exhausted:
+                if d in status.inconclusive:
+                    reasons.append(f"`{d}` was inconclusive; required evidence is missing")
+                elif d in status.exhausted:
                     reasons.append(f"`{d}` failed permanently")
                 elif d not in plan_ids:
                     reasons.append(f"`{d}` is missing from the plan")
@@ -3369,15 +3375,19 @@ def _record_result(
     result = {"step_id": step_id, "tool": tool, "ok": ok, "data": data}
     if extra:
         result.update(extra)
-    badge = "✓" if ok else "✗"
-    snippet = str(data)[:120].replace("\n", " ")
+    inconclusive = result.get("outcome") == "inconclusive"
+    badge = "⚠" if inconclusive else ("✓" if ok else "✗")
+    snippet = result.get("summary") or str(data)[:120].replace("\n", " ")
+    # Keep trace diagnostics available to the UI after the concise status line.
+    # Other tools retain their bounded progress previews.
+    detail = f"\n{data}" if result.get("method") == "vice.trace" else ""
     return {
         "tool_results": [result],
         "tool_call_stats": {
-            str(tool): {"calls": 1, "failures": 0 if ok else 1},
+            str(tool): {"calls": 1, "failures": 0 if ok or inconclusive else 1},
         },
         "messages": [
-            AIMessage(content=f"[tool:{tool}] {badge} step={step_id} — {snippet}")
+            AIMessage(content=f"[tool:{tool}] {badge} step={step_id} — {snippet}{detail}")
         ],
         # Tool nodes are LLM-free except the vice screenshot vision call;
         # draining here attributes that usage to the tool result (1.4).
@@ -5143,11 +5153,13 @@ def _vice_trace(args: dict[str, Any], step_id: str) -> dict[str, Any]:
         #    so `frames` can only be honoured as a time budget. Querying
         #    registers immediately after resuming (as this did) read an
         #    arbitrary PC, because the write had not happened yet.
+        run_error = None
         try:
             _vice_call("vice.execution.run", {})
             steps.append("resumed execution (run is not frame-bounded)")
         except Exception as e:  # noqa: BLE001
-            steps.append(f"run failed ({type(e).__name__}) — checking state anyway")
+            run_error = f"{type(e).__name__}: {e}"[:500]
+            steps.append(f"run failed ({run_error}) — checking state anyway")
 
         # `vice.ping` reports "running" even while the monitor holds the
         # CPU, so it cannot answer "has the watchpoint fired?". The
@@ -5159,22 +5171,44 @@ def _vice_trace(args: dict[str, Any], step_id: str) -> dict[str, Any]:
         deadline = started_wait + budget_s
         waited = 0.0
         hit_confirmed = False
-        while time.monotonic() < deadline:
-            if checkpoint_id is not None:
-                try:
-                    lst = _vice_call("vice.checkpoint.list", {})
-                    if _checkpoint_hit(lst.get("data"), checkpoint_id):
-                        hit_confirmed = True
-                        break
-                except Exception:  # noqa: BLE001
-                    pass
+        poll_error_count = 0
+        poll_error = None
+        while checkpoint_id is not None and time.monotonic() < deadline:
+            try:
+                lst = _vice_call("vice.checkpoint.list", {})
+                hits = _checkpoint_hit_count(lst.get("data"), checkpoint_id)
+                if hits is None:
+                    raise ValueError(
+                        f"checkpoint.list did not return a valid hit count for checkpoint {checkpoint_id}"
+                    )
+                if hits > 0:
+                    hit_confirmed = True
+                    break
+            except Exception as exc:  # noqa: BLE001
+                poll_error_count += 1
+                poll_error = f"{type(exc).__name__}: {exc}"[:500]
             time.sleep(_TRACE_POLL_INTERVAL_S)
             waited = time.monotonic() - started_wait
         waited = time.monotonic() - started_wait
-        steps.append(
-            f"watchpoint hit after ~{waited:.2f}s" if hit_confirmed else
-            f"no write seen within {budget_s:.2f}s"
-        )
+        if poll_error_count:
+            steps.append(f"checkpoint polling failed {poll_error_count} time(s); last error: {poll_error}")
+        if hit_confirmed:
+            outcome = "confirmed"
+            summary = f"Write confirmed at {address}; writing instruction is not proven."
+            steps.append(f"watchpoint hit after ~{waited:.2f}s")
+        elif checkpoint_id is None:
+            outcome = "error"
+            summary = f"Trace error at {address}: checkpoint.add returned no checkpoint ID."
+        elif run_error:
+            outcome = "error"
+            summary = f"Trace error at {address}: could not resume execution."
+        elif poll_error_count:
+            outcome = "error"
+            summary = f"Trace error at {address}: checkpoint polling failed; write status is unknown."
+        else:
+            outcome = "inconclusive"
+            summary = f"No confirmed write to {address} within {budget_s:.2f}s — inconclusive."
+            steps.append(f"no confirmed write within {budget_s:.2f}s")
 
         # 3. Confirm a hit via the checkpoint list (hit_count > 0), if the
         #    server exposes it. Only trusted when we captured OUR
@@ -5226,6 +5260,7 @@ def _vice_trace(args: dict[str, Any], step_id: str) -> dict[str, Any]:
                 steps.append(f"write confirmed; writer reconstruction unavailable ({type(exc).__name__})")
         ok = hit_confirmed
         body = [
+            summary,
             f"vice.trace of write watchpoint on {address}:",
             "steps: " + "; ".join(steps),
         ]
@@ -5236,16 +5271,25 @@ def _vice_trace(args: dict[str, Any], step_id: str) -> dict[str, Any]:
                 f"writer candidates (not execution proof; stopped PC=${pc:04X}):\n"
                 + writer_disasm[:2_000]
             )
-        if not ok:
+        if outcome == "inconclusive":
             body.append(
                 "No confirmed write within the observation timeout. "
                 "This does not prove the address is never written or that any "
                 "particular number of frames elapsed. No player input was supplied; "
                 "a movement-dependent write may require a separate approved action."
             )
+        elif not ok:
+            body.append(
+                "The trace could not reliably observe the watchpoint. "
+                "This is a tool error, not evidence that no write occurred."
+            )
         return _record_result(
             "vice", step_id, ok, "\n".join(body),
             extra={"method": "vice.trace", "address": address,
+                   "outcome": outcome, "summary": summary,
+                   "retryable": outcome == "error" and checkpoint_id is not None,
+                   "run_error": run_error,
+                   "poll_error_count": poll_error_count, "poll_error": poll_error,
                    "writer_pc": None,
                    "stop_pc": f"${pc:04X}" if pc is not None else None,
                    "writer_candidates": candidates,
@@ -5280,16 +5324,10 @@ def _vice_trace(args: dict[str, Any], step_id: str) -> dict[str, Any]:
                     pass
 
 
-def _checkpoint_hit(data: Any, checkpoint_id: Any) -> bool:
-    """Parse a checkpoint-list payload for OUR checkpoint's hit count.
-
-    Requires a concrete `checkpoint_id` and an exact id match: without a
-    known id, a hit on some unrelated breakpoint could be misattributed
-    to our watchpoint (review nit), so the caller uses PC/disasm proof
-    instead. Belt-and-braces with the caller's own id guard.
-    """
+def _checkpoint_hit_count(data: Any, checkpoint_id: Any) -> int | None:
+    """Our checkpoint's hit count, or None when the response cannot verify it."""
     if checkpoint_id is None:
-        return False
+        return None
     if isinstance(data, dict):
         items = data.get("checkpoints") or data.get("list") or []
     elif isinstance(data, list):
@@ -5305,12 +5343,19 @@ def _checkpoint_hit(data: Any, checkpoint_id: Any) -> bool:
         )
         if not _same_checkpoint(cid, checkpoint_id):
             continue
-        hits = it.get("hit_count", it.get("hits", it.get("hit", 0)))
-        if (isinstance(hits, bool) and hits) or (
-            isinstance(hits, (int, float)) and hits > 0
-        ):
-            return True
-    return False
+        hits = it.get("hit_count", it.get("hits", it.get("hit")))
+        if isinstance(hits, str) and hits.isascii() and hits.isdigit():
+            hits = int(hits)
+        if isinstance(hits, int) and hits >= 0:
+            return int(hits)
+        return None
+    return None
+
+
+def _checkpoint_hit(data: Any, checkpoint_id: Any) -> bool:
+    """Compatibility predicate; unrelated/malformed checkpoints never prove a hit."""
+    hits = _checkpoint_hit_count(data, checkpoint_id)
+    return hits is not None and hits > 0
 
 
 def vice_mcp_node(state: C64State) -> dict[str, Any]:

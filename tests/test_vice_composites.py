@@ -220,7 +220,7 @@ def test_trace_no_checkpoint_id_ignores_unrelated_hit(kb_state, monkeypatch):
     assert "may still be armed" in r["data"]
 
 
-def test_trace_no_hit_is_failure_but_cleans_up(kb_state, monkeypatch):
+def test_trace_no_hit_is_inconclusive_but_cleans_up(kb_state, monkeypatch):
     state, _ = kb_state
     calls = []
 
@@ -243,6 +243,8 @@ def test_trace_no_hit_is_failure_but_cleans_up(kb_state, monkeypatch):
     out = _run(state, {"method": "vice.trace", "address": "$00C0"})
     r = out["tool_results"][0]
     assert not r["ok"]                                # no confirmed write
+    assert r["outcome"] == "inconclusive"
+    assert out["tool_call_stats"]["vice"]["failures"] == 0
     assert r["writer_pc"] is None
     assert "No confirmed write" in r["data"]
     assert "vice.checkpoint.delete" in calls          # cleanup still ran
@@ -919,7 +921,7 @@ def test_trace_reports_honestly_when_nothing_writes_the_address(
 
     assert not r["ok"]
     assert r["hit_confirmed"] is False
-    assert "no write seen within" in r["data"]
+    assert "no confirmed write within" in r["data"]
 
 
 def test_trace_restores_the_execution_state_it_found(kb_state, monkeypatch):

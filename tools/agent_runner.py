@@ -735,9 +735,9 @@ def list_dump_candidates(memdump_dir: str | Path | None, *, game: str):
 
 
 def top_routines_by_xrefs(
-    game: str, *, limit: int = 12,
+    game: str, *, limit: int | None = 12,
 ) -> list[dict[str, Any]]:
-    """Return the most-called routines (handy starting points for the UI)."""
+    """Prioritize analyzed routines, then callers; None returns the full catalog."""
     store = _resolve_code_store(game)
     if store is None:
         return []
@@ -774,8 +774,8 @@ def top_routines_by_xrefs(
         "    ON l1.start_addr = cr.start_addr AND l1.rn = 1"
         " GROUP BY cr.start_addr"
         " ORDER BY has_layer1 DESC, callers DESC, cr.start_addr"
-        " LIMIT ?",
-        (int(limit),),
+        + (" LIMIT ?" if limit is not None else ""),
+        (int(limit),) if limit is not None else (),
     )
 
 

@@ -149,6 +149,9 @@ Tool argument cheat-sheet:
                         It does not advance an exact number of frames or inject input.
                         Only a checkpoint hit confirms a write; stopped PC is not
                         automatically the writer. Reconstructed writers are candidates.
+                        A clean timeout has outcome='inconclusive', not a tool error
+                        or evidence of no writes. It is not automatically retried;
+                        replan the target/trigger if runtime proof is still needed.
                         Watch an actual cave-cell address to prove a tile write;
                         watching coordinates/pointers alone does not prove soil removal.
                         Arrange any needed input as a separately approved experiment.

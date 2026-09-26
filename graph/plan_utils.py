@@ -151,7 +151,7 @@ def resolve_session_slug(game: str, sessions_root: Path | str) -> str:
 
 def is_permanent_failure(result: dict[str, Any]) -> bool:
     """True when a failed tool result can never succeed on retry."""
-    if result.get("ok"):
+    if result.get("ok") or result.get("outcome") == "inconclusive":
         return False
     if result.get("retryable") is False:
         return True
@@ -165,7 +165,7 @@ class StepStatus:
     Two distinct notions (tracker 0.6 review):
 
     * **terminal** (`done`) — the step will not be dispatched again:
-      it succeeded, or its retries are exhausted;
+      it succeeded, was inconclusive, or its retries are exhausted;
     * **satisfied dependency** (`succeeded`) — only a step that actually
       SUCCEEDED satisfies a `depends_on` reference. A permanently-failed
       prerequisite blocks its dependents; the executor then reports the
@@ -175,6 +175,7 @@ class StepStatus:
     succeeded: set[str] = field(default_factory=set)
     fail_counts: dict[str, int] = field(default_factory=dict)
     permanent_failures: set[str] = field(default_factory=set)
+    inconclusive: set[str] = field(default_factory=set)
 
     @property
     def exhausted(self) -> set[str]:
@@ -185,13 +186,13 @@ class StepStatus:
             sid for sid, n in self.fail_counts.items()
             if n >= MAX_STEP_ATTEMPTS
         )
-        return out - self.succeeded
+        return out - self.succeeded - self.inconclusive
 
     @property
     def done(self) -> set[str]:
         """Terminal steps — never dispatched again (see class docstring:
         terminal ≠ satisfied-dependency)."""
-        return self.succeeded | self.exhausted
+        return self.succeeded | self.exhausted | self.inconclusive
 
 
 def step_status(tool_results: list[dict[str, Any]] | None) -> StepStatus:
@@ -203,6 +204,10 @@ def step_status(tool_results: list[dict[str, Any]] | None) -> StepStatus:
         sid = str(sid)
         if r.get("ok"):
             st.succeeded.add(sid)
+            st.inconclusive.discard(sid)
+        elif r.get("outcome") == "inconclusive":
+            if sid not in st.succeeded:
+                st.inconclusive.add(sid)
         else:
             st.fail_counts[sid] = st.fail_counts.get(sid, 0) + 1
             if is_permanent_failure(r):
@@ -211,7 +216,7 @@ def step_status(tool_results: list[dict[str, Any]] | None) -> StepStatus:
 
 
 def pending_steps(state: dict[str, Any]) -> list[dict[str, Any]]:
-    """Plan steps that still need a (re)run: not succeeded, not exhausted."""
+    """Plan steps that have not reached a terminal outcome."""
     done = step_status(state.get("tool_results")).done
     return [
         s for s in state.get("plan", []) or []
@@ -279,14 +284,14 @@ def parallel_runnable_steps(
 
 
 def failed_step_notes(state: dict[str, Any]) -> list[str]:
-    """One line per permanently-failed step of the *current* plan.
+    """One line per failed or inconclusive step of the *current* plan.
 
     Surfaced to the analyst so the absence of that evidence is never
     read as negative evidence (tracker 0.3).
     """
     st = step_status(state.get("tool_results"))
     by_id = {str(s.get("id")): s for s in state.get("plan", []) or []}
-    dead = st.exhausted & set(by_id)
+    dead = (st.exhausted | st.inconclusive) & set(by_id)
     if not dead:
         return []
 
@@ -294,15 +299,16 @@ def failed_step_notes(state: dict[str, Any]) -> list[str]:
     for r in state.get("tool_results") or []:
         sid = str(r.get("step_id"))
         if sid in dead and not r.get("ok"):
-            last_fail[sid] = str(r.get("data", ""))[:200].replace("\n", " ")
+            last_fail[sid] = str(r.get("summary") or r.get("data", ""))[:200].replace("\n", " ")
 
     notes = []
     for sid in sorted(dead):
         s = by_id[sid]
         goal = str(s.get("goal") or "").strip()
+        label = "INCONCLUSIVE" if sid in st.inconclusive else "FAILED"
         notes.append(
             f"- {sid} ({s.get('tool', '?')}): {goal} — "
-            f"FAILED: {last_fail.get(sid, 'unknown error')}"
+            f"{label}: {last_fail.get(sid, 'unknown error')}"
         )
     return notes
 
