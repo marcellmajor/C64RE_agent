@@ -7,3 +7,6 @@ streamlit run app.py
 
 
 https://www.barrywalker.io/blog/vice-mcp-ai-meets-commodore-64/
+
+
+python process_unique_disassembly.py /Volumes/Old500GB/Old500GB_trace/boulderdash.trace /Volumes/Old500GB/Old500GB_trace/boulderdash_unique.asm
