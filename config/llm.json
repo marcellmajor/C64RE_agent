@@ -24,47 +24,47 @@
   "agents": {
     "planner": {
       "provider": "anthropic",
-      "model": "claude-opus-4-8",
+      "model": "claude-opus-5",
       "temperature": 0.2,
       "max_tokens": 8192
     },
     "executor": {
       "provider": "openai",
-      "model": "gpt-5.5",
+      "model": "gpt-5.6",
       "temperature": 0.0
     },
     "synthesizer": {
       "provider": "grok",
-      "model": "grok-4.5",
+      "model": "grok-4.6",
       "temperature": 0.3,
-      "reasoning_effort": "low"
+      "reasoning_effort": "medium"
     },
     "analyst": {
       "provider": "gemini",
       "model": "gemini-pro-latest",
       "temperature": 0.2,
       "max_tokens": 8192,
-      "reasoning_effort": "low"
+      "reasoning_effort": "medium"
     },
     "critic": {
       "provider": "gemini",
       "model": "gemini-pro-latest",
       "temperature": 0.1,
       "max_tokens": 8192,
-      "reasoning_effort": "low"
+      "reasoning_effort": "medium"
     },
     "curator": {
       "provider": "grok",
-      "model": "grok-4.5",
+      "model": "grok-4.6",
       "temperature": 0.2,
-      "reasoning_effort": "low"
+      "reasoning_effort": "medium"
     },
     "vision": {
       "provider": "gemini",
       "model": "gemini-pro-latest",
       "temperature": 0.1,
       "max_tokens": 2048,
-      "reasoning_effort": "low"
+      "reasoning_effort": "medium"
     }
   },
   "tools": {
@@ -83,15 +83,15 @@
     }
   },
   "pricing": {
-    "claude-opus-4-8": {
+    "claude-opus-5": {
       "input_per_mtok": 5.0,
       "output_per_mtok": 25.0
     },
-    "gpt-5.5": {
+    "gpt-5.6": {
       "input_per_mtok": 10.0,
       "output_per_mtok": 45.0
     },
-    "grok-4.5": {
+    "grok-4.6": {
       "input_per_mtok": 4.0,
       "output_per_mtok": 12.0
     },
