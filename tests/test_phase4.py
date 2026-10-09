@@ -427,6 +427,49 @@ def test_grok45_rejects_none_reasoning_effort_before_transport():
     assert llm_factory._reasoning_effort_grok("grok-4.3", "none") == "none"
 
 
+@pytest.mark.parametrize(
+    ("provider", "model", "effort", "sends_temperature"),
+    [
+        # Upcoming Gemini models reject sampling params with 400 INVALID_ARGUMENT.
+        ("gemini", "gemini-pro-latest", "medium", False),
+        # GPT-5 reasoning models only take temperature with effort "none".
+        ("openai", "gpt-5.6", None, False),
+        ("openai", "gpt-5.6", "low", False),
+        ("openai", "gpt-5.6", "none", True),
+        ("openai", "gpt-5-chat-latest", None, True),
+        ("openai", "gpt-4o", None, True),
+    ],
+)
+def test_get_llm_sends_temperature_only_when_model_accepts_it(
+    monkeypatch, provider, model, effort, sends_temperature,
+):
+    captured = {}
+
+    class FakeChatOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    agent = {"provider": provider, "model": model, "temperature": 0.2}
+    if effort is not None:
+        agent["reasoning_effort"] = effort
+    config = {
+        "providers": {provider: {"base_url": "http://example", "api_key": "k"}},
+        "agents": {"analyst": agent},
+        "defaults": {"max_tokens": 4096, "timeout_s": 5, "retries": 0},
+    }
+    monkeypatch.setattr(llm_factory, "load_config", lambda: config)
+    monkeypatch.setattr(llm_factory, "ChatOpenAI", FakeChatOpenAI)
+    llm_factory.get_llm.cache_clear()
+    try:
+        llm_factory.get_llm("analyst")
+        assert ("temperature" in captured) is sends_temperature
+        assert "top_p" not in captured
+        if sends_temperature:
+            assert captured["temperature"] == 0.2
+    finally:
+        llm_factory.get_llm.cache_clear()
+
+
 def test_real_llm_config_exposes_phase4_role_budgets(monkeypatch):
     """Smoke the checked-in JSON through the real load_config/get_llm path."""
 
@@ -451,10 +494,22 @@ def test_real_llm_config_exposes_phase4_role_budgets(monkeypatch):
             "critic": 8192,
             "vision": 2048,
         }
+        agents_cfg = llm_factory.load_config()["agents"]
+        gemini_roles = [
+            role for role in ("analyst", "critic", "vision")
+            if agents_cfg[role]["provider"] == "gemini"
+        ]
         assert {
             role: clients[role].kwargs["reasoning_effort"]
-            for role in ("analyst", "critic", "vision")
-        } == {"analyst": "low", "critic": "low", "vision": "low"}
+            for role in gemini_roles
+        } == {
+            role: agents_cfg[role]["reasoning_effort"]
+            for role in gemini_roles
+        }
+        assert not [
+            role for role in gemini_roles
+            if "temperature" in clients[role].kwargs
+        ]
     finally:
         llm_factory.get_llm.cache_clear()
         llm_factory.load_config.cache_clear()

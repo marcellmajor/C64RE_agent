@@ -138,15 +138,17 @@ you intend to use:
 {
   "agents": {
     "planner":     { "provider": "anthropic", "model": "claude-opus-4-8",  "temperature": 0.2, "max_tokens": 8192 },
-    "executor":    { "provider": "openai",    "model": "gpt-5.5",          "temperature": 0.0 },
+    "executor":    { "provider": "openai",    "model": "gpt-5.5" },
     "synthesizer": { "provider": "grok",      "model": "grok-4.5",         "temperature": 0.3, "reasoning_effort": "low" },
-    "analyst":     { "provider": "gemini",    "model": "gemini-pro-latest", "temperature": 0.2, "max_tokens": 8192, "reasoning_effort": "low" },
-    "critic":      { "provider": "gemini",    "model": "gemini-pro-latest", "temperature": 0.1, "max_tokens": 8192, "reasoning_effort": "low" },
+    "analyst":     { "provider": "gemini",    "model": "gemini-pro-latest", "max_tokens": 8192, "reasoning_effort": "low" },
+    "critic":      { "provider": "gemini",    "model": "gemini-pro-latest", "max_tokens": 8192, "reasoning_effort": "low" },
     "curator":     { "provider": "grok",      "model": "grok-4.5",         "temperature": 0.2, "reasoning_effort": "low" },
-    "vision":      { "provider": "gemini",    "model": "gemini-pro-latest", "temperature": 0.1, "max_tokens": 2048, "reasoning_effort": "low" }
+    "vision":      { "provider": "gemini",    "model": "gemini-pro-latest", "max_tokens": 2048, "reasoning_effort": "low" }
   }
 }
 ```
+
+`temperature` is not sent for the `anthropic`, `grok` or `gemini` providers, or for GPT-5 reasoning models unless their `reasoning_effort` is `"none"`, even when configured. Gemini ignores sampling parameters on current models and newer models reject them with a 400 error.
 
 Ollama (local) is also supported — set `"provider": "ollama"` and point `base_url` at `http://localhost:11434/v1`.
 

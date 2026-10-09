@@ -107,18 +107,27 @@ def _reasoning_effort_gemini(agent_cfg_effort: Any) -> str | None:
     return None
 
 
-def _supports_temperature(provider_name: str, model_name: str) -> bool:
+def _supports_temperature(
+    provider_name: str, model_name: str, reasoning_effort: str | None = None,
+) -> bool:
     """Return whether passing `temperature` is generally safe for this model.
 
     Some provider/model combinations reject `temperature` entirely:
     - grok reasoning models (xAI)
     - anthropic/claude provider (claude-opus-4.x and newer deprecate it)
+    - gemini provider: sampling params are ignored since Gemini 3.6 and
+      upcoming models return 400 INVALID_ARGUMENT. Gated on the provider,
+      not the model, because `gemini-pro-latest` moves without notice.
+    - GPT-5 reasoning models unless `reasoning_effort` is ``none``
+      (LangChain's ChatOpenAI drops it anyway; this keeps config honest)
     - any model with 'reasoning' in its name
     """
     p = (provider_name or "").lower()
     m = (model_name or "").lower()
     # Both the old 'claude' and new 'anthropic' provider keys map to Anthropic.
-    if p in {"claude", "anthropic", "grok"}:
+    if p in {"claude", "anthropic", "grok", "gemini"}:
+        return False
+    if _is_openai_gpt5_reasoning_model(m) and reasoning_effort != "none":
         return False
     if "reasoning" in m:
         return False
@@ -264,7 +273,9 @@ def get_llm(role: str) -> ChatOpenAI:
         )
         if gemini_effort:
             kwargs["reasoning_effort"] = gemini_effort
-    if _supports_temperature(provider_name, model_name):
+    if _supports_temperature(
+        provider_name, model_name, kwargs.get("reasoning_effort"),
+    ):
         kwargs["temperature"] = agent_cfg.get("temperature", 0.2)
 
     return ChatOpenAI(**kwargs)
