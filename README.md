@@ -137,12 +137,12 @@ you intend to use:
 ```json
 {
   "agents": {
-    "planner":     { "provider": "anthropic", "model": "claude-opus-4-8",  "temperature": 0.2, "max_tokens": 8192 },
+    "planner":     { "provider": "anthropic", "model": "claude-opus-4-8",  "max_tokens": 8192 },
     "executor":    { "provider": "openai",    "model": "gpt-5.5" },
-    "synthesizer": { "provider": "grok",      "model": "grok-4.5",         "temperature": 0.3, "reasoning_effort": "low" },
+    "synthesizer": { "provider": "grok",      "model": "grok-4.5",         "reasoning_effort": "low" },
     "analyst":     { "provider": "gemini",    "model": "gemini-pro-latest", "max_tokens": 8192, "reasoning_effort": "low" },
     "critic":      { "provider": "gemini",    "model": "gemini-pro-latest", "max_tokens": 8192, "reasoning_effort": "low" },
-    "curator":     { "provider": "grok",      "model": "grok-4.5",         "temperature": 0.2, "reasoning_effort": "low" },
+    "curator":     { "provider": "grok",      "model": "grok-4.5",         "reasoning_effort": "low" },
     "vision":      { "provider": "gemini",    "model": "gemini-pro-latest", "max_tokens": 2048, "reasoning_effort": "low" }
   }
 }
