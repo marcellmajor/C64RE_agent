@@ -427,6 +427,37 @@ def test_grok45_rejects_none_reasoning_effort_before_transport():
     assert llm_factory._reasoning_effort_grok("grok-4.3", "none") == "none"
 
 
+def test_gpt6_reasoning_effort_and_token_floor(monkeypatch):
+    effort = llm_factory._reasoning_effort_openai
+    assert effort("gpt-6-astra", None) == "low"
+    assert effort("gpt-6-astra", "none") == "low"
+    assert effort("gpt-6-astra", "minimal") == "low"
+    assert effort("gpt-6-astra", "xhigh") == "xhigh"
+
+    captured = {}
+
+    class FakeChatOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    config = {
+        "providers": {"openai": {"base_url": "http://example", "api_key": "k"}},
+        "agents": {"executor": {"provider": "openai", "model": "gpt-6-astra"}},
+        "defaults": {"max_tokens": 4096, "timeout_s": 5, "retries": 0},
+    }
+    monkeypatch.setattr(llm_factory, "load_config", lambda: config)
+    monkeypatch.setattr(llm_factory, "ChatOpenAI", FakeChatOpenAI)
+    monkeypatch.delenv("C64RE_GPT5_MIN_MAX_TOKENS", raising=False)
+    monkeypatch.delenv("C64RE_MAX_OUTPUT_TOKENS", raising=False)
+    llm_factory.get_llm.cache_clear()
+    try:
+        llm_factory.get_llm("executor")
+        assert captured["max_tokens"] == 8192
+        assert captured["reasoning_effort"] == "low"
+    finally:
+        llm_factory.get_llm.cache_clear()
+
+
 @pytest.mark.parametrize(
     ("provider", "model", "effort", "sends_temperature"),
     [
@@ -438,6 +469,9 @@ def test_grok45_rejects_none_reasoning_effort_before_transport():
         ("openai", "gpt-5.6", "none", True),
         ("openai", "gpt-5-chat-latest", None, True),
         ("openai", "gpt-4o", None, True),
+        # GPT-6 rejects any non-default temperature and has no "none" effort.
+        ("openai", "gpt-6-astra", None, False),
+        ("openai", "gpt-6-astra", "none", False),
     ],
 )
 def test_get_llm_sends_temperature_only_when_model_accepts_it(

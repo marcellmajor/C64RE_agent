@@ -25,14 +25,14 @@ CONFIG_DIR = config_dir()
 _ENV_RE = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
 
 
-def _is_openai_gpt5_reasoning_model(model_name: str) -> bool:
-    """True for GPT-5 family reasoning models using the Responses-style stack.
+def _is_openai_reasoning_model(model_name: str) -> bool:
+    """True for GPT-5/GPT-6 family reasoning models.
 
     `gpt-5-chat` exempted: LangChain treats it like a chat model without the
     same reasoning/temperature coupling as flagship `gpt-5*` checkpoints.
     """
     m = (model_name or "").lower()
-    return m.startswith("gpt-5") and "chat" not in m
+    return m.startswith(("gpt-5", "gpt-6")) and "chat" not in m
 
 
 def _reasoning_effort_openai(model_name: str, agent_cfg_effort: Any) -> str:
@@ -40,6 +40,7 @@ def _reasoning_effort_openai(model_name: str, agent_cfg_effort: Any) -> str:
 
     e.g. `gpt-5.5-pro` only allows ``medium``, ``high``, ``xhigh`` (not ``minimal``).
     Other GPT-5 models typically accept ``minimal`` … ``high``.
+    GPT-6 rejects ``none`` and ``minimal``.
     """
     m = (model_name or "").lower()
     configured = (
@@ -54,6 +55,14 @@ def _reasoning_effort_openai(model_name: str, agent_cfg_effort: Any) -> str:
         if configured in allowed:
             return configured
         return "medium"
+
+    # gpt-6-astra on Chat Completions (Oct 2026): "Supported values are:
+    # 'low', 'medium', 'high', and 'xhigh'."
+    if m.startswith("gpt-6"):
+        allowed = frozenset({"low", "medium", "high", "xhigh"})
+        if configured in allowed:
+            return configured
+        return "low"
 
     # All other GPT-5 variants: "low" is universally accepted;
     # "minimal" is rejected by codex and certain other checkpoints.
@@ -118,8 +127,8 @@ def _supports_temperature(
     - gemini provider: sampling params are ignored since Gemini 3.6 and
       upcoming models return 400 INVALID_ARGUMENT. Gated on the provider,
       not the model, because `gemini-pro-latest` moves without notice.
-    - GPT-5 reasoning models unless `reasoning_effort` is ``none``
-      (LangChain's ChatOpenAI drops it anyway; this keeps config honest)
+    - GPT-5/GPT-6 reasoning models unless `reasoning_effort` is ``none``
+      (LangChain drops it for GPT-5 but not GPT-6, which rejects it)
     - any model with 'reasoning' in its name
     """
     p = (provider_name or "").lower()
@@ -127,7 +136,7 @@ def _supports_temperature(
     # Both the old 'claude' and new 'anthropic' provider keys map to Anthropic.
     if p in {"claude", "anthropic", "grok", "gemini"}:
         return False
-    if _is_openai_gpt5_reasoning_model(m) and reasoning_effort != "none":
+    if _is_openai_reasoning_model(m) and reasoning_effort != "none":
         return False
     if "reasoning" in m:
         return False
@@ -229,7 +238,7 @@ def get_llm(role: str) -> ChatOpenAI:
     # Reasoning-heavy OpenAI models can spend the whole completion budget on
     # internal reasoning if effort is unchecked, yielding empty visible `content`.
     # Extra headroom plus low reasoning effort avoids planner/analyst silent failure.
-    if provider_name == "openai" and _is_openai_gpt5_reasoning_model(model_name):
+    if provider_name == "openai" and _is_openai_reasoning_model(model_name):
         floor = int(os.environ.get("C64RE_GPT5_MIN_MAX_TOKENS", "8192"))
         max_tok = max(max_tok, floor)
 
@@ -256,7 +265,7 @@ def get_llm(role: str) -> ChatOpenAI:
         "timeout": defaults.get("timeout_s", 120),
         "max_retries": defaults.get("retries", 3),
     }
-    if provider_name == "openai" and _is_openai_gpt5_reasoning_model(model_name):
+    if provider_name == "openai" and _is_openai_reasoning_model(model_name):
         kwargs["reasoning_effort"] = _reasoning_effort_openai(
             model_name, agent_cfg.get("reasoning_effort")
         )

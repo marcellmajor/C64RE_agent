@@ -29,7 +29,7 @@
     },
     "executor": {
       "provider": "openai",
-      "model": "gpt-5.6"
+      "model": "gpt-6-astra"
     },
     "synthesizer": {
       "provider": "grok",
@@ -80,9 +80,9 @@
       "input_per_mtok": 5.0,
       "output_per_mtok": 25.0
     },
-    "gpt-5.6": {
+    "gpt-6-astra": {
       "input_per_mtok": 10.0,
-      "output_per_mtok": 45.0
+      "output_per_mtok": 50.0
     },
     "grok-4.6": {
       "input_per_mtok": 4.0,

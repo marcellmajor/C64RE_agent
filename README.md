@@ -148,7 +148,7 @@ you intend to use:
 }
 ```
 
-`temperature` is not sent for the `anthropic`, `grok` or `gemini` providers, or for GPT-5 reasoning models unless their `reasoning_effort` is `"none"`, even when configured. Gemini ignores sampling parameters on current models and newer models reject them with a 400 error.
+`temperature` is not sent for the `anthropic`, `grok` or `gemini` providers, or for GPT-5/GPT-6 reasoning models unless their `reasoning_effort` is `"none"`, even when configured. Gemini ignores sampling parameters on current models and newer models reject them with a 400 error.
 
 Ollama (local) is also supported — set `"provider": "ollama"` and point `base_url` at `http://localhost:11434/v1`.
 

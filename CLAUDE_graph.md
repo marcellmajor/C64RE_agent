@@ -243,7 +243,7 @@ working-tree JSON assigns:
 | Role | Provider | Configured model ID | Maximum output tokens |
 |---|---|---|---|
 | Planner | `anthropic` | `claude-opus-5` | 8,192 |
-| Executor | `openai` | `gpt-5.6` | 4,096 (default) |
+| Executor | `openai` | `gpt-6-astra` | 8,192 (reasoning-model floor) |
 | Synthesizer | `grok` | `grok-4.6` | 4,096 (default) |
 | Analyst | `gemini` | `gemini-pro-latest` | 8,192 |
 | Critic | `gemini` | `gemini-pro-latest` | 8,192 |
